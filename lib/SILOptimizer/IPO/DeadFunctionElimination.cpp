@@ -27,7 +27,6 @@
 using namespace swift;
 
 STATISTIC(NumDeadFunc, "Number of dead functions eliminated");
-STATISTIC(NumEliminatedExternalDefs, "Number of external function definitions eliminated");
 
 namespace {
 
@@ -40,19 +39,15 @@ protected:
   /// Represents a function which is implementing a vtable or witness table
   /// method.
   struct FuncImpl {
-    FuncImpl(SILFunction *F, ClassDecl *Cl) : F(F) { Impl.Cl = Cl; }
-    FuncImpl(SILFunction *F, ProtocolConformance *C) : F(F) { Impl.Conf = C; }
+    FuncImpl(SILFunction *F, ClassDecl *Cl) : F(F), Impl(Cl) {}
+    FuncImpl(SILFunction *F, ProtocolConformance *C) : F(F), Impl(C) {}
 
     /// The implementing function.
     SILFunction *F;
 
-    union {
-      /// In case of a vtable method.
-      ClassDecl *Cl;
-
-      /// In case of a witness method.
-      ProtocolConformance *Conf;
-    } Impl;
+    /// This is a class decl if we are tracking a class_method (i.e. a vtable
+    /// method) and a protocol conformance if we are tracking a witness_method.
+    PointerUnion<ClassDecl *, ProtocolConformance *> Impl;
   };
 
   /// Stores which functions implement a vtable or witness table method.
@@ -98,8 +93,8 @@ protected:
   /// Checks is a function is alive, e.g. because it is visible externally.
   bool isAnchorFunction(SILFunction *F) {
 
-    // Remove internal functions that are not referenced by anything.
-    if (isPossiblyUsedExternally(F->getLinkage(), Module->isWholeModule()))
+    // Functions that may be used externally cannot be removed.
+    if (F->isPossiblyUsedExternally())
       return true;
 
     // ObjC functions are called through the runtime and are therefore alive
@@ -107,16 +102,10 @@ protected:
     if (F->getRepresentation() == SILFunctionTypeRepresentation::ObjCMethod)
       return true;
 
-    // If function is marked as "keep-as-public", don't remove it.
-    // Change its linkage to public, so that other applications can refer to it.
-    // It is important that this transformation is done at the end of
-    // a pipeline, as it may break some optimizations.
-    if (F->isKeepAsPublic()) {
-      F->setLinkage(SILLinkage::Public);
-      DEBUG(llvm::dbgs() << "DFE: Preserve the specialization "
-                         << F->getName() << '\n');
+    // Global initializers are always emitted into the defining module and
+    // their bodies are never SIL serialized.
+    if (F->isGlobalInit())
       return true;
-    }
 
     return false;
   }
@@ -153,7 +142,8 @@ protected:
   /// Marks all contained functions and witness tables of a witness table as
   /// alive.
   void makeAlive(SILWitnessTable *WT) {
-    DEBUG(llvm::dbgs() << "    scan witness table " << WT->getName() << '\n');
+    LLVM_DEBUG(llvm::dbgs() << "    scan witness table " << WT->getName()
+                            << '\n');
 
     AliveFunctionsAndTables.insert(WT);
     for (const SILWitnessTable::Entry &entry : WT->getEntries()) {
@@ -184,28 +174,37 @@ protected:
           break;
 
         case SILWitnessTable::Invalid:
-        case SILWitnessTable::MissingOptional:
         case SILWitnessTable::AssociatedType:
           break;
       }
     }
 
+    for (const auto &conf : WT->getConditionalConformances()) {
+      if (conf.Conformance.isConcrete())
+        ensureAliveConformance(conf.Conformance.getConcrete());
+    }
   }
-  
+
   /// Marks the declarations referenced by a key path pattern as alive if they
   /// aren't yet.
-  void ensureKeyPathComponentsAreAlive(KeyPathPattern *KP) {
-    for (auto &component : KP->getComponents()) {
-      switch (component.getKind()) {
-      case KeyPathPatternComponent::Kind::SettableProperty:
-        ensureAlive(component.getComputedPropertySetter());
-        LLVM_FALLTHROUGH;
-      case KeyPathPatternComponent::Kind::GettableProperty: {
-        ensureAlive(component.getComputedPropertyGetter());
-        auto id = component.getComputedPropertyId();
-        switch (id.getKind()) {
-        case KeyPathPatternComponent::ComputedPropertyId::DeclRef: {
-          auto decl = cast<AbstractFunctionDecl>(id.getDeclRef().getDecl());
+  void
+  ensureKeyPathComponentIsAlive(const KeyPathPatternComponent &component) {
+    switch (component.getKind()) {
+    case KeyPathPatternComponent::Kind::SettableProperty:
+      ensureAlive(component.getComputedPropertySetter());
+      LLVM_FALLTHROUGH;
+    case KeyPathPatternComponent::Kind::GettableProperty: {
+      ensureAlive(component.getComputedPropertyGetter());
+      auto id = component.getComputedPropertyId();
+      switch (id.getKind()) {
+      case KeyPathPatternComponent::ComputedPropertyId::DeclRef: {
+        auto declRef = id.getDeclRef();
+        if (declRef.isForeign) {
+          // Nothing to do here: foreign functions aren't ours to be deleting.
+          // (And even if they were, they're ObjC-dispatched and thus anchored
+          // already: see isAnchorFunction)
+        } else {
+          auto decl = cast<AbstractFunctionDecl>(declRef.getDecl());
           if (auto clas = dyn_cast<ClassDecl>(decl->getDeclContext())) {
             ensureAliveClassMethod(getMethodInfo(decl, /*witness*/ false),
                                    dyn_cast<FuncDecl>(decl),
@@ -215,31 +214,31 @@ protected:
           } else {
             llvm_unreachable("key path keyed by a non-class, non-protocol method");
           }
-          break;
         }
-        case KeyPathPatternComponent::ComputedPropertyId::Function:
-          ensureAlive(id.getFunction());
-          break;
-        case KeyPathPatternComponent::ComputedPropertyId::Property:
-          break;
-        }
-        
-        if (auto equals = component.getComputedPropertyIndexEquals())
-          ensureAlive(equals);
-        if (auto hash = component.getComputedPropertyIndexHash())
-          ensureAlive(hash);
+        break;
+      }
+      case KeyPathPatternComponent::ComputedPropertyId::Function:
+        ensureAlive(id.getFunction());
+        break;
+      case KeyPathPatternComponent::ComputedPropertyId::Property:
+        break;
+      }
 
-        continue;
-      }
-      case KeyPathPatternComponent::Kind::StoredProperty:
-      case KeyPathPatternComponent::Kind::OptionalChain:
-      case KeyPathPatternComponent::Kind::OptionalForce:
-      case KeyPathPatternComponent::Kind::OptionalWrap:            
-        continue;
-      }
+      if (auto equals = component.getSubscriptIndexEquals())
+        ensureAlive(equals);
+      if (auto hash = component.getSubscriptIndexHash())
+        ensureAlive(hash);
+
+      break;
+    }
+    case KeyPathPatternComponent::Kind::StoredProperty:
+    case KeyPathPatternComponent::Kind::OptionalChain:
+    case KeyPathPatternComponent::Kind::OptionalForce:
+    case KeyPathPatternComponent::Kind::OptionalWrap:
+      break;
     }
   }
-  
+
   /// Marks a function as alive if it is not alive yet.
   void ensureAlive(SILFunction *F) {
     if (!isAlive(F))
@@ -279,14 +278,14 @@ protected:
     // All implementations of derived classes may be called.
     if (isDerivedOrEqual(ImplCl, MethodCl))
       return true;
-    
+
     // Check if the method implementation is the same in a super class, i.e.
     // it is not overridden in the derived class.
     auto *Impl1 = MethodCl->findImplementingMethod(FD);
     assert(Impl1);
     auto *Impl2 = ImplCl->findImplementingMethod(FD);
     assert(Impl2);
-    
+
     return Impl1 == Impl2;
   }
 
@@ -300,7 +299,8 @@ protected:
 
     for (FuncImpl &FImpl : mi->implementingFunctions) {
       if (!isAlive(FImpl.F) &&
-          canHaveSameImplementation(FD, MethodCl, FImpl.Impl.Cl)) {
+          canHaveSameImplementation(FD, MethodCl,
+                                    FImpl.Impl.get<ClassDecl *>())) {
         makeAlive(FImpl.F);
       } else {
         allImplsAreCalled = false;
@@ -317,9 +317,10 @@ protected:
       return;
     mi->methodIsCalled = true;
     for (FuncImpl &FImpl : mi->implementingFunctions) {
-      if (FImpl.Impl.Conf) {
-        SILWitnessTable *WT = Module->lookUpWitnessTable(FImpl.Impl.Conf,
-                                                  /*deserializeLazily*/ false);
+      if (auto *Conf = FImpl.Impl.dyn_cast<ProtocolConformance *>()) {
+        SILWitnessTable *WT =
+            Module->lookUpWitnessTable(Conf,
+                                       /*deserializeLazily*/ false);
         if (!WT || isAlive(WT))
           makeAlive(FImpl.F);
       } else {
@@ -340,7 +341,7 @@ protected:
   /// Scans all references inside a function.
   void scanFunction(SILFunction *F) {
 
-    DEBUG(llvm::dbgs() << "    scan function " << F->getName() << '\n');
+    LLVM_DEBUG(llvm::dbgs() << "    scan function " << F->getName() << '\n');
 
     // First scan all instructions of the function.
     for (SILBasicBlock &BB : *F) {
@@ -362,13 +363,21 @@ protected:
         } else if (auto *FRI = dyn_cast<FunctionRefInst>(&I)) {
           ensureAlive(FRI->getReferencedFunction());
         } else if (auto *KPI = dyn_cast<KeyPathInst>(&I)) {
-          ensureKeyPathComponentsAreAlive(KPI->getPattern());
+          for (auto &component : KPI->getPattern()->getComponents())
+            ensureKeyPathComponentIsAlive(component);
         }
       }
     }
   }
 
   /// Retrieve the visibility information from the AST.
+  ///
+  /// This differs from SILModule::isVisibleExternally(VarDecl *) because of
+  /// it's handling of class methods. It returns true for methods whose
+  /// declarations are not directly visible externally, but have been imported
+  /// from another module. This ensures that entries aren't deleted from vtables
+  /// imported from the stdlib.
+  /// FIXME: Passes should not embed special logic for handling linkage.
   bool isVisibleExternally(const ValueDecl *decl) {
     AccessLevel access = decl->getEffectiveAccess();
     SILLinkage linkage;
@@ -388,9 +397,7 @@ protected:
     if (isPossiblyUsedExternally(linkage, Module->isWholeModule()))
       return true;
 
-    // If a vtable or witness table (method) is only visible in another module
-    // it can be accessed inside that module and we don't see this access.
-    // We hit this case e.g. if a table is imported from the stdlib.
+    // Special case for vtable visibility.
     if (decl->getDeclContext()->getParentModule() != Module->getSwiftModule())
       return true;
 
@@ -408,12 +415,13 @@ protected:
 
     for (SILFunction &F : *Module) {
       if (isAnchorFunction(&F)) {
-        DEBUG(llvm::dbgs() << "  anchor function: " << F.getName() << "\n");
+        LLVM_DEBUG(llvm::dbgs() << "  anchor function: " << F.getName() <<"\n");
         ensureAlive(&F);
       }
 
       if (!F.shouldOptimize()) {
-        DEBUG(llvm::dbgs() << "  anchor a no optimization function: " << F.getName() << "\n");
+        LLVM_DEBUG(llvm::dbgs() << "  anchor a no optimization function: "
+                                << F.getName() << "\n");
         ensureAlive(&F);
       }
     }
@@ -426,7 +434,7 @@ public:
   /// The main entry point of the optimization.
   bool findAliveFunctions() {
 
-    DEBUG(llvm::dbgs() << "running function elimination\n");
+    LLVM_DEBUG(llvm::dbgs() << "running function elimination\n");
 
     // Find everything which may not be eliminated, e.g. because it is accessed
     // externally.
@@ -505,8 +513,6 @@ class DeadFunctionElimination : FunctionLivenessComputation {
         mi->addWitnessFunction(F, nullptr);
       }
     }
-    
-
   }
 
   /// DeadFunctionElimination pass takes functions
@@ -595,6 +601,13 @@ class DeadFunctionElimination : FunctionLivenessComputation {
         }
       }
     }
+    // Check property descriptor implementations.
+    for (SILProperty &P : Module->getPropertyList()) {
+      if (auto component = P.getComponent()) {
+        ensureKeyPathComponentIsAlive(*component);
+      }
+    }
+
   }
 
   /// Removes all dead methods from vtables and witness tables.
@@ -604,8 +617,8 @@ class DeadFunctionElimination : FunctionLivenessComputation {
       vTable.removeEntries_if([this, &changedTable]
                               (SILVTable::Entry &entry) -> bool {
         if (!isAlive(entry.Implementation)) {
-          DEBUG(llvm::dbgs() << "  erase dead vtable method " <<
-                entry.Implementation->getName() << "\n");
+          LLVM_DEBUG(llvm::dbgs() << "  erase dead vtable method "
+                                  << entry.Implementation->getName() << "\n");
           changedTable = true;
           return true;
         }
@@ -620,8 +633,8 @@ class DeadFunctionElimination : FunctionLivenessComputation {
       WT->clearMethods_if([this, &changedTable]
                           (const SILWitnessTable::MethodWitness &MW) -> bool {
         if (!isAlive(MW.Witness)) {
-          DEBUG(llvm::dbgs() << "  erase dead witness method " <<
-                MW.Witness->getName() << "\n");
+          LLVM_DEBUG(llvm::dbgs() << "  erase dead witness method "
+                                  << MW.Witness->getName() << "\n");
           changedTable = true;
           return true;
         }
@@ -639,8 +652,8 @@ class DeadFunctionElimination : FunctionLivenessComputation {
         if (!MW)
           return false;
         if (!isAlive(MW)) {
-          DEBUG(llvm::dbgs() << "  erase dead default witness method "
-                             << MW->getName() << "\n");
+          LLVM_DEBUG(llvm::dbgs() << "  erase dead default witness method "
+                                  << MW->getName() << "\n");
           changedTable = true;
           return true;
         }
@@ -657,7 +670,7 @@ public:
   /// The main entry point of the optimization.
   void eliminateFunctions(SILModuleTransform *DFEPass) {
 
-    DEBUG(llvm::dbgs() << "running dead function elimination\n");
+    LLVM_DEBUG(llvm::dbgs() << "running dead function elimination\n");
     findAliveFunctions();
 
     bool changedTables = removeDeadEntriesFromTables();
@@ -678,8 +691,8 @@ public:
       SILWitnessTable *Wt = &*Iter;
       Iter++;
       if (!isAlive(Wt)) {
-        DEBUG(llvm::dbgs() << "  erase dead witness table " << Wt->getName()
-                           << '\n');
+        LLVM_DEBUG(llvm::dbgs() << "  erase dead witness table "
+                                << Wt->getName() << '\n');
         Module->deleteWitnessTable(Wt);
       }
     }
@@ -689,179 +702,14 @@ public:
       SILFunction *F = DeadFunctions.back();
       DeadFunctions.pop_back();
 
-      DEBUG(llvm::dbgs() << "  erase dead function " << F->getName() << "\n");
+      LLVM_DEBUG(llvm::dbgs() << "  erase dead function " << F->getName()
+                              << "\n");
       NumDeadFunc++;
-      DFEPass->notifyDeleteFunction(F);
+      DFEPass->notifyWillDeleteFunction(F);
       Module->eraseFunction(F);
     }
     if (changedTables)
       DFEPass->invalidateFunctionTables();
-  }
-};
-
-} // end anonymous namespace
-
-//===----------------------------------------------------------------------===//
-//                        ExternalFunctionDefinitionsElimination
-//===----------------------------------------------------------------------===//
-
-namespace {
-
-/// This pass performs removal of external function definitions for a sake of
-/// reducing the amount of code to run through IRGen. It is supposed to run very
-/// late in the pipeline, after devirtualization, inlining and specialization
-/// passes.
-///
-/// NOTE:
-/// Overall, this pass does not try to remove any information which can be
-/// useful for LLVM code generation, e.g. for analysis of function's
-/// side-effects. Therefore it does not remove bodies of any external functions
-/// that are alive, because LLVM may analyze their bodies to determine their
-/// side-effects and use it to achieve a better optimization.
-///
-/// Current implementation does not consider functions which are reachable only
-/// via vtables or witness_tables as alive and removes their bodies, because
-/// even if they would be kept around, LLVM does not know how to look at
-/// function definitions through Swift's vtables and witness_tables.
-///
-/// TODO:
-/// Once there is a proper support for IPO in Swift compiler and/or there is
-/// a way to communicate function's side-effects without providing its body
-/// (e.g. by means of SILFunction flags, attributes, etc), it should be
-/// safe to remove bodies of all external definitions.
-
-class ExternalFunctionDefinitionsElimination : FunctionLivenessComputation {
-
-  /// ExternalFunctionDefinitionsElimination pass does not take functions
-  /// reachable via vtables and witness_tables into account when computing
-  /// a function liveness information. The only exceptions are external
-  /// transparent functions, because bodies of external transparent functions
-  /// should never be removed.
-  void findAnchorsInTables() override {
-    // Check vtable methods.
-    for (SILVTable &vTable : Module->getVTableList()) {
-      for (auto &entry : vTable.getEntries()) {
-        SILFunction *F = entry.Implementation;
-        if (F->isTransparent() && isAvailableExternally(F->getLinkage()))
-          ensureAlive(F);
-      }
-    }
-
-    // Check witness methods.
-    for (SILWitnessTable &WT : Module->getWitnessTableList()) {
-      isVisibleExternally(WT.getConformance()->getProtocol());
-      for (const SILWitnessTable::Entry &entry : WT.getEntries()) {
-        if (entry.getKind() != SILWitnessTable::Method)
-          continue;
-
-        auto methodWitness = entry.getMethodWitness();
-        SILFunction *F = methodWitness.Witness;
-        if (!F)
-          continue;
-        if (F->isTransparent() && isAvailableExternally(F->getLinkage()))
-          ensureAlive(F);
-      }
-    }
-
-    // Check default witness methods.
-    for (SILDefaultWitnessTable &WT : Module->getDefaultWitnessTableList()) {
-      for (const SILDefaultWitnessTable::Entry &entry : WT.getEntries()) {
-        if (!entry.isValid())
-          continue;
-
-        SILFunction *F = entry.getWitness();
-        if (F->isTransparent() && isAvailableExternally(F->getLinkage()))
-          ensureAlive(F);
-      }
-    }
-
-  }
-
-  bool findAliveFunctions() {
-    /// TODO: Once there is a proper support for IPO,
-    /// bodies of all external functions can be removed.
-    /// Therefore there is no need for a liveness computation.
-    /// The next line can be just replaced by:
-    /// return false;
-
-    // Keep all transparent functions alive. This is important because we have
-    // to generate code for transparent functions.
-    // Here we handle the special case if a transparent function is referenced
-    // from a non-externally-available function (i.e. a function for which we
-    // generate code). And those function is only reachable through a
-    // vtable/witness-table. In such a case we would not visit the transparent
-    // function in findAliveFunctions() because we don't consider vtables/
-    // witness-tables as anchors.
-    for (SILFunction &F : *Module) {
-      if (isAvailableExternally(F.getLinkage()))
-        continue;
-
-      for (SILBasicBlock &BB : F) {
-        for (SILInstruction &I : BB) {
-          if (auto *FRI = dyn_cast<FunctionRefInst>(&I)) {
-            SILFunction *RefF = FRI->getReferencedFunction();
-            // FIXME: Bad usage of transparent
-            if (RefF->isTransparent() && RefF->isSerialized())
-              ensureAlive(RefF);
-          }
-        }
-      }
-    }
-
-    return FunctionLivenessComputation::findAliveFunctions();
-  }
-
-  /// Try to convert definition into declaration.
-  /// Returns true if function was erased from the module.
-  bool tryToConvertExternalDefinitionIntoDeclaration(SILFunction *F) {
-    // Bail if it is a declaration already
-    if (!F->isDefinition())
-      return false;
-    // Bail if there is no external implementation of this function.
-    if (!F->isAvailableExternally())
-      return false;
-    // Bail if has a shared visibility, as there are no guarantees
-    // that an implementation is available elsewhere.
-    if (hasSharedVisibility(F->getLinkage()))
-      return false;
-    // Make this definition a declaration by removing the body of a function.
-
-    DEBUG(llvm::dbgs() << "  removed external function " << F->getName()
-          << "\n");
-    F->dropAllReferences();
-    auto &Blocks = F->getBlocks();
-    Blocks.clear();
-    assert(F->isExternalDeclaration() &&
-           "Function should be an external declaration");
-    NumEliminatedExternalDefs++;
-    return true;
-  }
-
-public:
-  ExternalFunctionDefinitionsElimination(SILModule *module)
-      : FunctionLivenessComputation(module) {}
-
-  /// Eliminate bodies of external functions which are not alive.
-  ///
-  /// Bodies of alive functions should not be removed, as LLVM may
-  /// still need them for analyzing their side-effects.
-  void eliminateFunctions(SILModuleTransform *DFEPass) {
-
-    findAliveFunctions();
-    // Get rid of definitions for all global functions that are not marked as
-    // alive.
-    for (auto FI = Module->begin(), EI = Module->end(); FI != EI;) {
-      SILFunction *F = &*FI;
-      ++FI;
-      // Do not remove bodies of any functions that are alive.
-      if (!isAlive(F)) {
-        if (tryToConvertExternalDefinitionIntoDeclaration(F)) {
-          DFEPass->notifyDeleteFunction(F);
-          if (F->getRefCount() == 0)
-            F->getModule().eraseFunction(F);
-        }
-      }
-    }
   }
 };
 
@@ -875,7 +723,7 @@ namespace {
 
 class SILDeadFuncElimination : public SILModuleTransform {
   void run() override {
-    DEBUG(llvm::dbgs() << "Running DeadFuncElimination\n");
+    LLVM_DEBUG(llvm::dbgs() << "Running DeadFuncElimination\n");
 
     // The deserializer caches functions that it deserializes so that if it is
     // asked to deserialize that function again, it does not do extra work. This
@@ -887,34 +735,12 @@ class SILDeadFuncElimination : public SILModuleTransform {
     DeadFunctionElimination deadFunctionElimination(getModule());
     deadFunctionElimination.eliminateFunctions(this);
   }
-  
-};
-
-class SILExternalFuncDefinitionsElimination : public SILModuleTransform {
-  void run() override {
-    DEBUG(llvm::dbgs() << "Running ExternalFunctionDefinitionsElimination\n");
-
-    // The deserializer caches functions that it deserializes so that if it is
-    // asked to deserialize that function again, it does not do extra work. This
-    // causes the function's reference count to be incremented causing it to be
-    // alive unnecessarily. We invalidate the SILLoaderCaches here so that we
-    // can eliminate the definitions of such functions.
-    getModule()->invalidateSILLoaderCaches();
-
-    ExternalFunctionDefinitionsElimination EFDFE(getModule());
-    EFDFE.eliminateFunctions(this);
- }
-
 };
 
 } // end anonymous namespace
 
 SILTransform *swift::createDeadFunctionElimination() {
   return new SILDeadFuncElimination();
-}
-
-SILTransform *swift::createExternalFunctionDefinitionsElimination() {
-  return new SILExternalFuncDefinitionsElimination();
 }
 
 void swift::performSILDeadFunctionElimination(SILModule *M) {

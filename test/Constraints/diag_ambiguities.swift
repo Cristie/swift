@@ -37,7 +37,9 @@ func rdar29691909(o: AnyObject) -> Any? {
 }
 
 func rdar29907555(_ value: Any!) -> String {
-  return "\(value)" // no error
+  return "\(value)" // expected-warning {{string interpolation produces a debug description for an optional value; did you mean to make this explicit?}}
+  // expected-note@-1 {{use 'String(describing:)' to silence this warning}}
+  // expected-note@-2 {{provide a default value to avoid this warning}}
 }
 
 struct SR3715 {
@@ -49,6 +51,20 @@ struct SR3715 {
   func take(_ a: [Any]) {}
 
   func test() {
-    take([overloaded]) // no error
+    take([overloaded])
+  }
+}
+
+// rdar://35116378 - Here the ambiguity is in the pre-check pass; make sure
+// we emit a diagnostic instead of crashing.
+struct Movie {}
+
+class MoviesViewController {
+  typealias itemType = Movie // expected-note {{'itemType' declared here}}
+  let itemType = [Movie].self // expected-note {{'itemType' declared here}}
+  var items: [Movie] = [Movie]()
+
+  func loadData() {
+    _ = itemType // expected-error {{ambiguous use of 'itemType'}}
   }
 }

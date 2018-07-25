@@ -62,9 +62,7 @@ static bool isUnitTest(const ValueDecl *D) {
     return false;
 
   // 4. ...takes no parameters...
-  if (FD->getParameterLists().size() != 2)
-    return false;
-  if (FD->getParameterList(1)->size() != 0)
+  if (FD->getParameters()->size() != 0)
     return false;
 
   // 5. ...is of at least 'internal' access (unless we can use
@@ -101,8 +99,8 @@ static void setFuncSymbolInfo(const FuncDecl *FD, SymbolInfo &sym) {
     }
   }
 
-  if (FD->isAccessor()) {
-    sym.SubKind = getSubKindForAccessor(FD->getAccessorKind());
+  if (auto accessor = dyn_cast<AccessorDecl>(FD)) {
+    sym.SubKind = getSubKindForAccessor(accessor->getAccessorKind());
     return;
   }
 
@@ -138,7 +136,7 @@ static SymbolKind getVarSymbolKind(const VarDecl *VD) {
 
 SymbolInfo index::getSymbolInfoForDecl(const Decl *D) {
   SymbolInfo info{ SymbolKind::Unknown, SymbolSubKind::None,
-                   SymbolPropertySet(), SymbolLanguage::Swift };
+                   SymbolLanguage::Swift, SymbolPropertySet() };
   switch (D->getKind()) {
     case DeclKind::Enum:             info.Kind = SymbolKind::Enum; break;
     case DeclKind::Struct:           info.Kind = SymbolKind::Struct; break;
@@ -188,6 +186,7 @@ SymbolInfo index::getSymbolInfoForDecl(const Decl *D) {
     case DeclKind::Param:
       info.Kind = SymbolKind::Parameter;
       break;
+    case DeclKind::Accessor:
     case DeclKind::Func:
       setFuncSymbolInfo(cast<FuncDecl>(D), info);
       break;
@@ -199,7 +198,23 @@ SymbolInfo index::getSymbolInfoForDecl(const Decl *D) {
         info.Properties |= SymbolProperty::GKInspectable;
       break;
 
-    default:
+    // Arguably these should be indexed?
+    case DeclKind::PrecedenceGroup:
+    case DeclKind::InfixOperator:
+    case DeclKind::PrefixOperator:
+    case DeclKind::PostfixOperator:
+      break;
+
+    // These all reflect some sort of uninteresting syntactic structure
+    // and don't merit indexing.
+    case DeclKind::Import:
+    case DeclKind::PatternBinding:
+    case DeclKind::EnumCase:
+    case DeclKind::TopLevelCode:
+    case DeclKind::IfConfig:
+    case DeclKind::PoundDiagnostic:
+    case DeclKind::MissingMember:
+    case DeclKind::Module:
       break;
   }
 
@@ -212,16 +227,17 @@ SymbolInfo index::getSymbolInfoForDecl(const Decl *D) {
 
 SymbolSubKind index::getSubKindForAccessor(AccessorKind AK) {
   switch (AK) {
-    case AccessorKind::NotAccessor: return SymbolSubKind::None;
-    case AccessorKind::IsGetter:    return SymbolSubKind::AccessorGetter;
-    case AccessorKind::IsSetter:    return SymbolSubKind::AccessorSetter;
-    case AccessorKind::IsWillSet:   return SymbolSubKind::SwiftAccessorWillSet;
-    case AccessorKind::IsDidSet:    return SymbolSubKind::SwiftAccessorDidSet;
-    case AccessorKind::IsAddressor: return SymbolSubKind::SwiftAccessorAddressor;
-    case AccessorKind::IsMutableAddressor:
-      return SymbolSubKind::SwiftAccessorMutableAddressor;
-    case AccessorKind::IsMaterializeForSet:
-      llvm_unreachable("unexpected MaterializeForSet");
+  case AccessorKind::Get:    return SymbolSubKind::AccessorGetter;
+  case AccessorKind::Set:    return SymbolSubKind::AccessorSetter;
+  case AccessorKind::WillSet:   return SymbolSubKind::SwiftAccessorWillSet;
+  case AccessorKind::DidSet:    return SymbolSubKind::SwiftAccessorDidSet;
+  case AccessorKind::Address: return SymbolSubKind::SwiftAccessorAddressor;
+  case AccessorKind::MutableAddress:
+    return SymbolSubKind::SwiftAccessorMutableAddressor;
+  case AccessorKind::Read:      return SymbolSubKind::SwiftAccessorRead;
+  case AccessorKind::Modify:    return SymbolSubKind::SwiftAccessorModify;
+  case AccessorKind::MaterializeForSet:
+    llvm_unreachable("unexpected MaterializeForSet");
   }
 
   llvm_unreachable("Unhandled AccessorKind in switch.");

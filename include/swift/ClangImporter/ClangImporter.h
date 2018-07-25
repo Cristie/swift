@@ -56,8 +56,20 @@ class IRGenOptions;
 class LazyResolver;
 class ModuleDecl;
 class NominalTypeDecl;
+class TypeDecl;
 class VisibleDeclConsumer;
 enum class SelectorSplitKind;
+
+/// Represents the different namespaces for types in C.
+///
+/// A simplified version of clang::Sema::LookupKind.
+enum class ClangTypeKind {
+  Typedef,
+  ObjCClass = Typedef,
+  /// Structs, enums, and unions.
+  Tag,
+  ObjCProtocol,
+};
 
 /// \brief Class that imports Clang modules into Swift, mapping directly
 /// from Clang ASTs over to Swift ASTs.
@@ -105,7 +117,7 @@ public:
   /// \brief Create a new clang::DependencyCollector customized to
   /// ClangImporter's specific uses.
   static std::shared_ptr<clang::DependencyCollector>
-  createDependencyCollector();
+  createDependencyCollector(bool TrackSystemDeps);
 
   /// \brief Check whether the module with a given name can be imported without
   /// importing it.
@@ -131,10 +143,39 @@ public:
                         ArrayRef<std::pair<Identifier, SourceLoc>> path)
                       override;
 
+  /// Determine whether \c overlayDC is within an overlay module for the
+  /// imported context enclosing \c importedDC.
+  ///
+  /// This routine is used for various hacks that are only permitted within
+  /// overlays of imported modules, e.g., Objective-C bridging conformances.
+  bool isInOverlayModuleForImportedModule(
+                                      const DeclContext *overlayDC,
+                                      const DeclContext *importedDC) override;
+
   /// \brief Look for declarations associated with the given name.
   ///
   /// \param name The name we're searching for.
   void lookupValue(DeclName name, VisibleDeclConsumer &consumer);
+
+  /// Look up a type declaration by its Clang name.
+  ///
+  /// Note that this method does no filtering. If it finds the type in a loaded
+  /// module, it returns it. This is intended for use in reflection / debugging
+  /// contexts where access is not a problem.
+  void lookupTypeDecl(StringRef clangName, ClangTypeKind kind,
+                      llvm::function_ref<void(TypeDecl*)> receiver);
+
+  /// Look up type a declaration synthesized by the Clang importer itself, using
+  /// a "related entity kind" to determine which type it should be. For example,
+  /// this can be used to find the synthesized error struct for an
+  /// NS_ERROR_ENUM.
+  ///
+  /// Note that this method does no filtering. If it finds the type in a loaded
+  /// module, it returns it. This is intended for use in reflection / debugging
+  /// contexts where access is not a problem.
+  void lookupRelatedEntity(StringRef clangName, ClangTypeKind kind,
+                           StringRef relatedEntityKind,
+                           llvm::function_ref<void(TypeDecl*)> receiver);
 
   /// Look for textually included declarations from the bridging header.
   ///
@@ -317,14 +358,6 @@ public:
 
 ImportDecl *createImportDecl(ASTContext &Ctx, DeclContext *DC, ClangNode ClangN,
                              ArrayRef<clang::Module *> Exported);
-
-/// Determine whether \c overlayDC is within an overlay module for the
-/// imported context enclosing \c importedDC.
-///
-/// This routine is used for various hacks that are only permitted within
-/// overlays of imported modules, e.g., Objective-C bridging conformances.
-bool isInOverlayModuleForImportedModule(const DeclContext *overlayDC,
-                                        const DeclContext *importedDC);
 
 } // end namespace swift
 

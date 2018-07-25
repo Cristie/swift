@@ -19,6 +19,7 @@
 #include "swift/SIL/TypeLowering.h"
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/Decl.h"
+#include "swift/AST/GenericSignature.h"
 #include "swift/AST/ForeignErrorConvention.h"
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/Attr.h"
@@ -53,8 +54,7 @@ TypeConverter::getIndicesAbstractionPattern(SubscriptDecl *decl) {
   if (auto sig = decl->getGenericSignatureOfContext())
     genericSig = sig->getCanonicalSignature();
   auto indicesTy = decl->getIndicesInterfaceType();
-  auto indicesCanTy = indicesTy->getCanonicalType(genericSig,
-                                                  *decl->getParentModule());
+  auto indicesCanTy = indicesTy->getCanonicalType(genericSig);
   return AbstractionPattern(genericSig, indicesCanTy);
 }
 
@@ -72,9 +72,8 @@ AbstractionPattern TypeConverter::getAbstractionPattern(VarDecl *var) {
   if (auto sig = var->getDeclContext()->getGenericSignatureOfContext())
     genericSig = sig->getCanonicalSignature();
 
-  CanType swiftType = var->getInterfaceType()->getCanonicalType();
-  if (auto inout = dyn_cast<InOutType>(swiftType))
-    swiftType = inout.getObjectType();
+  CanType swiftType = var->getInterfaceType()
+                         ->getCanonicalType();
 
   if (auto clangDecl = var->getClangDecl()) {
     auto clangType = getClangType(clangDecl);
@@ -95,7 +94,7 @@ AbstractionPattern TypeConverter::getAbstractionPattern(EnumElementDecl *decl) {
   assert(!decl->hasClangNode());
 
   // This cannot be implemented correctly for Optional.Some.
-  assert(decl->getParentEnum()->classifyAsOptionalType() == OTK_None &&
+  assert(!decl->getParentEnum()->isOptionalDecl() &&
          "Optional.Some does not have a unique abstraction pattern because "
          "optionals are re-abstracted");
 
@@ -146,8 +145,7 @@ AbstractionPattern::getCurriedCFunctionAsMethod(CanType origType,
 }
 
 AbstractionPattern
-AbstractionPattern::getOptional(AbstractionPattern object,
-                                OptionalTypeKind optionalKind) {
+AbstractionPattern::getOptional(AbstractionPattern object) {
   switch (object.getKind()) {
   case Kind::Invalid:
     llvm_unreachable("querying invalid abstraction pattern!");
@@ -168,19 +166,48 @@ AbstractionPattern::getOptional(AbstractionPattern object,
     return AbstractionPattern::getOpaque();
   case Kind::ClangType:
     return AbstractionPattern(object.getGenericSignature(),
-                              OptionalType::get(optionalKind, object.getType())
+                              OptionalType::get(object.getType())
                                 ->getCanonicalType(),
                               object.getClangType());
   case Kind::Type:
     return AbstractionPattern(object.getGenericSignature(),
-                              OptionalType::get(optionalKind, object.getType())
+                              OptionalType::get(object.getType())
                                 ->getCanonicalType());
   case Kind::Discard:
     return AbstractionPattern::getDiscard(object.getGenericSignature(),
-                              OptionalType::get(optionalKind, object.getType())
+                              OptionalType::get(object.getType())
                                 ->getCanonicalType());
   }
   llvm_unreachable("bad kind");
+}
+
+bool AbstractionPattern::isConcreteType() const {
+  assert(isTypeParameter());
+  return (getKind() != Kind::Opaque &&
+          GenericSig != nullptr &&
+          GenericSig->isConcreteType(getType()));
+}
+
+bool AbstractionPattern::requiresClass() {
+  switch (getKind()) {
+  case Kind::Opaque:
+    return false;
+  case Kind::Type:
+  case Kind::Discard: {
+    auto type = getType();
+    if (auto archetype = dyn_cast<ArchetypeType>(type))
+      return archetype->requiresClass();
+    else if (isa<DependentMemberType>(type) ||
+             isa<GenericTypeParamType>(type)) {
+      assert(GenericSig &&
+             "Dependent type in pattern without generic signature?");
+      return GenericSig->requiresClass(type);
+    }
+    return false;
+  }
+  default:
+    return false;
+  }
 }
 
 bool AbstractionPattern::matchesTuple(CanTupleType substType) {
@@ -766,13 +793,13 @@ AbstractionPattern AbstractionPattern::getFunctionInputType() const {
   llvm_unreachable("bad kind");
 }
 
-static CanType getAnyOptionalObjectType(CanType type) {
-  auto objectType = type.getAnyOptionalObjectType();
+static CanType getOptionalObjectType(CanType type) {
+  auto objectType = type.getOptionalObjectType();
   assert(objectType && "type was not optional");
   return objectType;
 }
 
-AbstractionPattern AbstractionPattern::getAnyOptionalObjectType() const {
+AbstractionPattern AbstractionPattern::getOptionalObjectType() const {
   switch (getKind()) {
   case Kind::Invalid:
     llvm_unreachable("querying invalid abstraction pattern!");
@@ -797,16 +824,16 @@ AbstractionPattern AbstractionPattern::getAnyOptionalObjectType() const {
     if (isTypeParameter())
       return AbstractionPattern::getOpaque();
     return AbstractionPattern(getGenericSignature(),
-                              ::getAnyOptionalObjectType(getType()));
+                              ::getOptionalObjectType(getType()));
 
   case Kind::Discard:
     return AbstractionPattern::getDiscard(getGenericSignature(),
-                                        ::getAnyOptionalObjectType(getType()));
+                                          ::getOptionalObjectType(getType()));
 
   case Kind::ClangType:
     // This is not reflected in clang types.
     return AbstractionPattern(getGenericSignature(),
-                              ::getAnyOptionalObjectType(getType()),
+                              ::getOptionalObjectType(getType()),
                               getClangType());
   }
   llvm_unreachable("bad kind");
@@ -982,8 +1009,8 @@ bool AbstractionPattern::hasSameBasicTypeStructure(CanType l, CanType r) {
   }
 
   // Optionals must match, sortof.
-  auto lObject = l.getAnyOptionalObjectType();
-  auto rObject = r.getAnyOptionalObjectType();
+  auto lObject = l.getOptionalObjectType();
+  auto rObject = r.getOptionalObjectType();
   if (lObject && rObject) {
     return hasSameBasicTypeStructure(lObject, rObject);
   } else if (lObject || rObject) {

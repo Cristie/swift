@@ -33,6 +33,9 @@ using namespace swift::irgen;
 using StringSet = llvm::StringSet<>;
 
 namespace swift {
+
+struct TBDGenOptions;
+
 namespace tbdgen {
 
 class TBDGenVisitor : public ASTVisitor<TBDGenVisitor> {
@@ -41,13 +44,10 @@ public:
   const llvm::Triple &Triple;
   const UniversalLinkageInfo &UniversalLinkInfo;
   ModuleDecl *SwiftModule;
-  StringRef InstallName;
+  TBDGenOptions &Opts;
 
 private:
   bool FileHasEntryPoint = false;
-  bool SILSerializeWitnessTables;
-
-  bool InsideAbstractStorageDecl = false;
 
   void addSymbol(StringRef name) {
     auto isNewValue = Symbols.insert(name).second;
@@ -71,14 +71,14 @@ private:
 
   void addConformances(DeclContext *DC);
 
+  void addDispatchThunk(SILDeclRef declRef);
+
 public:
   TBDGenVisitor(StringSet &symbols, const llvm::Triple &triple,
                 const UniversalLinkageInfo &universalLinkInfo,
-                ModuleDecl *swiftModule, bool silSerializeWitnessTables,
-                StringRef installName)
+                ModuleDecl *swiftModule, TBDGenOptions &opts)
       : Symbols(symbols), Triple(triple), UniversalLinkInfo(universalLinkInfo),
-        SwiftModule(swiftModule), InstallName(installName),
-        SILSerializeWitnessTables(silSerializeWitnessTables) {}
+        SwiftModule(swiftModule), Opts(opts) {}
 
   void setFileHasEntryPoint(bool hasEntryPoint) {
     FileHasEntryPoint = hasEntryPoint;
@@ -87,39 +87,22 @@ public:
       addSymbol("main");
   }
 
-  void visitMembers(Decl *D) {
-    SmallVector<Decl *, 4> members;
-    auto addMembers = [&](DeclRange range) {
-      for (auto member : range)
-        members.push_back(member);
-    };
-    if (auto ED = dyn_cast<ExtensionDecl>(D))
-      addMembers(ED->getMembers());
-    else if (auto NTD = dyn_cast<NominalTypeDecl>(D))
-      addMembers(NTD->getMembers());
-    else if (auto ASD = dyn_cast<AbstractStorageDecl>(D))
-      ASD->getAllAccessorFunctions(members);
-
-    for (auto member : members) {
-      ASTVisitor::visit(member);
-    }
-  }
+  /// \brief Adds the global symbols associated with the first file.
+  void addFirstFileSymbols();
 
   void visitPatternBindingDecl(PatternBindingDecl *PBD);
 
-  void visitValueDecl(ValueDecl *VD);
-
   void visitAbstractFunctionDecl(AbstractFunctionDecl *AFD);
 
-  void visitTypeAliasDecl(TypeAliasDecl *TAD) {
-    // any information here is encoded elsewhere
-  }
+  void visitAccessorDecl(AccessorDecl *AD);
 
   void visitNominalTypeDecl(NominalTypeDecl *NTD);
 
   void visitClassDecl(ClassDecl *CD);
 
   void visitConstructorDecl(ConstructorDecl *CD);
+
+  void visitDestructorDecl(DestructorDecl *DD);
 
   void visitExtensionDecl(ExtensionDecl *ED);
 
@@ -129,7 +112,9 @@ public:
 
   void visitVarDecl(VarDecl *VD);
 
-  void visitDecl(Decl *D) { visitMembers(D); }
+  void visitEnumDecl(EnumDecl *ED);
+
+  void visitDecl(Decl *D) {}
 };
 } // end namespace tbdgen
 } // end namespace swift

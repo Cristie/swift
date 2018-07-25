@@ -35,7 +35,7 @@ extension Dictionary {
   /// The provided `NSDictionary` will be copied to ensure that the copy can
   /// not be mutated by other code.
   public init(_cocoaDictionary: _NSDictionary) {
-    _sanityCheck(
+    assert(
       _isBridgedVerbatimToObjectiveC(Key.self) &&
       _isBridgedVerbatimToObjectiveC(Value.self),
       "Dictionary can be backed by NSDictionary storage only when both key and value are bridged verbatim to Objective-C")
@@ -80,6 +80,23 @@ extension Dictionary : _ObjectiveCBridgeable {
       return
     }
 
+    if Key.self == String.self {
+      // String and NSString have different concepts of equality, so
+      // string-keyed NSDictionaries may generate key collisions when bridged
+      // over to Swift. See rdar://problem/35995647
+      var dict = Dictionary(minimumCapacity: d.count)
+      d.enumerateKeysAndObjects({ (anyKey: Any, anyValue: Any, _) in
+        let key = Swift._forceBridgeFromObjectiveC(
+          anyKey as AnyObject, Key.self)
+        let value = Swift._forceBridgeFromObjectiveC(
+          anyValue as AnyObject, Value.self)
+        // FIXME: Log a warning if `dict` already had a value for `key`
+        dict[key] = value
+      })
+      result = dict
+      return
+    }
+
     // `Dictionary<Key, Value>` where either `Key` or `Value` is a value type
     // may not be backed by an NSDictionary.
     var builder = _DictionaryBuilder<Key, Value>(count: d.count)
@@ -115,26 +132,17 @@ extension Dictionary : _ObjectiveCBridgeable {
     // dictionary; map it to an empty dictionary.
     if _slowPath(d == nil) { return Dictionary() }
 
-    if let native = [Key : Value]._bridgeFromObjectiveCAdoptingNativeStorageOf(
-        d! as AnyObject) {
-      return native
-    }
+    var result: Dictionary? = nil
+    _forceBridgeFromObjectiveC(d!, result: &result)
+    return result!
+  }
+}
 
-    if _isBridgedVerbatimToObjectiveC(Key.self) &&
-       _isBridgedVerbatimToObjectiveC(Value.self) {
-      return [Key : Value](
-        _cocoaDictionary: unsafeBitCast(d! as AnyObject, to: _NSDictionary.self))
-    }
-
-    // `Dictionary<Key, Value>` where either `Key` or `Value` is a value type
-    // may not be backed by an NSDictionary.
-    var builder = _DictionaryBuilder<Key, Value>(count: d!.count)
-    d!.enumerateKeysAndObjects({ (anyKey: Any, anyValue: Any, _) in
-      builder.add(
-          key: Swift._forceBridgeFromObjectiveC(anyKey as AnyObject, Key.self),
-          value: Swift._forceBridgeFromObjectiveC(anyValue as AnyObject, Value.self))
-    })
-    return builder.take()
+extension NSDictionary : _HasCustomAnyHashableRepresentation {
+  // Must be @nonobjc to avoid infinite recursion during bridging
+  @nonobjc
+  public func _toCustomAnyHashable() -> AnyHashable? {
+    return AnyHashable(self as! Dictionary<AnyHashable, AnyHashable>)
   }
 }
 
@@ -184,7 +192,8 @@ extension NSDictionary : Sequence {
 
 extension NSMutableDictionary {
   // Bridging subscript.
-  override public subscript(key: Any) -> Any? {
+  @objc override public subscript(key: Any) -> Any? {
+    @objc(_swift_objectForKeyedSubscript:)
     get {
       return self.object(forKey: key)
     }
@@ -219,14 +228,14 @@ extension NSDictionary {
     let alignment = MemoryLayout<AnyObject>.alignment
     let singleSize = stride * numElems
     let totalSize = singleSize * 2
-    _sanityCheck(stride == MemoryLayout<NSCopying>.stride)
-    _sanityCheck(alignment == MemoryLayout<NSCopying>.alignment)
+    assert(stride == MemoryLayout<NSCopying>.stride)
+    assert(alignment == MemoryLayout<NSCopying>.alignment)
 
     // Allocate a buffer containing both the keys and values.
     let buffer = UnsafeMutableRawPointer.allocate(
-      bytes: totalSize, alignedTo: alignment)
+      byteCount: totalSize, alignment: alignment)
     defer {
-      buffer.deallocate(bytes: totalSize, alignedTo: alignment)
+      buffer.deallocate()
       _fixLifetime(otherDictionary)
     }
 

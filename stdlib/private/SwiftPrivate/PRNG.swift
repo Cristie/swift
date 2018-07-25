@@ -13,17 +13,17 @@
 import SwiftShims
 
 public func rand32() -> UInt32 {
-  return _swift_stdlib_cxx11_mt19937()
+  return _stdlib_cxx11_mt19937()
 }
 
 public func rand32(exclusiveUpperBound limit: UInt32) -> UInt32 {
-  return _swift_stdlib_cxx11_mt19937_uniform(limit)
+  return _stdlib_cxx11_mt19937_uniform(limit)
 }
 
 public func rand64() -> UInt64 {
   return
-    (UInt64(_swift_stdlib_cxx11_mt19937()) << 32) |
-    UInt64(_swift_stdlib_cxx11_mt19937())
+    (UInt64(_stdlib_cxx11_mt19937()) << 32) |
+    UInt64(_stdlib_cxx11_mt19937())
 }
 
 public func randInt() -> Int {
@@ -54,7 +54,7 @@ public func randArray(_ count: Int) -> [Int] {
 
 public func pickRandom<
   C : RandomAccessCollection
->(_ c: C) -> C.Iterator.Element {
+>(_ c: C) -> C.Element {
   let i = Int(rand32(exclusiveUpperBound: numericCast(c.count)))
   return c[c.index(c.startIndex, offsetBy: numericCast(i))]
 }

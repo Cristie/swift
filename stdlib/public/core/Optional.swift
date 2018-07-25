@@ -72,7 +72,7 @@
 /// optional chaining to access the `hasSuffix(_:)` method on a `String?`
 /// instance.
 ///
-///     if let isPNG = imagePaths["star"]?.hasSuffix(".png") {
+///     if imagePaths["star"]?.hasSuffix(".png") == true {
 ///         print("The star image is in PNG format")
 ///     }
 ///     // Prints "The star image is in PNG format"
@@ -118,7 +118,7 @@
 ///
 /// Unconditionally unwrapping a `nil` instance with `!` triggers a runtime
 /// error.
-@_fixed_layout
+@_frozen
 public enum Optional<Wrapped> : ExpressibleByNilLiteral {
   // The compiler has special knowledge of Optional<Wrapped>, including the fact
   // that it is an `enum` with cases named `none` and `some`.
@@ -133,7 +133,6 @@ public enum Optional<Wrapped> : ExpressibleByNilLiteral {
   case some(Wrapped)
 
   /// Creates an instance that stores the given value.
-  @_inlineable // FIXME(sil-serialize-all)
   @_transparent
   public init(_ some: Wrapped) { self = .some(some) }
 
@@ -158,7 +157,7 @@ public enum Optional<Wrapped> : ExpressibleByNilLiteral {
   ///   of the instance.
   /// - Returns: The result of the given closure. If this instance is `nil`,
   ///   returns `nil`.
-  @_inlineable
+  @inlinable
   public func map<U>(
     _ transform: (Wrapped) throws -> U
   ) rethrows -> U? {
@@ -189,7 +188,7 @@ public enum Optional<Wrapped> : ExpressibleByNilLiteral {
   ///   of the instance.  
   /// - Returns: The result of the given closure. If this instance is `nil`,
   ///   returns `nil`.
-  @_inlineable
+  @inlinable
   public func flatMap<U>(
     _ transform: (Wrapped) throws -> U?
   ) rethrows -> U? {
@@ -210,7 +209,6 @@ public enum Optional<Wrapped> : ExpressibleByNilLiteral {
   ///
   /// In this example, the assignment to the `i` variable calls this
   /// initializer behind the scenes.
-  @_inlineable // FIXME(sil-serialize-all)
   @_transparent
   public init(nilLiteral: ()) {
     self = .none
@@ -239,7 +237,7 @@ public enum Optional<Wrapped> : ExpressibleByNilLiteral {
   ///   `unsafelyUnwrapped` only when you are confident that this instance
   ///   will never be equal to `nil` and only after you've tried using the
   ///   postfix `!` operator.
-  @_inlineable
+  @inlinable
   public var unsafelyUnwrapped: Wrapped {
     @inline(__always)
     get {
@@ -254,9 +252,8 @@ public enum Optional<Wrapped> : ExpressibleByNilLiteral {
   ///
   /// This version is for internal stdlib use; it avoids any checking
   /// overhead for users, even in Debug builds.
-  @_inlineable
-  public // SPI(SwiftExperimental)
-  var _unsafelyUnwrappedUnchecked: Wrapped {
+  @usableFromInline @inlinable
+  internal var _unsafelyUnwrappedUnchecked: Wrapped {
     @inline(__always)
     get {
       if let x = self {
@@ -269,7 +266,6 @@ public enum Optional<Wrapped> : ExpressibleByNilLiteral {
 
 extension Optional : CustomDebugStringConvertible {
   /// A textual representation of this instance, suitable for debugging.
-  @_inlineable // FIXME(sil-serialize-all)
   public var debugDescription: String {
     switch self {
     case .some(let value):
@@ -284,7 +280,6 @@ extension Optional : CustomDebugStringConvertible {
 }
 
 extension Optional : CustomReflectable {
-  @_inlineable // FIXME(sil-serialize-all)
   public var customMirror: Mirror {
     switch self {
     case .some(let value):
@@ -298,113 +293,135 @@ extension Optional : CustomReflectable {
   }
 }
 
-@_inlineable // FIXME(sil-serialize-all)
 @_transparent
 public // COMPILER_INTRINSIC
 func _diagnoseUnexpectedNilOptional(_filenameStart: Builtin.RawPointer,
                                     _filenameLength: Builtin.Word,
                                     _filenameIsASCII: Builtin.Int1,
-                                    _line: Builtin.Word) {
+                                    _line: Builtin.Word,
+                                    _isImplicitUnwrap: Builtin.Int1) {
   _preconditionFailure(
-    "Unexpectedly found nil while unwrapping an Optional value",
+    Bool(_isImplicitUnwrap)
+      ? "Unexpectedly found nil while implicitly unwrapping an Optional value"
+      : "Unexpectedly found nil while unwrapping an Optional value",
     file: StaticString(_start: _filenameStart,
                        utf8CodeUnitCount: _filenameLength,
                        isASCII: _filenameIsASCII),
     line: UInt(_line))
 }
 
-/// Returns a Boolean value indicating whether two optional instances are
-/// equal.
-///
-/// Use this equal-to operator (`==`) to compare any two optional instances of
-/// a type that conforms to the `Equatable` protocol. The comparison returns
-/// `true` if both arguments are `nil` or if the two arguments wrap values
-/// that are equal. Conversely, the comparison returns `false` if only one of
-/// the arguments is `nil` or if the two arguments wrap values that are not
-/// equal.
-///
-///     let group1 = [1, 2, 3, 4, 5]
-///     let group2 = [1, 3, 5, 7, 9]
-///     if group1.first == group2.first {
-///         print("The two groups start the same.")
-///     }
-///     // Prints "The two groups start the same."
-///
-/// You can also use this operator to compare a non-optional value to an
-/// optional that wraps the same type. The non-optional value is wrapped as an
-/// optional before the comparison is made. In the following example, the
-/// `numberToMatch` constant is wrapped as an optional before comparing to the
-/// optional `numberFromString`:
-///
-///     let numberToFind: Int = 23
-///     let numberFromString: Int? = Int("23")      // Optional(23)
-///     if numberToFind == numberFromString {
-///         print("It's a match!")
-///     }
-///     // Prints "It's a match!"
-///
-/// An instance that is expressed as a literal can also be used with this
-/// operator. In the next example, an integer literal is compared with the
-/// optional integer `numberFromString`. The literal `23` is inferred as an
-/// `Int` instance and then wrapped as an optional before the comparison is
-/// performed.
-///
-///     if 23 == numberFromString {
-///         print("It's a match!")
-///     }
-///     // Prints "It's a match!"
-///
-/// - Parameters:
-///   - lhs: An optional value to compare.
-///   - rhs: Another optional value to compare.
-@_inlineable
-public func == <T: Equatable>(lhs: T?, rhs: T?) -> Bool {
-  switch (lhs, rhs) {
-  case let (l?, r?):
-    return l == r
-  case (nil, nil):
-    return true
-  default:
-    return false
+extension Optional : Equatable where Wrapped : Equatable {
+  /// Returns a Boolean value indicating whether two optional instances are
+  /// equal.
+  ///
+  /// Use this equal-to operator (`==`) to compare any two optional instances of
+  /// a type that conforms to the `Equatable` protocol. The comparison returns
+  /// `true` if both arguments are `nil` or if the two arguments wrap values
+  /// that are equal. Conversely, the comparison returns `false` if only one of
+  /// the arguments is `nil` or if the two arguments wrap values that are not
+  /// equal.
+  ///
+  ///     let group1 = [1, 2, 3, 4, 5]
+  ///     let group2 = [1, 3, 5, 7, 9]
+  ///     if group1.first == group2.first {
+  ///         print("The two groups start the same.")
+  ///     }
+  ///     // Prints "The two groups start the same."
+  ///
+  /// You can also use this operator to compare a non-optional value to an
+  /// optional that wraps the same type. The non-optional value is wrapped as an
+  /// optional before the comparison is made. In the following example, the
+  /// `numberToMatch` constant is wrapped as an optional before comparing to the
+  /// optional `numberFromString`:
+  ///
+  ///     let numberToFind: Int = 23
+  ///     let numberFromString: Int? = Int("23")      // Optional(23)
+  ///     if numberToFind == numberFromString {
+  ///         print("It's a match!")
+  ///     }
+  ///     // Prints "It's a match!"
+  ///
+  /// An instance that is expressed as a literal can also be used with this
+  /// operator. In the next example, an integer literal is compared with the
+  /// optional integer `numberFromString`. The literal `23` is inferred as an
+  /// `Int` instance and then wrapped as an optional before the comparison is
+  /// performed.
+  ///
+  ///     if 23 == numberFromString {
+  ///         print("It's a match!")
+  ///     }
+  ///     // Prints "It's a match!"
+  ///
+  /// - Parameters:
+  ///   - lhs: An optional value to compare.
+  ///   - rhs: Another optional value to compare.
+  @inlinable
+  public static func ==(lhs: Wrapped?, rhs: Wrapped?) -> Bool {
+    switch (lhs, rhs) {
+    case let (l?, r?):
+      return l == r
+    case (nil, nil):
+      return true
+    default:
+      return false
+    }
+  }
+  
+  /// Returns a Boolean value indicating whether two optional instances are not
+  /// equal.
+  ///
+  /// Use this not-equal-to operator (`!=`) to compare any two optional instances
+  /// of a type that conforms to the `Equatable` protocol. The comparison
+  /// returns `true` if only one of the arguments is `nil` or if the two
+  /// arguments wrap values that are not equal. The comparison returns `false`
+  /// if both arguments are `nil` or if the two arguments wrap values that are
+  /// equal.
+  ///
+  ///     let group1 = [2, 4, 6, 8, 10]
+  ///     let group2 = [1, 3, 5, 7, 9]
+  ///     if group1.first != group2.first {
+  ///         print("The two groups start differently.")
+  ///     }
+  ///     // Prints "The two groups start differently."
+  ///
+  /// You can also use this operator to compare a non-optional value to an
+  /// optional that wraps the same type. The non-optional value is wrapped as an
+  /// optional before the comparison is made. In this example, the
+  /// `numberToMatch` constant is wrapped as an optional before comparing to the
+  /// optional `numberFromString`:
+  ///
+  ///     let numberToFind: Int = 23
+  ///     let numberFromString: Int? = Int("not-a-number")      // nil
+  ///     if numberToFind != numberFromString {
+  ///         print("No match.")
+  ///     }
+  ///     // Prints "No match."
+  ///
+  /// - Parameters:
+  ///   - lhs: An optional value to compare.
+  ///   - rhs: Another optional value to compare.
+  @inlinable
+  public static func !=(lhs: Wrapped?, rhs: Wrapped?) -> Bool {
+    return !(lhs == rhs)
   }
 }
 
-/// Returns a Boolean value indicating whether two optional instances are not
-/// equal.
-///
-/// Use this not-equal-to operator (`!=`) to compare any two optional instances
-/// of a type that conforms to the `Equatable` protocol. The comparison
-/// returns `true` if only one of the arguments is `nil` or if the two
-/// arguments wrap values that are not equal. The comparison returns `false`
-/// if both arguments are `nil` or if the two arguments wrap values that are
-/// equal.
-///
-///     let group1 = [2, 4, 6, 8, 10]
-///     let group2 = [1, 3, 5, 7, 9]
-///     if group1.first != group2.first {
-///         print("The two groups start differently.")
-///     }
-///     // Prints "The two groups start differently."
-///
-/// You can also use this operator to compare a non-optional value to an
-/// optional that wraps the same type. The non-optional value is wrapped as an
-/// optional before the comparison is made. In this example, the
-/// `numberToMatch` constant is wrapped as an optional before comparing to the
-/// optional `numberFromString`:
-///
-///     let numberToFind: Int = 23
-///     let numberFromString: Int? = Int("not-a-number")      // nil
-///     if numberToFind != numberFromString {
-///         print("No match.")
-///     }
-///     // Prints "No match."
-///
-/// - Parameters:
-///   - lhs: An optional value to compare.
-///   - rhs: Another optional value to compare.
-@_inlineable
-public func != <T : Equatable>(lhs: T?, rhs: T?) -> Bool {
-  return !(lhs == rhs)
+extension Optional: Hashable where Wrapped: Hashable {
+  /// Hashes the essential components of this value by feeding them into the
+  /// given hasher.
+  ///
+  /// - Parameter hasher: The hasher to use when combining the components
+  ///   of this instance.
+  @inlinable
+  public func hash(into hasher: inout Hasher) {
+    switch self {
+    case .none:
+      hasher.combine(0 as UInt8)
+    case .some(let wrapped):
+      hasher.combine(1 as UInt8)
+      hasher.combine(wrapped)
+    }
+  }
 }
 
 // Enable pattern matching against the nil literal, even if the element type
@@ -412,181 +429,177 @@ public func != <T : Equatable>(lhs: T?, rhs: T?) -> Bool {
 @_fixed_layout
 public struct _OptionalNilComparisonType : ExpressibleByNilLiteral {
   /// Create an instance initialized with `nil`.
-  @_inlineable // FIXME(sil-serialize-all)
   @_transparent
   public init(nilLiteral: ()) {
   }
 }
 
-/// Returns a Boolean value indicating whether an argument matches `nil`.
-///
-/// You can use the pattern-matching operator (`~=`) to test whether an
-/// optional instance is `nil` even when the wrapped value's type does not
-/// conform to the `Equatable` protocol. The pattern-matching operator is used
-/// internally in `case` statements for pattern matching.
-///
-/// The following example declares the `stream` variable as an optional
-/// instance of a hypothetical `DataStream` type, and then uses a `switch`
-/// statement to determine whether the stream is `nil` or has a configured
-/// value. When evaluating the `nil` case of the `switch` statement, this
-/// operator is called behind the scenes.
-///
-///     var stream: DataStream? = nil
-///     switch stream {
-///     case nil:
-///         print("No data stream is configured.")
-///     case let x?:
-///         print("The data stream has \(x.availableBytes) bytes available.")
-///     }
-///     // Prints "No data stream is configured."
-///
-/// - Note: To test whether an instance is `nil` in an `if` statement, use the
-///   equal-to operator (`==`) instead of the pattern-matching operator. The
-///   pattern-matching operator is primarily intended to enable `case`
-///   statement pattern matching.
-///
-/// - Parameters:
-///   - lhs: A `nil` literal.
-///   - rhs: A value to match against `nil`.
-@_inlineable // FIXME(sil-serialize-all)
-@_transparent
-public func ~= <T>(lhs: _OptionalNilComparisonType, rhs: T?) -> Bool {
-  switch rhs {
-  case .some(_):
-    return false
-  case .none:
-    return true
+extension Optional {
+  /// Returns a Boolean value indicating whether an argument matches `nil`.
+  ///
+  /// You can use the pattern-matching operator (`~=`) to test whether an
+  /// optional instance is `nil` even when the wrapped value's type does not
+  /// conform to the `Equatable` protocol. The pattern-matching operator is used
+  /// internally in `case` statements for pattern matching.
+  ///
+  /// The following example declares the `stream` variable as an optional
+  /// instance of a hypothetical `DataStream` type, and then uses a `switch`
+  /// statement to determine whether the stream is `nil` or has a configured
+  /// value. When evaluating the `nil` case of the `switch` statement, this
+  /// operator is called behind the scenes.
+  ///
+  ///     var stream: DataStream? = nil
+  ///     switch stream {
+  ///     case nil:
+  ///         print("No data stream is configured.")
+  ///     case let x?:
+  ///         print("The data stream has \(x.availableBytes) bytes available.")
+  ///     }
+  ///     // Prints "No data stream is configured."
+  ///
+  /// - Note: To test whether an instance is `nil` in an `if` statement, use the
+  ///   equal-to operator (`==`) instead of the pattern-matching operator. The
+  ///   pattern-matching operator is primarily intended to enable `case`
+  ///   statement pattern matching.
+  ///
+  /// - Parameters:
+  ///   - lhs: A `nil` literal.
+  ///   - rhs: A value to match against `nil`.
+  @_transparent
+  public static func ~=(lhs: _OptionalNilComparisonType, rhs: Wrapped?) -> Bool {
+    switch rhs {
+    case .some:
+      return false
+    case .none:
+      return true
+    }
   }
-}
 
-// Enable equality comparisons against the nil literal, even if the
-// element type isn't equatable
+  // Enable equality comparisons against the nil literal, even if the
+  // element type isn't equatable
 
-/// Returns a Boolean value indicating whether the left-hand-side argument is
-/// `nil`.
-///
-/// You can use this equal-to operator (`==`) to test whether an optional
-/// instance is `nil` even when the wrapped value's type does not conform to
-/// the `Equatable` protocol.
-///
-/// The following example declares the `stream` variable as an optional
-/// instance of a hypothetical `DataStream` type. Although `DataStream` is not
-/// an `Equatable` type, this operator allows checking whether `stream` is
-/// `nil`.
-///
-///     var stream: DataStream? = nil
-///     if stream == nil {
-///         print("No data stream is configured.")
-///     }
-///     // Prints "No data stream is configured."
-///
-/// - Parameters:
-///   - lhs: A value to compare to `nil`.
-///   - rhs: A `nil` literal.
-@_inlineable // FIXME(sil-serialize-all)
-@_transparent
-public func == <T>(lhs: T?, rhs: _OptionalNilComparisonType) -> Bool {
-  switch lhs {
-  case .some(_):
-    return false
-  case .none:
-    return true
+  /// Returns a Boolean value indicating whether the left-hand-side argument is
+  /// `nil`.
+  ///
+  /// You can use this equal-to operator (`==`) to test whether an optional
+  /// instance is `nil` even when the wrapped value's type does not conform to
+  /// the `Equatable` protocol.
+  ///
+  /// The following example declares the `stream` variable as an optional
+  /// instance of a hypothetical `DataStream` type. Although `DataStream` is not
+  /// an `Equatable` type, this operator allows checking whether `stream` is
+  /// `nil`.
+  ///
+  ///     var stream: DataStream? = nil
+  ///     if stream == nil {
+  ///         print("No data stream is configured.")
+  ///     }
+  ///     // Prints "No data stream is configured."
+  ///
+  /// - Parameters:
+  ///   - lhs: A value to compare to `nil`.
+  ///   - rhs: A `nil` literal.
+  @_transparent
+  public static func ==(lhs: Wrapped?, rhs: _OptionalNilComparisonType) -> Bool {
+    switch lhs {
+    case .some:
+      return false
+    case .none:
+      return true
+    }
   }
-}
 
-/// Returns a Boolean value indicating whether the left-hand-side argument is
-/// not `nil`.
-///
-/// You can use this not-equal-to operator (`!=`) to test whether an optional
-/// instance is not `nil` even when the wrapped value's type does not conform
-/// to the `Equatable` protocol.
-///
-/// The following example declares the `stream` variable as an optional
-/// instance of a hypothetical `DataStream` type. Although `DataStream` is not
-/// an `Equatable` type, this operator allows checking whether `stream` wraps
-/// a value and is therefore not `nil`.
-///
-///     var stream: DataStream? = fetchDataStream()
-///     if stream != nil {
-///         print("The data stream has been configured.")
-///     }
-///     // Prints "The data stream has been configured."
-///
-/// - Parameters:
-///   - lhs: A value to compare to `nil`.
-///   - rhs: A `nil` literal.
-@_inlineable // FIXME(sil-serialize-all)
-@_transparent
-public func != <T>(lhs: T?, rhs: _OptionalNilComparisonType) -> Bool {
-  switch lhs {
-  case .some(_):
-    return true
-  case .none:
-    return false
+  /// Returns a Boolean value indicating whether the left-hand-side argument is
+  /// not `nil`.
+  ///
+  /// You can use this not-equal-to operator (`!=`) to test whether an optional
+  /// instance is not `nil` even when the wrapped value's type does not conform
+  /// to the `Equatable` protocol.
+  ///
+  /// The following example declares the `stream` variable as an optional
+  /// instance of a hypothetical `DataStream` type. Although `DataStream` is not
+  /// an `Equatable` type, this operator allows checking whether `stream` wraps
+  /// a value and is therefore not `nil`.
+  ///
+  ///     var stream: DataStream? = fetchDataStream()
+  ///     if stream != nil {
+  ///         print("The data stream has been configured.")
+  ///     }
+  ///     // Prints "The data stream has been configured."
+  ///
+  /// - Parameters:
+  ///   - lhs: A value to compare to `nil`.
+  ///   - rhs: A `nil` literal.
+  @_transparent
+  public static func !=(lhs: Wrapped?, rhs: _OptionalNilComparisonType) -> Bool {
+    switch lhs {
+    case .some:
+      return true
+    case .none:
+      return false
+    }
   }
-}
 
-/// Returns a Boolean value indicating whether the right-hand-side argument is
-/// `nil`.
-///
-/// You can use this equal-to operator (`==`) to test whether an optional
-/// instance is `nil` even when the wrapped value's type does not conform to
-/// the `Equatable` protocol.
-///
-/// The following example declares the `stream` variable as an optional
-/// instance of a hypothetical `DataStream` type. Although `DataStream` is not
-/// an `Equatable` type, this operator allows checking whether `stream` is
-/// `nil`.
-///
-///     var stream: DataStream? = nil
-///     if nil == stream {
-///         print("No data stream is configured.")
-///     }
-///     // Prints "No data stream is configured."
-///
-/// - Parameters:
-///   - lhs: A `nil` literal.
-///   - rhs: A value to compare to `nil`.
-@_inlineable // FIXME(sil-serialize-all)
-@_transparent
-public func == <T>(lhs: _OptionalNilComparisonType, rhs: T?) -> Bool {
-  switch rhs {
-  case .some(_):
-    return false
-  case .none:
-    return true
+  /// Returns a Boolean value indicating whether the right-hand-side argument is
+  /// `nil`.
+  ///
+  /// You can use this equal-to operator (`==`) to test whether an optional
+  /// instance is `nil` even when the wrapped value's type does not conform to
+  /// the `Equatable` protocol.
+  ///
+  /// The following example declares the `stream` variable as an optional
+  /// instance of a hypothetical `DataStream` type. Although `DataStream` is not
+  /// an `Equatable` type, this operator allows checking whether `stream` is
+  /// `nil`.
+  ///
+  ///     var stream: DataStream? = nil
+  ///     if nil == stream {
+  ///         print("No data stream is configured.")
+  ///     }
+  ///     // Prints "No data stream is configured."
+  ///
+  /// - Parameters:
+  ///   - lhs: A `nil` literal.
+  ///   - rhs: A value to compare to `nil`.
+  @_transparent
+  public static func ==(lhs: _OptionalNilComparisonType, rhs: Wrapped?) -> Bool {
+    switch rhs {
+    case .some:
+      return false
+    case .none:
+      return true
+    }
   }
-}
 
-/// Returns a Boolean value indicating whether the right-hand-side argument is
-/// not `nil`.
-///
-/// You can use this not-equal-to operator (`!=`) to test whether an optional
-/// instance is not `nil` even when the wrapped value's type does not conform
-/// to the `Equatable` protocol.
-///
-/// The following example declares the `stream` variable as an optional
-/// instance of a hypothetical `DataStream` type. Although `DataStream` is not
-/// an `Equatable` type, this operator allows checking whether `stream` wraps
-/// a value and is therefore not `nil`.
-///
-///     var stream: DataStream? = fetchDataStream()
-///     if nil != stream {
-///         print("The data stream has been configured.")
-///     }
-///     // Prints "The data stream has been configured."
-///
-/// - Parameters:
-///   - lhs: A `nil` literal.
-///   - rhs: A value to compare to `nil`.
-@_inlineable // FIXME(sil-serialize-all)
-@_transparent
-public func != <T>(lhs: _OptionalNilComparisonType, rhs: T?) -> Bool {
-  switch rhs {
-  case .some(_):
-    return true
-  case .none:
-    return false
+  /// Returns a Boolean value indicating whether the right-hand-side argument is
+  /// not `nil`.
+  ///
+  /// You can use this not-equal-to operator (`!=`) to test whether an optional
+  /// instance is not `nil` even when the wrapped value's type does not conform
+  /// to the `Equatable` protocol.
+  ///
+  /// The following example declares the `stream` variable as an optional
+  /// instance of a hypothetical `DataStream` type. Although `DataStream` is not
+  /// an `Equatable` type, this operator allows checking whether `stream` wraps
+  /// a value and is therefore not `nil`.
+  ///
+  ///     var stream: DataStream? = fetchDataStream()
+  ///     if nil != stream {
+  ///         print("The data stream has been configured.")
+  ///     }
+  ///     // Prints "The data stream has been configured."
+  ///
+  /// - Parameters:
+  ///   - lhs: A `nil` literal.
+  ///   - rhs: A value to compare to `nil`.
+  @_transparent
+  public static func !=(lhs: _OptionalNilComparisonType, rhs: Wrapped?) -> Bool {
+    switch rhs {
+    case .some:
+      return true
+    case .none:
+      return false
+    }
   }
 }
 
@@ -622,7 +635,6 @@ public func != <T>(lhs: _OptionalNilComparisonType, rhs: T?) -> Bool {
 ///   - optional: An optional value.
 ///   - defaultValue: A value to use as a default. `defaultValue` is the same
 ///     type as the `Wrapped` type of `optional`.
-@_inlineable // FIXME(sil-serialize-all)
 @_transparent
 public func ?? <T>(optional: T?, defaultValue: @autoclosure () throws -> T)
     rethrows -> T {
@@ -676,7 +688,6 @@ public func ?? <T>(optional: T?, defaultValue: @autoclosure () throws -> T)
 ///   - optional: An optional value.
 ///   - defaultValue: A value to use as a default. `defaultValue` and
 ///     `optional` have the same type.
-@_inlineable // FIXME(sil-serialize-all)
 @_transparent
 public func ?? <T>(optional: T?, defaultValue: @autoclosure () throws -> T?)
     rethrows -> T? {
@@ -695,14 +706,13 @@ public func ?? <T>(optional: T?, defaultValue: @autoclosure () throws -> T?)
 #if _runtime(_ObjC)
 extension Optional : _ObjectiveCBridgeable {
   // The object that represents `none` for an Optional of this type.
-  @_inlineable // FIXME(sil-serialize-all)
-  @_versioned // FIXME(sil-serialize-all)
+  @inlinable // FIXME(sil-serialize-all)
   internal static var _nilSentinel : AnyObject {
     @_silgen_name("_swift_Foundation_getOptionalNilSentinelObject")
     get
   }
 
-  @_inlineable // FIXME(sil-serialize-all)
+  @inlinable // FIXME(sil-serialize-all)
   public func _bridgeToObjectiveC() -> AnyObject {
     // Bridge a wrapped value by unwrapping.
     if let value = self {
@@ -712,7 +722,7 @@ extension Optional : _ObjectiveCBridgeable {
     return type(of: self)._nilSentinel
   }
 
-  @_inlineable // FIXME(sil-serialize-all)
+  @inlinable // FIXME(sil-serialize-all)
   public static func _forceBridgeFromObjectiveC(
     _ source: AnyObject,
     result: inout Optional<Wrapped>?
@@ -730,7 +740,7 @@ extension Optional : _ObjectiveCBridgeable {
     result = .some(.some(unwrappedResult))
   }
 
-  @_inlineable // FIXME(sil-serialize-all)
+  @inlinable // FIXME(sil-serialize-all)
   public static func _conditionallyBridgeFromObjectiveC(
     _ source: AnyObject,
     result: inout Optional<Wrapped>?
@@ -754,7 +764,7 @@ extension Optional : _ObjectiveCBridgeable {
     }
   }
 
-  @_inlineable // FIXME(sil-serialize-all)
+  @inlinable // FIXME(sil-serialize-all)
   public static func _unconditionallyBridgeFromObjectiveC(_ source: AnyObject?)
       -> Optional<Wrapped> {
     if let nonnullSource = source {

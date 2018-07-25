@@ -152,7 +152,7 @@ CanArchetypeType swift::getOpenedArchetypeOf(const SILInstruction *I) {
       isa<OpenExistentialBoxInst>(I) || isa<OpenExistentialBoxValueInst>(I) ||
       isa<OpenExistentialMetatypeInst>(I) || isa<OpenExistentialValueInst>(I)) {
     auto SVI = cast<SingleValueInstruction>(I);
-    auto Ty = getOpenedArchetypeOf(SVI->getType().getSwiftRValueType());
+    auto Ty = getOpenedArchetypeOf(SVI->getType().getASTType());
     assert(Ty && Ty->isOpenedExistential() &&
            "Type should be an opened archetype");
     return Ty;
@@ -187,9 +187,13 @@ SILValue SILOpenedArchetypesState::getOpenedArchetypeDef(
   // First perform a quick check.
   for (auto &Op : OpenedArchetypeOperands) {
     auto Def = Op.get();
-    if (auto SVI = dyn_cast<SingleValueInstruction>(Def))
+    if (auto *SVI = dyn_cast<SingleValueInstruction>(Def))
       if (getOpenedArchetypeOf(SVI) == archetypeTy)
         return Def;
+    if (auto *MVIR = dyn_cast<MultipleValueInstructionResult>(Def)) {
+      if (getOpenedArchetypeOf(MVIR->getParent()) == archetypeTy)
+        return Def;
+    }
   }
   // Then use a regular lookup.
   if (OpenedArchetypesTracker)

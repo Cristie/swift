@@ -115,16 +115,23 @@ private:
   void visitFallthroughStmt(FallthroughStmt *) {}
   void visitFailStmt(FailStmt *) {}
   void visitReturnStmt(ReturnStmt *) {}
+  void visitYieldStmt(YieldStmt *) {}
   void visitThrowStmt(ThrowStmt *) {}
   void visitDeferStmt(DeferStmt *DS) {
     // Nothing in the defer is visible.
   }
 
   void checkStmtCondition(const StmtCondition &Cond) {
-    for (auto entry : Cond)
-      if (auto *P = entry.getPatternOrNull())
-        if (!isReferencePointInRange(entry.getSourceRange()))
+    SourceLoc start = SourceLoc();
+    for (auto entry : Cond) {
+      if (start.isInvalid())
+        start = entry.getStartLoc();
+      if (auto *P = entry.getPatternOrNull()) {
+        SourceRange previousConditionsToHere = SourceRange(start, entry.getEndLoc());
+        if (!isReferencePointInRange(previousConditionsToHere))
           checkPattern(P, DeclVisibilityKind::LocalVariable);
+      }
+    }
   }
 
   void visitIfStmt(IfStmt *S) {
@@ -219,7 +226,7 @@ private:
         }
       }
     }
-    if (!inPatterns && items.size() > 0)
+    if (!inPatterns && !items.empty())
       checkPattern(items[0].getPattern(), DeclVisibilityKind::LocalVariable);
     visit(body);
   }

@@ -27,6 +27,7 @@
 #include "llvm/Support/Regex.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <map>
 #include <vector>
 
 namespace swift {
@@ -110,6 +111,30 @@ struct ScalarTraits {
 };
 
 
+/// This class should be specialized by any type that can be 'null' in JSON.
+/// For example:
+///
+///    template<>
+///    struct NullableTraits<MyType *> > {
+///      static bool isNull(MyType *&ptr) {
+///        return !ptr;
+///      }
+///      static MyType &get(MyType *&ptr) {
+///        return *ptr;
+///      }
+///    };
+template<typename T>
+struct NullableTraits {
+  // Must provide:
+  //
+  // Function to return true if the value is 'null'.
+  // static bool isNull(const T &Val);
+  //
+  // Function to return a reference to the unwrapped value.
+  // static T::value_type &get(const T &Val);
+};
+
+
 /// This class should be specialized by any type that needs to be converted
 /// to/from a JSON array.  For example:
 ///
@@ -143,7 +168,7 @@ struct MissingTrait;
 template <class T>
 struct has_ScalarEnumerationTraits
 {
-  typedef void (*Signature_enumeration)(class Output&, T&);
+  using Signature_enumeration = void (*)(class Output &, T &);
 
   template <typename U>
   static char test(SameType<Signature_enumeration, &U::enumeration>*);
@@ -161,7 +186,7 @@ public:
 template <class T>
 struct has_ScalarBitSetTraits
 {
-  typedef void (*Signature_bitset)(class Output&, T&);
+  using Signature_bitset = void (*)(class Output &, T &);
 
   template <typename U>
   static char test(SameType<Signature_bitset, &U::bitset>*);
@@ -178,8 +203,8 @@ public:
 template <class T>
 struct has_ScalarTraits
 {
-  typedef void (*Signature_output)(const T&, llvm::raw_ostream&);
-  typedef bool (*Signature_mustQuote)(StringRef);
+  using Signature_output = void (*)(const T &, llvm::raw_ostream &);
+  using Signature_mustQuote = bool (*)(StringRef);
 
   template <typename U>
   static char test(SameType<Signature_output, &U::output> *,
@@ -198,7 +223,7 @@ public:
 template <class T>
 struct has_ObjectTraits
 {
-  typedef void (*Signature_mapping)(class Output&, T&);
+  using Signature_mapping = void (*)(class Output &, T &);
 
   template <typename U>
   static char test(SameType<Signature_mapping, &U::mapping>*);
@@ -214,7 +239,7 @@ public:
 template <class T>
 struct has_ObjectValidateTraits
 {
-  typedef StringRef (*Signature_validate)(class Output&, T&);
+  using Signature_validate = StringRef (*)(class Output &, T &);
 
   template <typename U>
   static char test(SameType<Signature_validate, &U::validate>*);
@@ -232,7 +257,7 @@ public:
 template <class T>
 struct has_ArrayMethodTraits
 {
-  typedef size_t (*Signature_size)(class Output&, T&);
+  using Signature_size = size_t (*)(class Output &, T &);
 
   template <typename U>
   static char test(SameType<Signature_size, &U::size>*);
@@ -248,6 +273,23 @@ public:
 template<typename T>
 struct has_ArrayTraits : public std::integral_constant<bool,
     has_ArrayMethodTraits<T>::value > { };
+
+// Test if NullableTraits<T> is defined on type T.
+template <class T>
+struct has_NullableTraits
+{
+  using Signature_isNull = bool (*)(T &);
+
+  template <typename U>
+  static char test(SameType<Signature_isNull, &U::isNull> *);
+
+  template <typename U>
+  static double test(...);
+
+public:
+  static bool const value =
+  (sizeof(test<NullableTraits<T>>(nullptr)) == 1);
+};
 
 inline bool isNumber(StringRef S) {
   static const char DecChars[] = "0123456789";
@@ -285,6 +327,7 @@ struct missingTraits : public std::integral_constant<bool,
     !has_ScalarEnumerationTraits<T>::value
  && !has_ScalarBitSetTraits<T>::value
  && !has_ScalarTraits<T>::value
+ && !has_NullableTraits<T>::value
  && !has_ObjectTraits<T>::value
  && !has_ArrayTraits<T>::value> {};
 
@@ -299,6 +342,10 @@ struct unvalidatedObjectTraits : public std::integral_constant<bool,
 && !has_ObjectValidateTraits<T>::value> {};
 
 class Output {
+public:
+  using UserInfoMap = std::map<void *, void *>;
+
+private:
   enum State {
     ArrayFirstValue,
     ArrayOtherValue,
@@ -311,12 +358,18 @@ class Output {
   bool PrettyPrint;
   bool NeedBitValueComma;
   bool EnumerationMatchFound;
+  UserInfoMap UserInfo;
 
 public:
-  Output(llvm::raw_ostream &os, bool PrettyPrint = true) : Stream(os),
-      PrettyPrint(PrettyPrint), NeedBitValueComma(false),
-      EnumerationMatchFound(false) {}
+  Output(llvm::raw_ostream &os, UserInfoMap UserInfo = {},
+         bool PrettyPrint = true)
+      : Stream(os), PrettyPrint(PrettyPrint), NeedBitValueComma(false),
+        EnumerationMatchFound(false), UserInfo(UserInfo) {}
   virtual ~Output() = default;
+
+  UserInfoMap &getUserInfo() {
+    return UserInfo;
+  }
 
   unsigned beginArray();
   bool preflightElement(unsigned, void *&);
@@ -338,6 +391,7 @@ public:
   void endBitSetScalar();
 
   void scalarString(StringRef &, bool);
+  void null();
 
   template <typename T>
   void enumCase(T &Val, const char* Str, const T ConstVal) {
@@ -576,6 +630,16 @@ jsonize(Output &out, T &Val, bool) {
     StringRef Str = Buffer.str();
     out.scalarString(Str, ScalarTraits<T>::mustQuote(Str));
   }
+}
+
+
+template<typename T>
+typename std::enable_if<has_NullableTraits<T>::value,void>::type
+jsonize(Output &out, T &Obj, bool) {
+  if (NullableTraits<T>::isNull(Obj))
+    out.null();
+  else
+    jsonize(out, NullableTraits<T>::get(Obj), true);
 }
 
 

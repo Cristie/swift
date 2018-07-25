@@ -29,6 +29,10 @@ namespace swift {
 
 class FunctionSignaturePartialSpecializer;
 
+namespace OptRemark {
+class Emitter;
+} // namespace OptRemark
+
 /// Tries to specialize an \p Apply of a generic function. It can be a full
 /// apply site or a partial apply.
 /// Replaced and now dead instructions are returned in \p DeadApplies.
@@ -38,7 +42,8 @@ class FunctionSignaturePartialSpecializer;
 /// This is the top-level entry point for specializing an existing call site.
 void trySpecializeApplyOfGeneric(
     ApplySite Apply, DeadInstructionSet &DeadApplies,
-    llvm::SmallVectorImpl<SILFunction *> &NewFunctions);
+    llvm::SmallVectorImpl<SILFunction *> &NewFunctions,
+    OptRemark::Emitter &ORE);
 
 /// Helper class to describe re-abstraction of function parameters done during
 /// specialization.
@@ -77,21 +82,18 @@ class ReabstractionInfo {
   // any transformations performed by the generic specializer.
   //
   // Maps callee's generic parameters to caller's archetypes.
-  SubstitutionList CalleeParamSubs;
+  SubstitutionMap CalleeParamSubMap;
 
   // Set of substitutions to be used to invoke a specialized function.
   //
   // Maps generic parameters of the specialized callee function to caller's
   // archetypes.
-  SubstitutionList CallerParamSubs;
+  SubstitutionMap CallerParamSubMap;
 
   // Replaces archetypes of the original callee with archetypes
   // or concrete types, if they were made concrete) of the specialized
   // callee.
-  //
-  // Maps original callee's generic parameters to specialized
-  // callee archetypes.
-  SubstitutionList ClonerParamSubs;
+  SubstitutionMap ClonerParamSubMap;
 
   // Reference to the original generic non-specialized callee function.
   SILFunction *Callee;
@@ -112,17 +114,18 @@ class ReabstractionInfo {
 
   // Create a new substituted type with the updated signature.
   CanSILFunctionType createSubstitutedType(SILFunction *OrigF,
-                                           const SubstitutionMap &SubstMap,
+                                           SubstitutionMap SubstMap,
                                            bool HasUnboundGenericParams);
 
   void createSubstitutedAndSpecializedTypes();
   bool prepareAndCheck(ApplySite Apply, SILFunction *Callee,
-                       SubstitutionList ParamSubs);
+                       SubstitutionMap ParamSubs,
+                       OptRemark::Emitter *ORE = nullptr);
   void performFullSpecializationPreparation(SILFunction *Callee,
-                                            SubstitutionList ParamSubs);
+                                            SubstitutionMap ParamSubs);
   void performPartialSpecializationPreparation(SILFunction *Caller,
                                                SILFunction *Callee,
-                                               SubstitutionList ParamSubs);
+                                               SubstitutionMap ParamSubs);
   void finishPartialSpecializationPreparation(
       FunctionSignaturePartialSpecializer &FSPS);
 
@@ -133,8 +136,9 @@ public:
   /// If specialization is not possible getSpecializedType() will return an
   /// invalid type.
   ReabstractionInfo(ApplySite Apply, SILFunction *Callee,
-                    SubstitutionList ParamSubs,
-                    bool ConvertIndirectToDirect = true);
+                    SubstitutionMap ParamSubs,
+                    bool ConvertIndirectToDirect = true,
+                    OptRemark::Emitter *ORE = nullptr);
 
   /// Constructs the ReabstractionInfo for generic function \p Callee with
   /// additional requirements. Requirements may contain new layout,
@@ -202,16 +206,16 @@ public:
     return SpecializedGenericSig;
   }
 
-  SubstitutionList getCallerParamSubstitutions() const {
-    return CallerParamSubs;
+  SubstitutionMap getCallerParamSubstitutionMap() const {
+    return CallerParamSubMap;
   }
 
-  SubstitutionList getClonerParamSubstitutions() const {
-    return ClonerParamSubs;
+  SubstitutionMap getClonerParamSubstitutionMap() const {
+    return ClonerParamSubMap;
   }
 
-  SubstitutionList getCalleeParamSubstitutions() const {
-    return CalleeParamSubs;
+  SubstitutionMap getCalleeParamSubstitutionMap() const {
+    return CalleeParamSubMap;
   }
 
   /// Create a specialized function type for a specific substituted type \p
@@ -240,7 +244,7 @@ public:
 
   /// Returns true if a given apply can be specialized.
   static bool canBeSpecialized(ApplySite Apply, SILFunction *Callee,
-                               SubstitutionList ParamSubs);
+                               SubstitutionMap ParamSubs);
 
   /// Returns the apply site for the current generic specialization.
   ApplySite getApply() const {
@@ -255,7 +259,7 @@ public:
 class GenericFuncSpecializer {
   SILModule &M;
   SILFunction *GenericFunc;
-  SubstitutionList ParamSubs;
+  SubstitutionMap ParamSubs;
   IsSerialized_t Serialized;
   const ReabstractionInfo &ReInfo;
 
@@ -264,7 +268,7 @@ class GenericFuncSpecializer {
 
 public:
   GenericFuncSpecializer(SILFunction *GenericFunc,
-                         SubstitutionList ParamSubs,
+                         SubstitutionMap ParamSubs,
                          IsSerialized_t Serialized,
                          const ReabstractionInfo &ReInfo);
 

@@ -10,14 +10,17 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "swift/SIL/SILModule.h"
-#include "swift/SIL/SILFunction.h"
-#include "swift/SIL/SILBasicBlock.h"
-#include "swift/SIL/SILInstruction.h"
 #include "swift/SIL/SILArgument.h"
+#include "swift/SIL/SILBasicBlock.h"
+#include "swift/SIL/SILFunction.h"
+#include "swift/SIL/SILInstruction.h"
+#include "swift/SIL/SILModule.h"
+#include "swift/SIL/SILProfiler.h"
 #include "swift/SIL/CFG.h"
 #include "swift/SIL/PrettyStackTrace.h"
 #include "swift/AST/GenericEnvironment.h"
+#include "swift/Basic/OptimizationMode.h"
+#include "swift/Basic/Statistic.h"
 #include "llvm/ADT/Optional.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/GraphWriter.h"
@@ -96,7 +99,11 @@ SILFunction::SILFunction(SILModule &Module, SILLinkage Linkage, StringRef Name,
       Serialized(isSerialized), Thunk(isThunk),
       ClassSubclassScope(unsigned(classSubclassScope)), GlobalInitFlag(false),
       InlineStrategy(inlineStrategy), Linkage(unsigned(Linkage)),
-      KeepAsPublic(false), EffectsKindAttr(E), EntryCount(entryCount) {
+      HasCReferences(false), IsWeakLinked(false),
+      OptMode(OptimizationMode::NotSet), EffectsKindAttr(E),
+      EntryCount(entryCount) {
+  validateSubclassScope(classSubclassScope, isThunk, nullptr);
+
   if (InsertBefore)
     Module.functions.insert(SILModule::iterator(InsertBefore), this);
   else
@@ -135,6 +142,11 @@ SILFunction::~SILFunction() {
          "Function cannot be deleted while function_ref's still exist");
 }
 
+void SILFunction::createProfiler(ASTNode Root, ForDefinition_t forDefinition) {
+  assert(!Profiler && "Function already has a profiler");
+  Profiler = SILProfiler::create(Module, forDefinition, Root);
+}
+
 bool SILFunction::hasForeignBody() const {
   if (!hasClangNode()) return false;
   return SILDeclRef::isClangGenerated(getClangNode());
@@ -167,10 +179,15 @@ ASTContext &SILFunction::getASTContext() const {
   return getModule().getASTContext();
 }
 
+OptimizationMode SILFunction::getEffectiveOptimizationMode() const {
+  if (OptMode != OptimizationMode::NotSet)
+    return OptMode;
+
+  return getModule().getOptions().OptMode;
+}
+
 bool SILFunction::shouldOptimize() const {
-  if (Module.getStage() == SILStage::Raw)
-    return true;
-  return !hasSemanticsAttr("optimize.sil.never");
+  return getEffectiveOptimizationMode() != OptimizationMode::NoOptimization;
 }
 
 Type SILFunction::mapTypeIntoContext(Type type) const {
@@ -193,11 +210,6 @@ SILType GenericEnvironment::mapTypeIntoContext(SILModule &M,
                     QueryInterfaceTypeSubstitutions(this),
                     LookUpConformanceInSignature(*genericSig),
                     genericSig);
-}
-
-Type SILFunction::mapTypeOutOfContext(Type type) const {
-  return GenericEnvironment::mapTypeOutOfContext(
-      getGenericEnvironment(), type);
 }
 
 bool SILFunction::isNoReturnFunction() const {
@@ -393,17 +405,26 @@ TargetFunction("view-cfg-only-for-function", llvm::cl::init(""),
                llvm::cl::desc("Only print out the cfg for this function"));
 #endif
 
-
-void SILFunction::viewCFG() const {
+static void viewCFGHelper(const SILFunction* f, bool skipBBContents) {
 /// When asserts are disabled, this should be a NoOp.
 #ifndef NDEBUG
     // If we have a target function, only print that function out.
-    if (!TargetFunction.empty() && !(getName().str() == TargetFunction))
+    if (!TargetFunction.empty() && !(f->getName().str() == TargetFunction))
       return;
 
-  ViewGraph(const_cast<SILFunction *>(this), "cfg" + getName().str());
+    ViewGraph(const_cast<SILFunction *>(f), "cfg" + f->getName().str(),
+              /*shortNames=*/skipBBContents);
 #endif
 }
+
+void SILFunction::viewCFG() const {
+  viewCFGHelper(this, /*skipBBContents=*/false);
+}
+
+void SILFunction::viewCFGOnly() const {
+  viewCFGHelper(this, /*skipBBContents=*/true);
+}
+
 
 bool SILFunction::hasSelfMetadataParam() const {
   auto paramTypes = getConventions().getParameterSILTypes();
@@ -414,7 +435,7 @@ bool SILFunction::hasSelfMetadataParam() const {
   if (!silTy.isObject())
     return false;
 
-  auto selfTy = silTy.getSwiftRValueType();
+  auto selfTy = silTy.getASTType();
 
   if (auto metaTy = dyn_cast<MetatypeType>(selfTy)) {
     selfTy = metaTy.getInstanceType();
@@ -441,17 +462,24 @@ bool SILFunction::hasValidLinkageForFragileRef() const {
   if (hasValidLinkageForFragileInline())
     return true;
 
+  // If the containing module has been serialized
+  if (getModule().isSerialized()) {
+    return true;
+  }
+
   // Otherwise, only public functions can be referenced.
   return hasPublicVisibility(getLinkage());
 }
 
-/// Helper method which returns true if the linkage of the SILFunction
-/// indicates that the objects definition might be required outside the
-/// current SILModule.
 bool
 SILFunction::isPossiblyUsedExternally() const {
-  return swift::isPossiblyUsedExternally(getLinkage(),
-                                         getModule().isWholeModule());
+  auto linkage = getLinkage();
+
+  // Hidden functions may be referenced by other C code in the linkage unit.
+  if (linkage == SILLinkage::Hidden && hasCReferences())
+    return true;
+
+  return swift::isPossiblyUsedExternally(linkage, getModule().isWholeModule());
 }
 
 bool SILFunction::isExternallyUsedSymbol() const {
@@ -465,18 +493,45 @@ void SILFunction::convertToDeclaration() {
   getBlocks().clear();
 }
 
-SubstitutionList SILFunction::getForwardingSubstitutions() {
-  if (ForwardingSubs)
-    return *ForwardingSubs;
+SubstitutionMap SILFunction::getForwardingSubstitutionMap() {
+  if (ForwardingSubMap)
+    return ForwardingSubMap;
 
-  auto *env = getGenericEnvironment();
-  if (!env)
-    return {};
+  if (auto *env = getGenericEnvironment())
+    ForwardingSubMap = env->getForwardingSubstitutionMap();
 
-  ForwardingSubs = env->getForwardingSubstitutions();
-  return *ForwardingSubs;
+  return ForwardingSubMap;
 }
 
 bool SILFunction::shouldVerifyOwnership() const {
   return !hasSemanticsAttr("verify.ownership.sil.never");
+}
+
+// See swift/Basic/Statistic.h for declaration: this enables tracing
+// SILFunctions, is defined here to avoid too much layering violation / circular
+// linkage dependency.
+
+struct SILFunctionTraceFormatter : public UnifiedStatsReporter::TraceFormatter {
+  void traceName(const void *Entity, raw_ostream &OS) const {
+    if (!Entity)
+      return;
+    const SILFunction *F = static_cast<const SILFunction *>(Entity);
+    OS << F->getName();
+  }
+
+  void traceLoc(const void *Entity, SourceManager *SM,
+                clang::SourceManager *CSM, raw_ostream &OS) const {
+    if (!Entity)
+      return;
+    const SILFunction *F = static_cast<const SILFunction *>(Entity);
+    F->getLocation().getSourceRange().print(OS, *SM, false);
+  }
+};
+
+static SILFunctionTraceFormatter TF;
+
+template<>
+const UnifiedStatsReporter::TraceFormatter*
+FrontendStatsTracer::getTraceFormatter<const SILFunction *>() {
+  return &TF;
 }

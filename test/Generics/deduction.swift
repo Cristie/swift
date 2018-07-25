@@ -23,7 +23,9 @@ func useIdentity(_ x: Int, y: Float, i32: Int32) {
   // Deduction where the result type and input type can get different results
   var xx : X, yy : Y
   xx = identity(yy) // expected-error{{cannot assign value of type 'Y' to type 'X'}}
-  xx = identity2(yy) // expected-error{{cannot convert value of type 'Y' to expected argument type 'X'}}
+
+  // FIXME: rdar://41416647
+  xx = identity2(yy) // expected-error{{type of expression is ambiguous without more context}}
 }
 
 // FIXME: Crummy diagnostic!
@@ -78,7 +80,7 @@ func passFunction(_ f: (Int) -> Float, x: Int, y: Float) {
    acceptFunction(f, y, y) // expected-error{{cannot convert value of type 'Float' to expected argument type 'Int'}}
 }
 
-func returnTuple<T, U>(_: T) -> (T, U) { } // expected-note {{in call to function 'returnTuple'}}
+func returnTuple<T, U>(_: T) -> (T, U) { } // expected-note 2{{in call to function 'returnTuple'}}
 
 func testReturnTuple(_ x: Int, y: Float) {
   returnTuple(x) // expected-error{{generic parameter 'U' could not be inferred}}
@@ -87,7 +89,7 @@ func testReturnTuple(_ x: Int, y: Float) {
   var _ : (Float, Float) = returnTuple(y)
 
   // <rdar://problem/22333090> QoI: Propagate contextual information in a call to operands
-  var _ : (Int, Float) = returnTuple(y) // expected-error{{cannot convert value of type 'Float' to expected argument type 'Int'}}
+  var _ : (Int, Float) = returnTuple(y) // expected-error{{generic parameter 'U' could not be inferred}}
 }
 
 
@@ -316,12 +318,14 @@ func foo() {
     let j = min(Int(3), Float(2.5)) // expected-error{{cannot convert value of type 'Float' to expected argument type 'Int'}}
     let k = min(A(), A()) // expected-error{{argument type 'A' does not conform to expected type 'Comparable'}}
     let oi : Int? = 5
-    let l = min(3, oi) // expected-error{{value of optional type 'Int?' not unwrapped; did you mean to use '!' or '?'?}}
+    let l = min(3, oi) // expected-error{{value of optional type 'Int?' must be unwrapped}}
+  // expected-note@-1{{coalesce}}
+  // expected-note@-2{{force-unwrap}}
 }
 
 infix operator +&
 func +&<R, S>(lhs: inout R, rhs: S) where R : RangeReplaceableCollection, S : Sequence, R.Element == S.Element {}
-// expected-note@-1 {{candidate requires that the types 'String' and 'String.Element' (aka 'Character') be equivalent (requirement specified as 'R.Element' == 'S.Element' [with R = [String], S = String])}}
+// expected-note@-1 {{candidate requires that the types 'String' and 'Character' be equivalent (requirement specified as 'R.Element' == 'S.Element' [with R = [String], S = String])}}
 
 func rdar33477726_1() {
   var arr: [String] = []
@@ -330,13 +334,13 @@ func rdar33477726_1() {
 }
 
 func rdar33477726_2<R, S>(_: R, _: S) where R: Sequence, S == R.Element {}
-// expected-note@-1 {{candidate requires that the types 'Int' and 'String.Element' (aka 'Character') be equivalent (requirement specified as 'S' == 'R.Element' [with R = String, S = Int])}}
+// expected-note@-1 {{candidate requires that the types 'Int' and 'Character' be equivalent (requirement specified as 'S' == 'R.Element' [with R = String, S = Int])}}
 rdar33477726_2("answer", 42)
 // expected-error@-1 {{cannot invoke 'rdar33477726_2(_:_:)' with an argument list of type '(String, Int)'}}
 
 prefix operator +-
 prefix func +-<T>(_: T) where T: Sequence, T.Element == Int {}
-// expected-note@-1 {{candidate requires that the types 'String.Element' (aka 'Character') and 'Int' be equivalent (requirement specified as 'T.Element' == 'Int' [with T = String])}}
+// expected-note@-1 {{candidate requires that the types 'Character' and 'Int' be equivalent (requirement specified as 'T.Element' == 'Int' [with T = String])}}
 
 +-"hello"
 // expected-error@-1 {{unary operator '+-(_:)' cannot be applied to an operand of type 'String'}}

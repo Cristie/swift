@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2018 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -18,6 +18,8 @@
 #ifndef SWIFT_BASIC_LANGOPTIONS_H
 #define SWIFT_BASIC_LANGOPTIONS_H
 
+#include "swift/Config.h"
+#include "swift/Basic/CycleDiagnosticKind.h"
 #include "swift/Basic/LLVM.h"
 #include "swift/Basic/Version.h"
 #include "clang/Basic/VersionTuple.h"
@@ -27,6 +29,7 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/Triple.h"
+#include "llvm/Support/Regex.h"
 #include "llvm/Support/raw_ostream.h"
 #include <string>
 #include <vector>
@@ -45,6 +48,8 @@ namespace swift {
     Runtime,
     /// Conditional import of module
     CanImport,
+    /// Target Environment (currently just 'simulator' or absent)
+    TargetEnvironment,
   };
 
   /// Describes which Swift 3 Objective-C inference warnings should be
@@ -113,6 +118,10 @@ namespace swift {
     /// expression.
     bool CodeCompleteInitsInPostfixExpr = false;
 
+    /// Whether to use heuristics to decide whether to show call-pattern
+    /// completions.
+    bool CodeCompleteCallPatternHeuristics = false;
+
     ///
     /// Flags for use by tests
     ///
@@ -120,6 +129,10 @@ namespace swift {
     /// Enable Objective-C Runtime interop code generation and build
     /// configuration options.
     bool EnableObjCInterop = true;
+
+    /// On Darwin platforms, use the pre-stable ABI's mark bit for Swift
+    /// classes instead of the stable ABI's bit.
+    bool UseDarwinPreStableABIBit = !bool(SWIFT_DARWIN_ENABLE_STABLE_ABI_BIT);
 
     /// Enables checking that uses of @objc require importing
     /// the Foundation module.
@@ -145,12 +158,8 @@ namespace swift {
     /// solver should be debugged.
     unsigned DebugConstraintSolverAttempt = 0;
 
-    /// \brief Enable the experimental constraint propagation in the
-    /// type checker.
-    bool EnableConstraintPropagation = false;
-
-    /// \brief Enable the iterative type checker.
-    bool IterativeTypeChecker = false;
+    /// \brief Enable named lazy member loading.
+    bool NamedLazyMemberLoading = true;
 
     /// Debug the generic signatures computed by the generic signature builder.
     bool DebugGenericSignatures = false;
@@ -160,11 +169,9 @@ namespace swift {
     /// This is for testing purposes.
     std::string DebugForbidTypecheckPrefix;
 
-    /// Number of parallel processes performing AST verification.
-    unsigned ASTVerifierProcessCount = 1U;
-
-    /// ID of the current process for the purposes of AST verification.
-    unsigned ASTVerifierProcessId = 1U;
+    /// \brief How to diagnose cycles encountered
+    CycleDiagnosticKind EvaluatorCycleDiagnostics =
+        CycleDiagnosticKind::NoDiagnose;
 
     /// \brief The upper bound, in bytes, of temporary data that can be
     /// allocated by the constraint solver.
@@ -175,6 +182,9 @@ namespace swift {
     /// \brief The upper bound to number of sub-expressions unsolved
     /// before termination of the shrink phrase of the constraint solver.
     unsigned SolverShrinkUnsolvedThreshold = 10;
+
+    /// Disable the shrink phase of the expression type checker.
+    bool SolverDisableShrink = false;
 
     /// The maximum depth to which to test decl circularity.
     unsigned MaxCircularityDepth = 500;
@@ -189,11 +199,6 @@ namespace swift {
     /// \brief Staging flag for treating inout parameters as Thread Sanitizer
     /// accesses.
     bool DisableTsanInoutInstrumentation = false;
-
-    /// \brief Staging flag for class resilience, which we do not want to enable
-    /// fully until more code is in place, to allow the standard library to be
-    /// tested with value type resilience only.
-    bool EnableClassResilience = false;
 
     /// Should we check the target OSs of serialized modules to see that they're
     /// new enough?
@@ -219,6 +224,9 @@ namespace swift {
     /// This is for bootstrapping. It can't be in SILOptions because the
     /// TypeChecker uses it to set resolve the ParameterConvention.
     bool EnableSILOpaqueValues = false;
+    
+    /// Enables key path resilience.
+    bool EnableKeyPathResilience = false;
 
     /// If set to true, the diagnosis engine can assume the emitted diagnostics
     /// will be used in editor. This usually leads to more aggressive fixit.
@@ -235,17 +243,33 @@ namespace swift {
 
     /// Diagnose uses of NSCoding with classes that have unstable mangled names.
     bool EnableNSKeyedArchiverDiagnostics = true;
-    
+
+    /// Diagnose switches over non-frozen enums that do not have catch-all
+    /// cases.
+    bool EnableNonFrozenEnumExhaustivityDiagnostics = false;
+
+    /// Regex for the passes that should report passed and missed optimizations.
+    ///
+    /// These are shared_ptrs so that this class remains copyable.
+    std::shared_ptr<llvm::Regex> OptimizationRemarkPassedPattern;
+    std::shared_ptr<llvm::Regex> OptimizationRemarkMissedPattern;
+
     /// When a conversion from String to Substring fails, emit a fix-it to append
     /// the void subscript '[]'.
     /// FIXME: Remove this flag when void subscripts are implemented.
     /// This is used to guard preemptive testing for the fix-it.
     bool FixStringToSubstringConversions = false;
 
-    /// Whether to keep track of a refined token stream in SourceFile while
-    /// parsing. This is set true usually for tooling purposes like semantic
-    /// coloring.
-    bool KeepTokensInSourceFile = false;
+    /// Whether collect tokens during parsing for syntax coloring.
+    bool CollectParsedToken = false;
+
+    /// Whether to parse syntax tree. If the syntax tree is built, the generated
+    /// AST may not be correct when syntax nodes are reused as part of
+    /// incrementals parsing.
+    bool BuildSyntaxTree = false;
+
+    /// Whether to verify the parsed syntax tree and emit related diagnostics.
+    bool VerifySyntaxTree = false;
 
     /// Sets the target we are building for and updates platform conditions
     /// to match.
@@ -323,8 +347,8 @@ namespace swift {
     /// This is usually the check you want; for example, when introducing
     /// a new language feature which is only visible in Swift 5, you would
     /// check for isSwiftVersionAtLeast(5).
-    bool isSwiftVersionAtLeast(unsigned major) const {
-      return EffectiveLanguageVersion.isVersionAtLeast(major);
+    bool isSwiftVersionAtLeast(unsigned major, unsigned minor = 0) const {
+      return EffectiveLanguageVersion.isVersionAtLeast(major, minor);
     }
 
     /// Returns true if the given platform condition argument represents
@@ -348,7 +372,7 @@ namespace swift {
     }
 
   private:
-    llvm::SmallVector<std::pair<PlatformConditionKind, std::string>, 4>
+    llvm::SmallVector<std::pair<PlatformConditionKind, std::string>, 5>
         PlatformConditionValues;
     llvm::SmallVector<std::string, 2> CustomConditionalCompilationFlags;
   };

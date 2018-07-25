@@ -59,7 +59,7 @@ class Derived : Base {
 	}
 
 	@inline(never)
-	@_semantics("optimize.sil.never") // avoid devirtualization
+	@_optimize(none) // avoid devirtualization
 	override func calledWithSuper() {
 		super.calledWithSuper()
 	}
@@ -84,13 +84,13 @@ class Other : Derived {
 }
 
 @inline(never)
-@_semantics("optimize.sil.never") // avoid devirtualization
+@_optimize(none) // avoid devirtualization
 func testClasses(_ b: Base) {
 	b.aliveMethod()
 }
 
 @inline(never)
-@_semantics("optimize.sil.never") // avoid devirtualization
+@_optimize(none) // avoid devirtualization
 func testWithDerived(_ d: Derived) {
 	d.baseNotCalled()
 	d.notInDerived()
@@ -98,7 +98,7 @@ func testWithDerived(_ d: Derived) {
 }
 
 @inline(never)
-@_semantics("optimize.sil.never") // avoid devirtualization
+@_optimize(none) // avoid devirtualization
 func testWithOther(_ o: Other) {
 	o.notInOther()
 }
@@ -143,18 +143,18 @@ struct Adopt : Prot {
 }
 
 @inline(never)
-@_semantics("optimize.sil.never") // avoid devirtualization
+@_optimize(none) // avoid devirtualization
 func testProtocols(_ p: Prot) {
 	p.aliveWitness()
 }
 
 @inline(never)
-@_semantics("optimize.sil.never") // avoid devirtualization
+@_optimize(none) // avoid devirtualization
 func testDefaultWitnessMethods(_ p: Prot) {
 	p.aliveDefaultWitness()
 }
 
-@_semantics("optimize.sil.never") // avoid devirtualization
+@_optimize(none) // avoid devirtualization
 public func callTest() {
 	testClasses(Base())
 	testClasses(Derived())
@@ -163,7 +163,7 @@ public func callTest() {
 	testProtocols(Adopt())
 }
 
-@_semantics("optimize.sil.never") // make sure not eliminated 
+@_optimize(none) // make sure not eliminated 
 internal func donotEliminate() {
   return
 }
@@ -180,7 +180,7 @@ internal func donotEliminate() {
 // CHECK-TESTING: sil {{.*}}publicClassMethod
 // CHECK-TESTING: sil {{.*}}DeadWitness
 
-// CHECK-LABEL: @_T025dead_function_elimination14donotEliminateyyF
+// CHECK-LABEL: @$S25dead_function_elimination14donotEliminateyyF
 
 // CHECK-LABEL: sil_vtable Base
 // CHECK: aliveMethod
@@ -216,15 +216,3 @@ internal func donotEliminate() {
 
 // CHECK-TESTING-LABEL: sil_witness_table Adopt: Prot
 // CHECK-TESTING: DeadWitness{{.*}}: @{{.*}}DeadWitness
-
-// CHECK-LABEL: sil_default_witness_table hidden Prot
-// CHECK:  no_default
-// CHECK:  no_default
-// CHECK:  method #Prot.aliveDefaultWitness!1: {{.*}} : @{{.*}}aliveDefaultWitness
-// CHECK:  no_default
-
-// CHECK-TESTING-LABEL: sil_default_witness_table Prot
-// CHECK-TESTING:  no_default
-// CHECK-TESTING:  no_default
-// CHECK-TESTING:  method #Prot.aliveDefaultWitness!1: {{.*}} : @{{.*}}aliveDefaultWitness
-// CHECK-TESTING:  method #Prot.DeadDefaultWitness!1: {{.*}} : @{{.*}}DeadDefaultWitness

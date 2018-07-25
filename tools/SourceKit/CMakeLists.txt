@@ -24,7 +24,9 @@ configure_file(
 set(SOURCEKIT_DEPLOYMENT_OS "${SWIFT_HOST_VARIANT}")
 set(SOURCEKIT_DEPLOYMENT_TARGET "${SWIFT_SDK_${SWIFT_HOST_VARIANT_SDK}_DEPLOYMENT_VERSION}")
 
-swift_is_installing_component(sourcekit-inproc SOURCEKIT_INSTALLING_INPROC)
+STRING(TOLOWER "${SWIFT_PRIMARY_VARIANT_SDK}" SOURCEKIT_PLATFORM_NAME)
+# Remove '_simulator' from the name if it exists
+STRING(REPLACE "_simulator" "" SOURCEKIT_PLATFORM_NAME "${SOURCEKIT_PLATFORM_NAME}")
 
 if("${CMAKE_SYSTEM_NAME}" STREQUAL "Darwin" AND NOT CMAKE_CROSSCOMPILING)
   set(CMAKE_OSX_SYSROOT "${SWIFT_SDK_${SWIFT_HOST_VARIANT_SDK}_PATH}")
@@ -85,6 +87,7 @@ endif()
 include_directories(BEFORE
   ${SOURCEKIT_BINARY_DIR}/include
   ${SOURCEKIT_SOURCE_DIR}/include
+  ${SOURCEKIT_BINARY_DIR}/tools/SourceKit/include
 )
 
 if("${CMAKE_SYSTEM_NAME}" STREQUAL "Linux")
@@ -98,6 +101,7 @@ if("${CMAKE_SYSTEM_NAME}" STREQUAL "Linux")
                         CMAKE_ARGS
                           -DCMAKE_C_COMPILER=${PATH_TO_CLANG_BUILD}/bin/clang
                           -DCMAKE_CXX_COMPILER=${PATH_TO_CLANG_BUILD}/bin/clang++
+                          -DCMAKE_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}
                           -DCMAKE_SWIFT_COMPILER=$<TARGET_FILE:swift>c
                           -DCMAKE_INSTALL_PREFIX=<INSTALL_DIR>
                           -DENABLE_SWIFT=YES
@@ -105,7 +109,9 @@ if("${CMAKE_SYSTEM_NAME}" STREQUAL "Linux")
                           ${SWIFT_PATH_TO_LIBDISPATCH_BUILD}/src/${CMAKE_SHARED_LIBRARY_PREFIX}dispatch${CMAKE_SHARED_LIBRARY_SUFFIX}
                           ${SWIFT_PATH_TO_LIBDISPATCH_BUILD}/${CMAKE_STATIC_LIBRARY_PREFIX}BlocksRuntime${CMAKE_STATIC_LIBRARY_SUFFIX}
                         STEP_TARGETS
-                          configure)
+                          configure
+                        BUILD_ALWAYS
+                          1)
 
     # CMake does not like the addition of INTERFACE_INCLUDE_DIRECTORIES without
     # the directory existing.  Just create the location which will be populated
@@ -120,6 +126,7 @@ if("${CMAKE_SYSTEM_NAME}" STREQUAL "Linux")
                           ${SWIFT_PATH_TO_LIBDISPATCH_SOURCE})
     add_dependencies(libdispatch
                        swift
+                       copy_shim_headers
                        swiftCore-${SWIFT_SDK_${SWIFT_HOST_VARIANT_SDK}_LIB_SUBDIR}-${SWIFT_HOST_VARIANT_ARCH}
                        swiftSwiftOnoneSupport-${SWIFT_SDK_${SWIFT_HOST_VARIANT_SDK}_LIB_SUBDIR}-${SWIFT_HOST_VARIANT_ARCH}
                        swiftCore-swiftmodule-${SWIFT_SDK_${SWIFT_HOST_VARIANT_SDK}_LIB_SUBDIR}-${SWIFT_HOST_VARIANT_ARCH}
@@ -148,5 +155,6 @@ if("${CMAKE_SYSTEM_NAME}" STREQUAL "Linux")
   set(SOURCEKIT_NEED_EXPLICIT_LIBDISPATCH TRUE)
 endif()
 
+add_subdirectory(include)
 add_subdirectory(lib)
 add_subdirectory(tools)

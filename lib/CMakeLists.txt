@@ -10,6 +10,9 @@
 # directory.
 list(APPEND LLVM_COMMON_DEPENDS intrinsics_gen clang-tablegen-targets)
 
+# Add generated libSyntax headers to global dependencies.
+list(APPEND LLVM_COMMON_DEPENDS swift-syntax-generated-headers)
+
 add_subdirectory(AST)
 add_subdirectory(ASTSectionImporter)
 add_subdirectory(Basic)
@@ -32,9 +35,7 @@ add_subdirectory(PrintAsObjC)
 add_subdirectory(RemoteAST)
 add_subdirectory(Sema)
 add_subdirectory(Serialization)
-if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
-  add_subdirectory(SwiftDemangle)
-endif()
+add_subdirectory(SwiftDemangle)
 add_subdirectory(SIL)
 add_subdirectory(SILGen)
 add_subdirectory(SILOptimizer)

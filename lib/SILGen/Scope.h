@@ -41,6 +41,18 @@ public:
     cleanups.innermostScope = depth;
   }
 
+  Scope(const Scope &&other) = delete;
+  Scope &operator=(const Scope &other) = delete;
+
+  Scope(Scope &&other)
+      : cleanups(other.cleanups), depth(other.depth),
+        savedInnermostScope(other.savedInnermostScope),
+        loc(other.loc) {
+    other.depth = CleanupsDepth::invalid();
+    assert(!other.isValid());
+  }
+  Scope &operator=(Scope &&other) = delete; // implementable if needed
+
   explicit Scope(SILGenFunction &SGF, SILLocation loc)
       : Scope(SGF.Cleanups, CleanupLocation::get(loc)) {}
 
@@ -64,12 +76,6 @@ public:
   /// Pop this scope pushing the +1 rvalue through the scope. Asserts if rv is a
   /// plus zero rvalue.
   RValue popPreservingValue(RValue &&rv);
-
-  /// Pop the scope pushing the +1 ManagedValues in `innerValues` through the
-  /// scope. Asserts if any ManagedValue is plus zero. Each cleanup is recreated
-  /// in the outer scope and associated with a managed value in `outerValues`.
-  void popPreservingValues(ArrayRef<ManagedValue> innerValues,
-                           MutableArrayRef<ManagedValue> outerValues);
 
 private:
   /// Internal private implementation of popImpl so we can use it in Scope::pop

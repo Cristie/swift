@@ -10,8 +10,9 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "swift/AST/Expr.h"
 #include "swift/SIL/SILBuilder.h"
+#include "swift/AST/Expr.h"
+#include "swift/SIL/Projection.h"
 #include "swift/SIL/SILGlobalVariable.h"
 
 using namespace swift;
@@ -22,7 +23,8 @@ using namespace swift;
 
 SILBuilder::SILBuilder(SILGlobalVariable *GlobVar,
                        SmallVectorImpl<SILInstruction *> *InsertedInstrs)
-    : F(nullptr), Mod(GlobVar->getModule()), InsertedInstrs(InsertedInstrs) {
+    : TempContext(GlobVar->getModule(), InsertedInstrs), C(TempContext),
+      F(nullptr) {
   setInsertionPoint(&GlobVar->StaticInitializerBlock);
 }
 
@@ -40,7 +42,7 @@ TupleInst *SILBuilder::createTuple(SILLocation loc, ArrayRef<SILValue> elts) {
   // Derive the tuple type from the elements.
   SmallVector<TupleTypeElt, 4> eltTypes;
   for (auto elt : elts)
-    eltTypes.push_back(elt->getType().getSwiftRValueType());
+    eltTypes.push_back(elt->getType().getASTType());
   auto tupleType = SILType::getPrimitiveObjectType(
       CanType(TupleType::get(eltTypes, getASTContext())));
 
@@ -49,7 +51,7 @@ TupleInst *SILBuilder::createTuple(SILLocation loc, ArrayRef<SILValue> elts) {
 
 SILType SILBuilder::getPartialApplyResultType(SILType origTy, unsigned argCount,
                                         SILModule &M,
-                                        SubstitutionList subs,
+                                        SubstitutionMap subs,
                                         ParameterConvention calleeConvention) {
   CanSILFunctionType FTI = origTy.castTo<SILFunctionType>();
   if (!subs.empty())
@@ -60,8 +62,9 @@ SILType SILBuilder::getPartialApplyResultType(SILType origTy, unsigned argCount,
   auto params = FTI->getParameters();
   auto newParams = params.slice(0, params.size() - argCount);
 
-  auto extInfo = FTI->getExtInfo().withRepresentation(
-      SILFunctionType::Representation::Thick);
+  auto extInfo = FTI->getExtInfo()
+    .withRepresentation(SILFunctionType::Representation::Thick)
+    .withIsPseudogeneric(false);
 
   // If the original method has an @unowned_inner_pointer return, the partial
   // application thunk will lifetime-extend 'self' for us, converting the
@@ -79,8 +82,10 @@ SILType SILBuilder::getPartialApplyResultType(SILType origTy, unsigned argCount,
   }
 
   auto appliedFnType = SILFunctionType::get(nullptr, extInfo,
+                                            FTI->getCoroutineKind(),
                                             calleeConvention,
                                             newParams,
+                                            FTI->getYields(),
                                             results,
                                             FTI->getOptionalErrorResult(),
                                             M.getASTContext());
@@ -97,23 +102,36 @@ SILBuilder::tryCreateUncheckedRefCast(SILLocation Loc, SILValue Op,
     return nullptr;
 
   return insert(UncheckedRefCastInst::create(getSILDebugLocation(Loc), Op,
-                                   ResultTy, getFunction(), OpenedArchetypes));
+                                             ResultTy, getFunction(),
+                                             C.OpenedArchetypes));
 }
+
+ClassifyBridgeObjectInst *
+SILBuilder::createClassifyBridgeObject(SILLocation Loc, SILValue value) {
+  auto &ctx = getASTContext();
+  Type int1Ty = BuiltinIntegerType::get(1, ctx);
+  Type resultTy = TupleType::get({ int1Ty, int1Ty }, ctx);
+  auto ty = SILType::getPrimitiveObjectType(resultTy->getCanonicalType());
+  return insert(new (getModule())
+                ClassifyBridgeObjectInst(getSILDebugLocation(Loc), value, ty));
+}
+
 
 // Create the appropriate cast instruction based on result type.
 SingleValueInstruction *
 SILBuilder::createUncheckedBitCast(SILLocation Loc, SILValue Op, SILType Ty) {
+  assert(Ty.isLoadableOrOpaque(getModule()));
   if (Ty.isTrivial(getModule()))
     return insert(UncheckedTrivialBitCastInst::create(
-        getSILDebugLocation(Loc), Op, Ty, getFunction(), OpenedArchetypes));
+        getSILDebugLocation(Loc), Op, Ty, getFunction(), C.OpenedArchetypes));
 
   if (auto refCast = tryCreateUncheckedRefCast(Loc, Op, Ty))
     return refCast;
 
   // The destination type is nontrivial, and may be smaller than the source
   // type, so RC identity cannot be assumed.
-  return insert(UncheckedBitwiseCastInst::create(getSILDebugLocation(Loc), Op,
-                                         Ty, getFunction(), OpenedArchetypes));
+  return insert(UncheckedBitwiseCastInst::create(
+      getSILDebugLocation(Loc), Op, Ty, getFunction(), C.OpenedArchetypes));
 }
 
 BranchInst *SILBuilder::createBranch(SILLocation Loc,
@@ -242,12 +260,35 @@ SILBuilder::emitDestroyAddr(SILLocation Loc, SILValue Operand) {
 
 static bool couldReduceStrongRefcount(SILInstruction *Inst) {
   // Simple memory accesses cannot reduce refcounts.
-  if (isa<LoadInst>(Inst) || isa<StoreInst>(Inst) ||
-      isa<RetainValueInst>(Inst) || isa<UnownedRetainInst>(Inst) ||
-      isa<UnownedReleaseInst>(Inst) || isa<StrongRetainUnownedInst>(Inst) ||
-      isa<StoreWeakInst>(Inst) || isa<StrongRetainInst>(Inst) ||
-      isa<AllocStackInst>(Inst) || isa<DeallocStackInst>(Inst))
+  switch (Inst->getKind()) {
+#define NEVER_LOADABLE_CHECKED_REF_STORAGE(Name, ...) \
+  case SILInstructionKind::Store##Name##Inst: \
     return false;
+#define ALWAYS_LOADABLE_CHECKED_REF_STORAGE(Name, ...) \
+  /* The next case must be first in this macro because */ \
+  /* SOMETIMES_LOADABLE_CHECKED_REF_STORAGE will fall into it. */ \
+  case SILInstructionKind::Name##ReleaseInst: \
+    if (isLessStrongThan(ReferenceOwnership::Name, ReferenceOwnership::Strong))\
+      return false; \
+    break; \
+  case SILInstructionKind::Name##RetainInst: \
+  case SILInstructionKind::StrongRetain##Name##Inst: \
+    return false;
+#define SOMETIMES_LOADABLE_CHECKED_REF_STORAGE(Name, ...) \
+  case SILInstructionKind::Store##Name##Inst: \
+  ALWAYS_LOADABLE_CHECKED_REF_STORAGE(Name, "...")
+#include "swift/AST/ReferenceStorage.def"
+  case SILInstructionKind::LoadInst:
+  case SILInstructionKind::StoreInst:
+  case SILInstructionKind::RetainValueInst:
+  case SILInstructionKind::StrongRetainInst:
+  case SILInstructionKind::AllocStackInst:
+  case SILInstructionKind::DeallocStackInst:
+  case SILInstructionKind::CopyUnownedValueInst:
+    return false;
+  default:
+    break;
+  }
 
   // Assign and copyaddr of trivial types cannot drop refcounts, and 'inits'
   // never can either.  Nontrivial ones can though, because the overwritten
@@ -405,7 +446,7 @@ SILValue SILBuilder::emitObjCToThickMetatype(SILLocation Loc, SILValue Op,
 void SILBuilder::addOpenedArchetypeOperands(SILInstruction *I) {
   // The list of archetypes from the previous instruction needs
   // to be replaced, because it may reference a removed instruction.
-  OpenedArchetypes.addOpenedArchetypeOperands(I->getTypeDependentOperands());
+  C.OpenedArchetypes.addOpenedArchetypeOperands(I->getTypeDependentOperands());
   if (I && I->getNumTypeDependentOperands() > 0)
     return;
 
@@ -414,8 +455,9 @@ void SILBuilder::addOpenedArchetypeOperands(SILInstruction *I) {
 
   while (I && I->getNumOperands() == 1 &&
          I->getNumTypeDependentOperands() == 0) {
-    // All the open instructions are single-value instructions.
-    auto SVI = dyn_cast<SingleValueInstruction>(I->getOperand(0));
+    // All the open instructions are single-value instructions.  Operands may
+    // be null when code is being transformed.
+    auto SVI = dyn_cast_or_null<SingleValueInstruction>(I->getOperand(0));
     // Within SimplifyCFG this function may be called for an instruction
     // within unreachable code. And within an unreachable block it can happen
     // that defs do not dominate uses (because there is no dominance defined).
@@ -431,18 +473,19 @@ void SILBuilder::addOpenedArchetypeOperands(SILInstruction *I) {
       I = SVI;
       continue;
     }
-    auto Def = OpenedArchetypes.getOpenedArchetypeDef(Archetype);
+    auto Def = C.OpenedArchetypes.getOpenedArchetypeDef(Archetype);
     // Return if it is a known open archetype.
     if (Def)
       return;
     // Otherwise register it and return.
-    if (OpenedArchetypesTracker)
-      OpenedArchetypesTracker->addOpenedArchetypeDef(Archetype, SVI);
+    if (C.OpenedArchetypesTracker)
+      C.OpenedArchetypesTracker->addOpenedArchetypeDef(Archetype, SVI);
     return;
   }
 
   if (I && I->getNumTypeDependentOperands() > 0) {
-    OpenedArchetypes.addOpenedArchetypeOperands(I->getTypeDependentOperands());
+    C.OpenedArchetypes.addOpenedArchetypeOperands(
+        I->getTypeDependentOperands());
   }
 }
 
@@ -456,4 +499,71 @@ ValueMetatypeInst *SILBuilder::createValueMetatype(SILLocation Loc,
       "type");
   return insert(new (getModule()) ValueMetatypeInst(getSILDebugLocation(Loc),
                                                       MetatypeTy, Base));
+}
+
+// TODO: This should really be an operation on type lowering.
+void SILBuilder::emitShallowDestructureValueOperation(
+    SILLocation Loc, SILValue V, llvm::SmallVectorImpl<SILValue> &Results) {
+  // Once destructure is allowed everywhere, remove the projection code.
+
+  // If we do not have a tuple or a struct, add to our results list and return.
+  SILType Ty = V->getType();
+  if (!(Ty.is<TupleType>() || Ty.getStructOrBoundGenericStruct())) {
+    Results.emplace_back(V);
+    return;
+  }
+
+  // Otherwise, we want to destructure add the destructure and return.
+  if (getFunction().hasQualifiedOwnership()) {
+    auto *DI = emitDestructureValueOperation(Loc, V);
+    copy(DI->getResults(), std::back_inserter(Results));
+    return;
+  }
+
+  // In non qualified ownership SIL, drop back to using projection code.
+  llvm::SmallVector<Projection, 16> Projections;
+  Projection::getFirstLevelProjections(V->getType(), getModule(), Projections);
+  transform(Projections, std::back_inserter(Results),
+            [&](const Projection &P) -> SILValue {
+              return P.createObjectProjection(*this, Loc, V).get();
+            });
+}
+
+// TODO: Can we put this on type lowering? It would take a little bit of work
+// since we would need to be able to handle aggregate trivial types which is not
+// represented today in TypeLowering.
+void SILBuilder::emitShallowDestructureAddressOperation(
+    SILLocation Loc, SILValue V, llvm::SmallVectorImpl<SILValue> &Results) {
+
+  // If we do not have a tuple or a struct, add to our results list.
+  SILType Ty = V->getType();
+  if (!(Ty.is<TupleType>() || Ty.getStructOrBoundGenericStruct())) {
+    Results.emplace_back(V);
+    return;
+  }
+
+  llvm::SmallVector<Projection, 16> Projections;
+  Projection::getFirstLevelProjections(V->getType(), getModule(), Projections);
+  transform(Projections, std::back_inserter(Results),
+            [&](const Projection &P) -> SILValue {
+              return P.createAddressProjection(*this, Loc, V).get();
+            });
+}
+
+DebugValueInst *SILBuilder::createDebugValue(SILLocation Loc, SILValue src,
+                                             SILDebugVariable Var) {
+  assert(src->getType().isLoadableOrOpaque(getModule()));
+  // Debug location overrides cannot apply to debug value instructions.
+  DebugLocOverrideRAII LocOverride{*this, None};
+  return insert(
+      DebugValueInst::create(getSILDebugLocation(Loc), src, getModule(), Var));
+}
+
+DebugValueAddrInst *SILBuilder::createDebugValueAddr(SILLocation Loc,
+                                                     SILValue src,
+                                                     SILDebugVariable Var) {
+  // Debug location overrides cannot apply to debug addr instructions.
+  DebugLocOverrideRAII LocOverride{*this, None};
+  return insert(DebugValueAddrInst::create(getSILDebugLocation(Loc), src,
+                                           getModule(), Var));
 }

@@ -463,7 +463,7 @@ unsigned OpaqueStorageAllocation::insertIndirectReturnArgs() {
         ParamDecl(VarDecl::Specifier::InOut, SourceLoc(), SourceLoc(),
                   ctx.getIdentifier("$return_value"), SourceLoc(),
                   ctx.getIdentifier("$return_value"),
-                  bodyResultTy.getSwiftRValueType(), pass.F->getDeclContext());
+                  bodyResultTy.getASTType(), pass.F->getDeclContext());
 
     pass.F->begin()->insertFunctionArgument(argIdx,
                                             bodyResultTy.getAddressType(),
@@ -472,21 +472,6 @@ unsigned OpaqueStorageAllocation::insertIndirectReturnArgs() {
   }
   assert(argIdx == pass.loweredFnConv.getNumIndirectSILResults());
   return argIdx;
-}
-
-/// Utility to derive SILLocation.
-/// 
-/// TODO: This should be a common utility.
-static SILLocation getLocForValue(SILValue value) {
-  if (auto *instr = value->getDefiningInstruction()) {
-    return instr->getLoc();
-  }
-  if (auto *arg = dyn_cast<SILArgument>(value)) {
-    if (arg->getDecl())
-      return RegularLocation(const_cast<ValueDecl *>(arg->getDecl()));
-  }
-  // TODO: bbargs should probably use one of their operand locations.
-  return value->getFunction()->getLocation();
 }
 
 /// Is this operand composing an aggregate from a subobject, or simply
@@ -587,7 +572,7 @@ void OpaqueStorageAllocation::allocateForValue(SILValue value,
   allocBuilder.setSILConventions(
       SILModuleConventions::getLoweredAddressConventions());
   AllocStackInst *allocInstr =
-      allocBuilder.createAllocStack(getLocForValue(value), value->getType());
+      allocBuilder.createAllocStack(value.getLoc(), value->getType());
 
   storage.storageAddress = allocInstr;
 
@@ -670,7 +655,7 @@ SILValue AddressMaterialization::materializeProjection(Operand *operand) {
 
   switch (user->getKind()) {
   default:
-    DEBUG(user->dump());
+    LLVM_DEBUG(user->dump());
     llvm_unreachable("Unexpected subobject composition.");
   case SILInstructionKind::EnumInst: {
     auto *enumInst = cast<EnumInst>(user);
@@ -996,7 +981,7 @@ void ApplyRewriter::convertApplyWithIndirectResults() {
   switch (origCallInst->getKind()) {
   case SILInstructionKind::ApplyInst:
     newCallInst = callBuilder.createApply(
-        loc, apply.getCallee(), apply.getSubstitutions(), newCallArgs,
+        loc, apply.getCallee(), apply.getSubstitutionMap(), newCallArgs,
         cast<ApplyInst>(origCallInst)->isNonThrowing(), nullptr);
     break;
   case SILInstructionKind::TryApplyInst:
@@ -1203,14 +1188,14 @@ protected:
   }
 
   void beforeVisit(SILInstruction *I) {
-    DEBUG(llvm::dbgs() << "  REWRITE USE "; I->dump());
+    LLVM_DEBUG(llvm::dbgs() << "  REWRITE USE "; I->dump());
 
     B.setInsertionPoint(I);
     B.setCurrentDebugScope(I->getDebugScope());
   }
 
   void visitSILInstruction(SILInstruction *I) {
-    DEBUG(I->dump());
+    LLVM_DEBUG(I->dump());
     llvm_unreachable("Unimplemented?!");
   }
 
@@ -1236,7 +1221,8 @@ protected:
   void visitDebugValueInst(DebugValueInst *debugInst) {
     SILValue srcVal = debugInst->getOperand();
     SILValue srcAddr = pass.valueStorageMap.getStorage(srcVal).storageAddress;
-    B.createDebugValueAddr(debugInst->getLoc(), srcAddr);
+    B.createDebugValueAddr(debugInst->getLoc(), srcAddr,
+                           *debugInst->getVarInfo());
     pass.markDead(debugInst);
   }
   
@@ -1336,16 +1322,16 @@ protected:
     // the value storage map.
     storage = &pass.valueStorageMap.getStorage(cast<SingleValueInstruction>(I));
 
-    DEBUG(llvm::dbgs() << "REWRITE DEF "; I->dump());
+    LLVM_DEBUG(llvm::dbgs() << "REWRITE DEF "; I->dump());
     if (storage->storageAddress)
-      DEBUG(llvm::dbgs() << "  STORAGE "; storage->storageAddress->dump());
+      LLVM_DEBUG(llvm::dbgs() << "  STORAGE "; storage->storageAddress->dump());
 
     B.setInsertionPoint(I);
     B.setCurrentDebugScope(I->getDebugScope());
   }
 
   void visitSILInstruction(SILInstruction *I) {
-    DEBUG(I->dump());
+    LLVM_DEBUG(I->dump());
     llvm_unreachable("Unimplemented?!");
   }
 
@@ -1509,7 +1495,7 @@ void AddressLowering::runOnFunction(SILFunction *F) {
   OpaqueStorageAllocation allocator(pass);
   allocator.allocateOpaqueStorage();
 
-  DEBUG(llvm::dbgs() << "\nREWRITING: " << F->getName(); F->dump());
+  LLVM_DEBUG(llvm::dbgs() << "\nREWRITING: " << F->getName(); F->dump());
 
   // Rewrite instructions with address-only operands or results.
   rewriteFunction(pass);
@@ -1527,7 +1513,7 @@ void AddressLowering::runOnFunction(SILFunction *F) {
     if (!deadInst)
       continue;
 
-    DEBUG(llvm::dbgs() << "DEAD "; deadInst->dump());
+    LLVM_DEBUG(llvm::dbgs() << "DEAD "; deadInst->dump());
 #ifndef NDEBUG
     for (auto result : deadInst->getResults())
       for (Operand *operand : result->getUses())

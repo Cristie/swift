@@ -16,25 +16,33 @@ class Node(object):
     subclass.
     """
 
-    def __init__(self, name, kind=None, children=None,
-                 element=None, element_name=None):
+    def __init__(self, name, description=None, kind=None, traits=None,
+                 children=None, element=None, element_name=None,
+                 element_choices=None, omit_when_empty=False):
         self.syntax_kind = name
         self.swift_syntax_kind = lowercase_first_word(name)
         self.name = kind_to_type(self.syntax_kind)
+        self.description = description
 
+        self.traits = traits or []
         self.children = children or []
         self.base_kind = kind
-        self.base_type = kind_to_type(self.base_kind)
+        if self.base_kind == 'SyntaxCollection':
+            self.base_type = 'Syntax'
+        else:
+            self.base_type = kind_to_type(self.base_kind)
 
         if self.base_kind not in SYNTAX_BASE_KINDS:
             error("unknown base kind '%s' for node '%s'" %
                   (self.base_kind, self.syntax_kind))
 
+        self.omit_when_empty = omit_when_empty
         self.collection_element = element or ""
         # If there's a preferred name for the collection element that differs
         # from its supertype, use that.
         self.collection_element_name = element_name or self.collection_element
         self.collection_element_type = kind_to_type(self.collection_element)
+        self.collection_element_choices = element_choices or []
 
     def is_base(self):
         """
@@ -67,3 +75,10 @@ class Node(object):
         return not self.is_base() and \
             not self.is_unknown() and \
             not self.is_syntax_collection()
+
+    def shall_be_omitted_when_empty(self):
+        """
+        Returns 'True' if this node shall not be created while parsing if it 
+        has no children.
+        """
+        return self.omit_when_empty

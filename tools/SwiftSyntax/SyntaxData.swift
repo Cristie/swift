@@ -38,6 +38,63 @@ final class SyntaxData: Equatable {
 
   let childCaches: [AtomicCache<SyntaxData>]
 
+  let positionCache: AtomicCache<AbsolutePosition>
+
+  fileprivate func calculatePosition(_ initPos: AbsolutePosition) ->
+      AbsolutePosition {
+    guard let parent = parent else {
+      // If this node is SourceFileSyntax, its location is the start of the file.
+      return initPos
+    }
+
+    // If the node is the first child of its parent, the location is same with
+    // the parent's location.
+    guard indexInParent != 0 else { return parent.position }
+
+    // Otherwise, the location is same with the previous sibling's location
+    // adding the stride of the sibling.
+    for idx in (0..<indexInParent).reversed() {
+      if let sibling = parent.cachedChild(at: idx) {
+        let pos = sibling.position.copy()
+        sibling.raw.accumulateAbsolutePosition(pos)
+        return pos
+      }
+    }
+    return parent.position
+  }
+
+  var position: AbsolutePosition {
+    return positionCache.value { return calculatePosition(AbsolutePosition()) }
+  }
+
+  var positionAfterSkippingLeadingTrivia: AbsolutePosition {
+    let result = position.copy()
+    _ = raw.accumulateLeadingTrivia(result)
+    return result
+  }
+
+  fileprivate func getNextSiblingPos() -> AbsolutePosition {
+    // If this node is root, the position of the next sibling is the end of
+    // this node.
+    guard let parent = parent else {
+      let result = self.position.copy()
+      raw.accumulateAbsolutePosition(result)
+      return result
+    }
+
+    // Find the first valid sibling and return its position.
+    for i in indexInParent+1..<parent.raw.layout.count {
+      guard let sibling = parent.cachedChild(at: i) else { continue }
+      return sibling.position
+    }
+    // Otherwise, use the parent's sibling instead.
+    return parent.getNextSiblingPos()
+  }
+
+  var byteSize: Int {
+    return getNextSiblingPos().utf8Offset - self.position.utf8Offset
+  }
+
   /// Creates a SyntaxData with the provided raw syntax, pointing to the
   /// provided index, in the provided parent.
   /// - Parameters:
@@ -51,6 +108,7 @@ final class SyntaxData: Equatable {
     self.indexInParent = indexInParent
     self.parent = parent
     self.childCaches = raw.layout.map { _ in AtomicCache<SyntaxData>() }
+    self.positionCache = AtomicCache<AbsolutePosition>()
   }
 
   /// The index path from this node to the root. This can be used to uniquely
@@ -72,7 +130,8 @@ final class SyntaxData: Equatable {
   ///
   /// - Parameter index: The index to create and cache.
   /// - Returns: The child's data at the provided index.
-  func cachedChild(at index: Int) -> SyntaxData {
+  func cachedChild(at index: Int) -> SyntaxData? {
+    if raw.layout[index] == nil { return nil }
     return childCaches[index].value { realizeChild(index) }
   }
 
@@ -84,7 +143,7 @@ final class SyntaxData: Equatable {
   /// - Parameter cursor: The cursor to create and cache.
   /// - Returns: The child's data at the provided cursor.
   func cachedChild<CursorType: RawRepresentable>(
-    at cursor: CursorType) -> SyntaxData
+    at cursor: CursorType) -> SyntaxData?
     where CursorType.RawValue == Int {
     return cachedChild(at: cursor.rawValue)
   }
@@ -123,7 +182,7 @@ final class SyntaxData: Equatable {
     // recursively up to the root.
     if let parent = parent {
       let (root, newParent) = parent.replacingChild(newRaw, at: indexInParent)
-      let newMe = newParent.cachedChild(at: indexInParent)
+      let newMe = newParent.cachedChild(at: indexInParent)!
       return (root: root, newValue: newMe)
     } else {
       // Otherwise, we're already the root, so return the new data as both the
@@ -185,7 +244,7 @@ final class SyntaxData: Equatable {
   /// - Returns: A new SyntaxData for the specific child you're
   ///            creating, whose parent is pointing to self.
   func realizeChild(_ index: Int) -> SyntaxData {
-    return SyntaxData(raw: raw.layout[index],
+    return SyntaxData(raw: raw.layout[index]!,
                       indexInParent: index,
                       parent: self)
   }

@@ -10,15 +10,6 @@
 //
 //===----------------------------------------------------------------------===//
 
-/// A type that provides subscript access to its elements, with bidirectional
-/// index traversal.
-///
-/// In most cases, it's best to ignore this protocol and use the
-/// `BidirectionalCollection` protocol instead, because it has a more complete
-/// interface.
-@available(*, deprecated, message: "it will be removed in Swift 4.0.  Please use 'BidirectionalCollection' instead")
-public typealias BidirectionalIndexable = BidirectionalCollection
-
 /// A collection that supports backward as well as forward traversal.
 ///
 /// Bidirectional collections offer traversal backward from any valid index,
@@ -44,13 +35,19 @@ public typealias BidirectionalIndexable = BidirectionalCollection
 ///   `c.index(before: c.index(after: i)) == i`.
 /// - If `i > c.startIndex && i <= c.endIndex`
 ///   `c.index(after: c.index(before: i)) == i`.
-public protocol BidirectionalCollection : Collection 
-{
+public protocol BidirectionalCollection: Collection
+where SubSequence: BidirectionalCollection, Indices: BidirectionalCollection {
   // FIXME(ABI): Associated type inference requires this.
   associatedtype Element
 
   // FIXME(ABI): Associated type inference requires this.
   associatedtype Index
+
+  // FIXME(ABI): Associated type inference requires this.
+  associatedtype SubSequence
+
+  // FIXME(ABI): Associated type inference requires this.
+  associatedtype Indices
 
   /// Returns the position immediately before the given index.
   ///
@@ -64,16 +61,6 @@ public protocol BidirectionalCollection : Collection
   /// - Parameter i: A valid index of the collection. `i` must be greater than
   ///   `startIndex`.
   func formIndex(before i: inout Index)
-
-  /// A sequence that can represent a contiguous subrange of the collection's
-  /// elements.
-  associatedtype SubSequence : BidirectionalCollection
-    = BidirectionalSlice<Self>
-
-  /// A type that represents the indices that are valid for subscripting the
-  /// collection, in ascending order.
-  associatedtype Indices : BidirectionalCollection
-    = DefaultBidirectionalIndices<Self>
 
   /// The indices that are valid for subscripting the collection, in ascending
   /// order.
@@ -123,12 +110,14 @@ public protocol BidirectionalCollection : Collection
   ///     print(streetsSlice)
   ///     // Prints "["Channing", "Douglas", "Evarts"]"
   ///
-  ///     let index = streetsSlice.index(of: "Evarts")    // 4
+  ///     let index = streetsSlice.firstIndex(of: "Evarts")    // 4
   ///     print(streets[index!])
   ///     // Prints "Evarts"
   ///
   /// - Parameter bounds: A range of the collection's indices. The bounds of
   ///   the range must be valid indices of the collection.
+  ///
+  /// - Complexity: O(1)
   subscript(bounds: Range<Index>) -> SubSequence { get }
 
   // FIXME(ABI): Associated type inference requires this.
@@ -144,33 +133,45 @@ public protocol BidirectionalCollection : Collection
 /// Default implementation for bidirectional collections.
 extension BidirectionalCollection {
 
-  @_inlineable // FIXME(sil-serialize-all)
+  @inlinable // protocol-only
   @inline(__always)
   public func formIndex(before i: inout Index) {
     i = index(before: i)
   }
 
-  @_inlineable // FIXME(sil-serialize-all)
-  public func index(_ i: Index, offsetBy n: IndexDistance) -> Index {
-    if n >= 0 {
-      return _advanceForward(i, by: n)
+  @inlinable // protocol-only
+  public func index(_ i: Index, offsetBy distance: Int) -> Index {
+    return _index(i, offsetBy: distance)
+  }
+
+  @inlinable // protocol-only
+  internal func _index(_ i: Index, offsetBy distance: Int) -> Index {
+    if distance >= 0 {
+      return _advanceForward(i, by: distance)
     }
     var i = i
-    for _ in stride(from: 0, to: n, by: -1) {
+    for _ in stride(from: 0, to: distance, by: -1) {
       formIndex(before: &i)
     }
     return i
   }
 
-  @_inlineable // FIXME(sil-serialize-all)
+  @inlinable // protocol-only
   public func index(
-    _ i: Index, offsetBy n: IndexDistance, limitedBy limit: Index
+    _ i: Index, offsetBy distance: Int, limitedBy limit: Index
   ) -> Index? {
-    if n >= 0 {
-      return _advanceForward(i, by: n, limitedBy: limit)
+    return _index(i, offsetBy: distance, limitedBy: limit)
+  }
+
+  @inlinable // protocol-only
+  internal func _index(
+    _ i: Index, offsetBy distance: Int, limitedBy limit: Index
+  ) -> Index? {
+    if distance >= 0 {
+      return _advanceForward(i, by: distance, limitedBy: limit)
     }
     var i = i
-    for _ in stride(from: 0, to: n, by: -1) {
+    for _ in stride(from: 0, to: distance, by: -1) {
       if i == limit {
         return nil
       }
@@ -179,36 +180,30 @@ extension BidirectionalCollection {
     return i
   }
 
-  @_inlineable // FIXME(sil-serialize-all)
-  public func distance(from start: Index, to end: Index) -> IndexDistance {
+  @inlinable // protocol-only
+  public func distance(from start: Index, to end: Index) -> Int {
+    return _distance(from: start, to: end)
+  }
+
+  @inlinable // protocol-only
+  internal func _distance(from start: Index, to end: Index) -> Int {
     var start = start
-    var count: IndexDistance = 0
+    var count = 0
 
     if start < end {
       while start != end {
-        count += 1 as IndexDistance
+        count += 1
         formIndex(after: &start)
       }
     }
     else if start > end {
       while start != end {
-        count -= 1 as IndexDistance
+        count -= 1
         formIndex(before: &start)
       }
     }
 
     return count
-  }
-}
-
-/// Supply the default "slicing" `subscript` for `BidirectionalCollection`
-/// models that accept the default associated `SubSequence`,
-/// `BidirectionalSlice<Self>`.
-extension BidirectionalCollection where SubSequence == BidirectionalSlice<Self> {
-  @_inlineable // FIXME(sil-serialize-all)
-  public subscript(bounds: Range<Index>) -> BidirectionalSlice<Self> {
-    _failEarlyRangeCheck(bounds, bounds: startIndex..<endIndex)
-    return BidirectionalSlice(base: self, bounds: bounds)
   }
 }
 
@@ -222,8 +217,8 @@ extension BidirectionalCollection where SubSequence == Self {
   /// - Returns: The last element of the collection if the collection has one
   ///   or more elements; otherwise, `nil`.
   ///
-  /// - Complexity: O(1).
-  @_inlineable // FIXME(sil-serialize-all)
+  /// - Complexity: O(1)
+  @inlinable // protocol-only
   public mutating func popLast() -> Element? {
     guard !isEmpty else { return nil }
     let element = last!
@@ -239,7 +234,7 @@ extension BidirectionalCollection where SubSequence == Self {
   /// - Returns: The last element of the collection.
   ///
   /// - Complexity: O(1)
-  @_inlineable // FIXME(sil-serialize-all)
+  @inlinable // protocol-only
   @discardableResult
   public mutating func removeLast() -> Element {
     let element = last!
@@ -249,20 +244,22 @@ extension BidirectionalCollection where SubSequence == Self {
 
   /// Removes the given number of elements from the end of the collection.
   ///
-  /// - Parameter n: The number of elements to remove. `n` must be greater
+  /// - Parameter k: The number of elements to remove. `k` must be greater
   ///   than or equal to zero, and must be less than or equal to the number of
   ///   elements in the collection.
   ///
   /// - Complexity: O(1) if the collection conforms to
-  ///   `RandomAccessCollection`; otherwise, O(*n*), where *n* is the length
-  ///   of the collection.
-  @_inlineable // FIXME(sil-serialize-all)
-  public mutating func removeLast(_ n: Int) {
-    if n == 0 { return }
-    _precondition(n >= 0, "Number of elements to remove should be non-negative")
-    _precondition(count >= numericCast(n),
+  ///   `RandomAccessCollection`; otherwise, O(*k*), where *k* is the number of
+  ///   elements to remove.
+  @inlinable // protocol-only
+  public mutating func removeLast(_ k: Int) {
+    if k == 0 { return }
+    _precondition(k >= 0, "Number of elements to remove should be non-negative")
+    _precondition(count >= k,
       "Can't remove more items from a collection than it contains")
-    self = self[startIndex..<index(endIndex, offsetBy: numericCast(-n))]
+    // FIXME: using non-_'d `index` incorrectly calls the Collection one for
+    // conditional conformances to BidirectionalCollections.
+    self = self[startIndex..<_index(endIndex, offsetBy: -k)]
   }
 }
 
@@ -279,18 +276,22 @@ extension BidirectionalCollection {
   ///     print(numbers.dropLast(10))
   ///     // Prints "[]"
   ///
-  /// - Parameter n: The number of elements to drop off the end of the
-  ///   collection. `n` must be greater than or equal to zero.
-  /// - Returns: A subsequence that leaves off `n` elements from the end.
+  /// - Parameter k: The number of elements to drop off the end of the
+  ///   collection. `k` must be greater than or equal to zero.
+  /// - Returns: A subsequence that leaves off `k` elements from the end.
   ///
-  /// - Complexity: O(*n*), where *n* is the number of elements to drop.
-  @_inlineable // FIXME(sil-serialize-all)
-  public func dropLast(_ n: Int) -> SubSequence {
+  /// - Complexity: O(1) if the collection conforms to
+  ///   `RandomAccessCollection`; otherwise, O(*k*), where *k* is the number of
+  ///   elements to drop.
+  @inlinable // protocol-only
+  public func dropLast(_ k: Int) -> SubSequence {
     _precondition(
-      n >= 0, "Can't drop a negative number of elements from a collection")
-    let end = index(
+      k >= 0, "Can't drop a negative number of elements from a collection")
+    // FIXME: using non-_'d `index` incorrectly calls the Collection one for
+    // conditional conformances to BidirectionalCollections.
+    let end = _index(
       endIndex,
-      offsetBy: numericCast(-n),
+      offsetBy: -k,
       limitedBy: startIndex) ?? startIndex
     return self[startIndex..<end]
   }
@@ -312,15 +313,19 @@ extension BidirectionalCollection {
   /// - Returns: A subsequence terminating at the end of the collection with at
   ///   most `maxLength` elements.
   ///
-  /// - Complexity: O(*n*), where *n* is equal to `maxLength`.
-  @_inlineable // FIXME(sil-serialize-all)
+  /// - Complexity: O(1) if the collection conforms to
+  ///   `RandomAccessCollection`; otherwise, O(*k*), where *k* is equal to
+  ///   `maxLength`.
+  @inlinable // protocol-only
   public func suffix(_ maxLength: Int) -> SubSequence {
     _precondition(
       maxLength >= 0,
       "Can't take a suffix of negative length from a collection")
-    let start = index(
+    // FIXME: using non-_'d `index` incorrectly calls the Collection one for
+    // conditional conformances to BidirectionalCollections.
+    let start = _index(
       endIndex,
-      offsetBy: numericCast(-maxLength),
+      offsetBy: -maxLength,
       limitedBy: startIndex) ?? startIndex
     return self[start..<endIndex]
   }

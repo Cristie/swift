@@ -58,7 +58,7 @@
 // FIXME: %FileCheck %s -check-prefix=PASS_EXPLODE_PATTERN -strict-whitespace < %t.printed.txt
 
 // FIXME: rdar://problem/19648117 Needs splitting objc parts out
-// XFAIL: linux
+// XFAIL: linux, freebsd
 
 import Bar
 import ObjectiveC
@@ -192,8 +192,8 @@ struct d0100_FooStruct {
 
   class NestedClass {}
 // PASS_COMMON-NEXT: {{^}}  class NestedClass {{{$}}
-// PASS_COMMON-NEXT: {{^}}    @objc deinit{{$}}
 // PASS_COMMON-NEXT: {{^}}    init(){{$}}
+// PASS_COMMON-NEXT: {{^}}    @objc deinit{{$}}
 // PASS_COMMON-NEXT: {{^}}  }{{$}}
 
   enum NestedEnum {}
@@ -268,8 +268,8 @@ extension d0100_FooStruct {
 
   class ExtNestedClass {}
 // PASS_COMMON-NEXT: {{^}}  class ExtNestedClass {{{$}}
-// PASS_COMMON-NEXT: {{^}}    @objc deinit{{$}}
 // PASS_COMMON-NEXT: {{^}}    init(){{$}}
+// PASS_COMMON-NEXT: {{^}}    @objc deinit{{$}}
 // PASS_COMMON-NEXT: {{^}}  }{{$}}
 
   enum ExtNestedEnum {
@@ -529,7 +529,7 @@ class d0170_TestAvailability {
 // PASS_COMMON-LABEL: {{^}}@objc class d0180_TestIBAttrs {{{$}}
 
   @IBAction func anAction(_: AnyObject) {}
-// PASS_COMMON-NEXT: {{^}}  @IBAction @objc func anAction(_: AnyObject){{$}}
+// PASS_COMMON-NEXT: {{^}}  @objc @IBAction func anAction(_: AnyObject){{$}}
 
   @IBDesignable
   class ADesignableClass {}
@@ -541,13 +541,13 @@ class d0170_TestAvailability {
 // PASS_EXPLODE_PATTERN-LABEL: {{^}}@objc class d0181_TestIBAttrs {{{$}}
 
   @IBOutlet weak var anOutlet: d0181_TestIBAttrs!
-// PASS_EXPLODE_PATTERN-NEXT: {{^}}  @IBOutlet @objc weak var anOutlet: @sil_weak d0181_TestIBAttrs!{{$}}
+// PASS_EXPLODE_PATTERN-NEXT: {{^}}  @objc @IBOutlet @_implicitly_unwrapped_optional weak var anOutlet: @sil_weak d0181_TestIBAttrs!{{$}}
 
   @IBInspectable var inspectableProp: Int = 0
-// PASS_EXPLODE_PATTERN-NEXT: {{^}}  @IBInspectable @objc var inspectableProp: Int{{$}}
+// PASS_EXPLODE_PATTERN-NEXT: {{^}}  @objc @IBInspectable var inspectableProp: Int{{$}}
 
   @GKInspectable var inspectableProp2: Int = 0
-// PASS_EXPLODE_PATTERN-NEXT: {{^}}  @GKInspectable @objc var inspectableProp2: Int{{$}}
+// PASS_EXPLODE_PATTERN-NEXT: {{^}}  @objc @GKInspectable var inspectableProp2: Int{{$}}
 }
 
 struct d0190_LetVarDecls {
@@ -587,12 +587,13 @@ struct d0200_EscapedIdentifiers {
 // PASS_COMMON-NEXT: {{^}}    case `case`{{$}}
 // PASS_COMMON-NEXT: {{^}}    {{.*}}static func __derived_enum_equals(_ a: d0200_EscapedIdentifiers.`enum`, _ b: d0200_EscapedIdentifiers.`enum`) -> Bool
 // PASS_COMMON-NEXT: {{^}}    var hashValue: Int { get }{{$}}
+// PASS_COMMON-NEXT: {{^}}    func hash(into hasher: inout Hasher)
 // PASS_COMMON-NEXT: {{^}}  }{{$}}
 
   class `class` {}
 // PASS_COMMON-NEXT: {{^}}  class `class` {{{$}}
-// PASS_COMMON-NEXT: {{^}}    @objc deinit{{$}}
 // PASS_COMMON-NEXT: {{^}}    init(){{$}}
+// PASS_COMMON-NEXT: {{^}}    @objc deinit{{$}}
 // PASS_COMMON-NEXT: {{^}}  }{{$}}
 
   typealias `protocol` = `class`
@@ -602,8 +603,8 @@ struct d0200_EscapedIdentifiers {
   class `extension` : `class` {}
 // PASS_ONE_LINE_TYPE-DAG: {{^}}  class `extension` : d0200_EscapedIdentifiers.`class` {{{$}}
 // PASS_ONE_LINE_TYPEREPR-DAG: {{^}}  class `extension` : `class` {{{$}}
-// PASS_COMMON: {{^}}    @objc deinit{{$}}
-// PASS_COMMON-NEXT: {{^}}    {{(override )?}}init(){{$}}
+// PASS_COMMON:      {{^}}    {{(override )?}}init(){{$}}
+// PASS_COMMON-NEXT: {{^}}    @objc deinit{{$}}
 // PASS_COMMON-NEXT: {{^}}  }{{$}}
 
   func `func`<`let`: `protocol`, `where`>(
@@ -1015,6 +1016,7 @@ enum d2000_EnumDecl1 {
 // PASS_COMMON-NEXT: {{^}}  case ED1_Second{{$}}
 // PASS_COMMON-NEXT: {{^}}  {{.*}}static func __derived_enum_equals(_ a: d2000_EnumDecl1, _ b: d2000_EnumDecl1) -> Bool
 // PASS_COMMON-NEXT: {{^}}  var hashValue: Int { get }{{$}}
+// PASS_COMMON-NEXT: {{^}}  func hash(into hasher: inout Hasher)
 // PASS_COMMON-NEXT: {{^}}}{{$}}
 
 enum d2100_EnumDecl2 {
@@ -1072,6 +1074,7 @@ enum d2300_EnumDeclWithValues1 : Int {
 // PASS_COMMON-NEXT: {{^}}  case EDV2_Second{{$}}
 // PASS_COMMON-NEXT: {{^}}  typealias RawValue = Int
 // PASS_COMMON-NEXT: {{^}}  var hashValue: Int { get }{{$}}
+// PASS_COMMON-NEXT: {{^}}  func hash(into hasher: inout Hasher)
 // PASS_COMMON-NEXT: {{^}}  init?(rawValue: Int){{$}}
 // PASS_COMMON-NEXT: {{^}}  var rawValue: Int { get }{{$}}
 // PASS_COMMON-NEXT: {{^}}}{{$}}
@@ -1085,6 +1088,7 @@ enum d2400_EnumDeclWithValues2 : Double {
 // PASS_COMMON-NEXT: {{^}}  case EDV3_Second{{$}}
 // PASS_COMMON-NEXT: {{^}}  typealias RawValue = Double
 // PASS_COMMON-NEXT: {{^}}  var hashValue: Int { get }{{$}}
+// PASS_COMMON-NEXT: {{^}}  func hash(into hasher: inout Hasher)
 // PASS_COMMON-NEXT: {{^}}  init?(rawValue: Double){{$}}
 // PASS_COMMON-NEXT: {{^}}  var rawValue: Double { get }{{$}}
 // PASS_COMMON-NEXT: {{^}}}{{$}}
@@ -1311,6 +1315,16 @@ public func ParamAttrs4(a : @escaping () -> ()) {
   a()
 }
 
+// PASS_PRINT_AST: public func ParamAttrs5(a: (@escaping () -> ()) -> ())
+public func ParamAttrs5(a : (@escaping () -> ()) -> ()) {
+}
+
+// PASS_PRINT_AST: public typealias ParamAttrs6 = (@autoclosure () -> ()) -> ()
+public typealias ParamAttrs6 = (@autoclosure () -> ()) -> ()
+
+// PASS_PRINT_AST: public var ParamAttrs7: (@escaping () -> ()) -> ()
+public var ParamAttrs7: (@escaping () -> ()) -> () = { f in f() }
+
 // Setter
 // PASS_PRINT_AST: class FooClassComputed {
 class FooClassComputed {
@@ -1338,11 +1352,11 @@ extension ProtocolToExtend where Self.Assoc == Int {}
 
 // Protocol with where clauses
 
-protocol ProtocolWithWhereClause : QuxProtocol where Qux == Int, Self : FooProtocol {}
-// PREFER_TYPE_REPR_PRINTING: protocol ProtocolWithWhereClause : FooProtocol, QuxProtocol where Self.Qux == Int {
+protocol ProtocolWithWhereClause : QuxProtocol where Qux == Int {}
+// PREFER_TYPE_REPR_PRINTING: protocol ProtocolWithWhereClause : QuxProtocol where Self.Qux == Int {
 
-protocol ProtocolWithWhereClauseAndAssoc : QuxProtocol where Qux == Int, Self : FooProtocol {
-// PREFER_TYPE_REPR_PRINTING-DAG: protocol ProtocolWithWhereClauseAndAssoc : FooProtocol, QuxProtocol where Self.Qux == Int {
+protocol ProtocolWithWhereClauseAndAssoc : QuxProtocol where Qux == Int {
+// PREFER_TYPE_REPR_PRINTING-DAG: protocol ProtocolWithWhereClauseAndAssoc : QuxProtocol where Self.Qux == Int {
   associatedtype A1 : QuxProtocol where A1 : FooProtocol, A1.Qux : QuxProtocol, Int == A1.Qux.Qux
 // PREFER_TYPE_REPR_PRINTING-DAG: {{^}}  associatedtype A1 : FooProtocol, QuxProtocol where Self.A1.Qux : QuxProtocol, Self.A1.Qux.Qux == Int{{$}}
 
@@ -1365,3 +1379,5 @@ public typealias MyPairI<B> = MyPair<Int, B>
 // PASS_PRINT_AST: public typealias MyPairI<B> = MyPair<Int, B>
 public typealias MyPairAlias<T, U> = MyPair<T, U>
 // PASS_PRINT_AST: public typealias MyPairAlias<T, U> = MyPair<T, U>
+public typealias MyPairAlias2<T: FooProtocol, U> = MyPair<T, U> where U: BarProtocol
+// PASS_PRINT_AST: public typealias MyPairAlias2<T, U> = MyPair<T, U> where T : FooProtocol, U : BarProtocol

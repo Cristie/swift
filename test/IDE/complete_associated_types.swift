@@ -32,8 +32,8 @@ protocol FooBaseProtocolWithAssociatedTypes {
   associatedtype FooBaseDefaultedTypeB = Int
   associatedtype FooBaseDefaultedTypeC = Int
 
-  associatedtype DeducedTypeCommonA // expected-note{{declared here}}
-  associatedtype DeducedTypeCommonB // expected-note{{declared here}}
+  associatedtype DeducedTypeCommonA
+  associatedtype DeducedTypeCommonB
   associatedtype DeducedTypeCommonC
   associatedtype DeducedTypeCommonD
   func deduceCommonA() -> DeducedTypeCommonA
@@ -57,8 +57,8 @@ protocol FooProtocolWithAssociatedTypes : FooBaseProtocolWithAssociatedTypes {
 
   associatedtype FooBaseDefaultedTypeB = Double
 
-  associatedtype DeducedTypeCommonA // expected-warning{{redeclaration of associated type}}
-  associatedtype DeducedTypeCommonB // expected-warning{{redeclaration of associated type}}
+  associatedtype DeducedTypeCommonA
+  associatedtype DeducedTypeCommonB
   func deduceCommonA() -> DeducedTypeCommonA
   func deduceCommonB() -> DeducedTypeCommonB
 
@@ -79,7 +79,7 @@ protocol BarBaseProtocolWithAssociatedTypes {
   associatedtype DefaultedTypeCommonA = Int
   associatedtype DefaultedTypeCommonC = Int
 
-  associatedtype DeducedTypeCommonA // expected-note{{'DeducedTypeCommonA' declared here}}
+  associatedtype DeducedTypeCommonA
   associatedtype DeducedTypeCommonC
   func deduceCommonA() -> DeducedTypeCommonA
   func deduceCommonC() -> DeducedTypeCommonC
@@ -102,7 +102,7 @@ protocol BarProtocolWithAssociatedTypes : BarBaseProtocolWithAssociatedTypes {
   associatedtype DefaultedTypeCommonA = Int
   associatedtype DefaultedTypeCommonD = Int
 
-  associatedtype DeducedTypeCommonA // expected-warning{{redeclaration of associated type}}
+  associatedtype DeducedTypeCommonA
   associatedtype DeducedTypeCommonD
   func deduceCommonA() -> DeducedTypeCommonA
   func deduceCommonD() -> DeducedTypeCommonD
@@ -177,9 +177,9 @@ func testStruct2() {
 func testStruct3(a: StructWithAssociatedTypes) {
   a.#^STRUCT_INSTANCE^#
 }
-// STRUCT_TYPE_COUNT: Begin completions, 26 items
+// STRUCT_TYPE_COUNT: Begin completions, 25 items
 
-// STRUCT_INSTANCE: Begin completions, 14 items
+// STRUCT_INSTANCE: Begin completions, 15 items
 // STRUCT_INSTANCE-DAG: Decl[InstanceMethod]/CurrNominal:   deduceCommonA()[#Int#]
 // STRUCT_INSTANCE-DAG: Decl[InstanceMethod]/CurrNominal:   deduceCommonB()[#Int#]
 // STRUCT_INSTANCE-DAG: Decl[InstanceMethod]/CurrNominal:   deduceCommonC()[#Int#]
@@ -194,6 +194,7 @@ func testStruct3(a: StructWithAssociatedTypes) {
 // STRUCT_INSTANCE-DAG: Decl[InstanceMethod]/CurrNominal:   deduceBarBaseC()[#Int#]
 // STRUCT_INSTANCE-DAG: Decl[InstanceMethod]/CurrNominal:   deduceBarBaseD()[#Int#]
 // STRUCT_INSTANCE-DAG: Decl[InstanceMethod]/CurrNominal:   deduceBarD()[#Int#]
+// STRUCT_INSTANCE-DAG: Keyword[self]/CurrNominal: self[#StructWithAssociatedTypes#]; name=self
 // STRUCT_INSTANCE: End completions
 
 // STRUCT_TYPES: Begin completions
@@ -266,7 +267,7 @@ struct StructWithBrokenConformance : FooProtocolWithAssociatedTypes {
 func testBrokenConformances1() {
   StructWithBrokenConformance.#^BROKEN_CONFORMANCE_1^#
 }
-// BROKEN_CONFORMANCE_1: Begin completions, 34 items
+// BROKEN_CONFORMANCE_1: Begin completions, 35 items
 // BROKEN_CONFORMANCE_1-DAG: Decl[TypeAlias]/CurrNominal:        DefaultedTypeCommonA[#StructWithBrokenConformance.DefaultedTypeCommonA#]; name=DefaultedTypeCommonA
 // BROKEN_CONFORMANCE_1-DAG: Decl[TypeAlias]/CurrNominal:        DefaultedTypeCommonB[#StructWithBrokenConformance.DefaultedTypeCommonB#]; name=DefaultedTypeCommonB
 // BROKEN_CONFORMANCE_1-DAG: Decl[TypeAlias]/CurrNominal:        FooBaseDefaultedTypeB[#StructWithBrokenConformance.FooBaseDefaultedTypeB#]; name=FooBaseDefaultedTypeB

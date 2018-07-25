@@ -34,7 +34,7 @@ class CodeCompletionCallbacks {
 protected:
   Parser &P;
   ASTContext &Context;
-  Parser::ParserPosition ExprBeginPosition;
+  ParserPosition ExprBeginPosition;
 
   /// The declaration parsed during delayed parsing that was caused by code
   /// completion. This declaration contained the code completion token.
@@ -65,7 +65,7 @@ public:
     return CompleteExprSelectorContext != ObjCSelectorContext::None;
   }
 
-  void setExprBeginning(Parser::ParserPosition PP) {
+  void setExprBeginning(ParserPosition PP) {
     ExprBeginPosition = PP;
   }
 
@@ -200,7 +200,17 @@ public:
 
   virtual void completeReturnStmt(CodeCompletionExpr *E) = 0;
 
+  /// Complete a yield statement.  A missing yield index means that the
+  /// completion immediately follows the 'yield' keyword; it may be either
+  /// an expresion or a parenthesized expression list.  A present yield
+  /// index means that the completion is within the parentheses and is
+  /// for a specific yield value.
+  virtual void completeYieldStmt(CodeCompletionExpr *E,
+                                 Optional<unsigned> yieldIndex) = 0;
+
   virtual void completeAfterPound(CodeCompletionExpr *E, StmtKind ParentKind) = 0;
+
+  virtual void completeAfterIfStmt(bool hasElse) = 0;
 
   virtual void completeGenericParams(TypeLoc TL) = 0;
 

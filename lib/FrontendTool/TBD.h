@@ -23,16 +23,13 @@ namespace swift {
 class ModuleDecl;
 class FileUnit;
 class FrontendOptions;
+struct TBDGenOptions;
 
-bool writeTBD(ModuleDecl *M, bool hasMultipleIRGenThreads,
-              bool silSerializeWitnessTables, llvm::StringRef OutputFilename,
-              llvm::StringRef installName);
+bool writeTBD(ModuleDecl *M, StringRef OutputFilename, TBDGenOptions &Opts);
 bool inputFileKindCanHaveTBDValidated(InputFileKind kind);
-bool validateTBD(ModuleDecl *M, llvm::Module &IRModule,
-                 bool hasMultipleIRGenThreads, bool silSerializeWitnessTables,
+bool validateTBD(ModuleDecl *M, llvm::Module &IRModule, TBDGenOptions &opts,
                  bool diagnoseExtraSymbolsInTBD);
-bool validateTBD(FileUnit *M, llvm::Module &IRModule,
-                 bool hasMultipleIRGenThreads, bool silSerializeWitnessTables,
+bool validateTBD(FileUnit *M, llvm::Module &IRModule, TBDGenOptions &opts,
                  bool diagnoseExtraSymbolsInTBD);
 }
 

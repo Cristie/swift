@@ -18,6 +18,7 @@
 
 #include "swift/AST/ASTVisitor.h"
 #include "swift/AST/ClangModuleLoader.h"
+#include "swift/AST/SILOptions.h"
 #include "swift/AST/USRGeneration.h"
 #include "swift/Config.h"
 #include "swift/IDE/CodeCompletion.h"
@@ -103,9 +104,9 @@ public:
 } // anonymous namespace
 
 UIdent UIdentVisitor::visitFuncDecl(const FuncDecl *D) {
-  if (D->isAccessor()) {
-    return SwiftLangSupport::getUIDForAccessor(D->getAccessorStorageDecl(),
-                                               D->getAccessorKind(),
+  if (auto AD = dyn_cast<AccessorDecl>(D)) {
+    return SwiftLangSupport::getUIDForAccessor(AD->getStorage(),
+                                               AD->getAccessorKind(),
                                                IsRef);
   }
 
@@ -212,23 +213,25 @@ UIdent SwiftLangSupport::getUIDForAccessor(const ValueDecl *D,
                                            AccessorKind AccKind,
                                            bool IsRef) {
   switch (AccKind) {
-  case AccessorKind::NotAccessor:
-    llvm_unreachable("expected accessor");
-  case AccessorKind::IsMaterializeForSet:
+  case AccessorKind::MaterializeForSet:
     llvm_unreachable("unexpected MaterializeForSet");
-  case AccessorKind::IsGetter:
+  case AccessorKind::Get:
     return IsRef ? KindRefAccessorGetter : KindDeclAccessorGetter;
-  case AccessorKind::IsSetter:
+  case AccessorKind::Set:
     return IsRef ? KindRefAccessorSetter : KindDeclAccessorSetter;
-  case AccessorKind::IsWillSet:
+  case AccessorKind::WillSet:
     return IsRef ? KindRefAccessorWillSet : KindDeclAccessorWillSet;
-  case AccessorKind::IsDidSet:
+  case AccessorKind::DidSet:
     return IsRef ? KindRefAccessorDidSet : KindDeclAccessorDidSet;
-  case AccessorKind::IsAddressor:
+  case AccessorKind::Address:
     return IsRef ? KindRefAccessorAddress : KindDeclAccessorAddress;
-  case AccessorKind::IsMutableAddressor:
+  case AccessorKind::MutableAddress:
     return IsRef ? KindRefAccessorMutableAddress
                  : KindDeclAccessorMutableAddress;
+  case AccessorKind::Read:
+    return IsRef ? KindRefAccessorRead : KindDeclAccessorRead;
+  case AccessorKind::Modify:
+    return IsRef ? KindRefAccessorModify : KindDeclAccessorModify;
   }
 
   llvm_unreachable("Unhandled AccessorKind in switch.");
@@ -341,6 +344,8 @@ UIdent SwiftLangSupport::getUIDForSyntaxNodeKind(SyntaxNodeKind SC) {
     return KindBuildConfigKeyword;
   case SyntaxNodeKind::BuildConfigId:
     return KindBuildConfigId;
+  case SyntaxNodeKind::PoundDirectiveKeyword:
+    return KindPoundDirectiveKeyword;
   case SyntaxNodeKind::AttributeId:
     return KindAttributeId;
   case SyntaxNodeKind::AttributeBuiltin:
@@ -395,6 +400,8 @@ UIdent SwiftLangSupport::getUIDForSyntaxStructureKind(
       return KindDeclSubscript;
     case SyntaxStructureKind::AssociatedType:
       return KindDeclAssociatedType;
+    case SyntaxStructureKind::GenericTypeParam:
+      return KindDeclGenericTypeParam;
     case SyntaxStructureKind::Parameter:
       return KindDeclVarParam;
     case SyntaxStructureKind::ForEachStatement:
@@ -423,6 +430,8 @@ UIdent SwiftLangSupport::getUIDForSyntaxStructureKind(
       return KindExprObjectLiteral;
     case SyntaxStructureKind::TupleExpression:
       return KindExprTuple;
+    case SyntaxStructureKind::ClosureExpression:
+      return KindExprClosure;
     case SyntaxStructureKind::Argument:
       return KindExprArg;
   }
@@ -451,6 +460,8 @@ getUIDForRangeKind(swift::ide::RangeKind Kind) {
     case swift::ide::RangeKind::SingleStatement: return KindRangeSingleStatement;
     case swift::ide::RangeKind::SingleDecl: return KindRangeSingleDeclaration;
     case swift::ide::RangeKind::MultiStatement: return KindRangeMultiStatement;
+    case swift::ide::RangeKind::MultiTypeMemberDecl:
+      return KindRangeMultiTypeMemberDeclaration;
     case swift::ide::RangeKind::PartOfExpression: return KindRangeInvalid;
     case swift::ide::RangeKind::Invalid: return KindRangeInvalid;
   }
@@ -480,6 +491,8 @@ getUIDForRefactoringRangeKind(ide::RefactoringRangeKind Kind) {
     return KindRenameRangeKeywordBase;
   case ide::RefactoringRangeKind::ParameterName:
     return KindRenameRangeParam;
+  case ide::RefactoringRangeKind::NoncollapsibleParameterName:
+    return KindRenameRangeNoncollapsibleParam;
   case ide::RefactoringRangeKind::DeclArgumentLabel:
     return KindRenameRangeDeclArgLabel;
   case ide::RefactoringRangeKind::CallArgumentLabel:
@@ -625,10 +638,47 @@ Optional<UIdent> SwiftLangSupport::getUIDForDeclAttribute(const swift::DeclAttri
         return Attr_Objc;
       }
     }
+    case DAK_AccessControl: {
+      static UIdent Attr_Private("source.decl.attribute.private");
+      static UIdent Attr_FilePrivate("source.decl.attribute.fileprivate");
+      static UIdent Attr_Internal("source.decl.attribute.internal");
+      static UIdent Attr_Public("source.decl.attribute.public");
+      static UIdent Attr_Open("source.decl.attribute.open");
 
-    // We handle access control explicitly.
-    case DAK_AccessControl:
-    case DAK_SetterAccess:
+      switch (cast<AbstractAccessControlAttr>(Attr)->getAccess()) {
+        case AccessLevel::Private:
+          return Attr_Private;
+        case AccessLevel::FilePrivate:
+          return Attr_FilePrivate;
+        case AccessLevel::Internal:
+          return Attr_Internal;
+        case AccessLevel::Public:
+          return Attr_Public;
+        case AccessLevel::Open:
+          return Attr_Open;
+      }
+    }
+    case DAK_SetterAccess: {
+      static UIdent Attr_Private("source.decl.attribute.setter_access.private");
+      static UIdent Attr_FilePrivate("source.decl.attribute.setter_access.fileprivate");
+      static UIdent Attr_Internal("source.decl.attribute.setter_access.internal");
+      static UIdent Attr_Public("source.decl.attribute.setter_access.public");
+      static UIdent Attr_Open("source.decl.attribute.setter_access.open");
+
+      switch (cast<AbstractAccessControlAttr>(Attr)->getAccess()) {
+        case AccessLevel::Private:
+          return Attr_Private;
+        case AccessLevel::FilePrivate:
+          return Attr_FilePrivate;
+        case AccessLevel::Internal:
+          return Attr_Internal;
+        case AccessLevel::Public:
+          return Attr_Public;
+        case AccessLevel::Open:
+          return Attr_Open;
+      }
+    }
+
     // Ignore these.
     case DAK_ShowInInterface:
     case DAK_RawDocComment:
@@ -715,6 +765,14 @@ std::string SwiftLangSupport::resolvePathSymlinks(StringRef FilePath) {
 #endif
 }
 
+void SwiftLangSupport::getStatistics(StatisticsReceiver receiver) {
+  std::vector<Statistic *> stats = {
+#define SWIFT_STATISTIC(VAR, UID, DESC) &Stats.VAR,
+#include "SwiftStatistics.def"
+  };
+  receiver(stats);
+}
+
 CloseClangModuleFiles::~CloseClangModuleFiles() {
   clang::Preprocessor &PP = loader.getClangPreprocessor();
   clang::ModuleMap &ModMap = PP.getHeaderSearchInfo().getModuleMap();
@@ -723,4 +781,14 @@ CloseClangModuleFiles::~CloseClangModuleFiles() {
     if (!M->isSubModule() && M->getASTFile())
       M->getASTFile()->closeFile();
   }
+}
+
+void SourceKit::disableExpensiveSILOptions(SILOptions &Opts) {
+  // Disable the sanitizers.
+  Opts.Sanitizers = {};
+
+  // Disable PGO and code coverage.
+  Opts.GenerateProfile = false;
+  Opts.EmitProfileCoverageMapping = false;
+  Opts.UseProfile = "";
 }

@@ -29,7 +29,6 @@ using namespace swift::PatternMatch;
 using llvm::DenseMap;
 using llvm::MapVector;
 
-static const uint64_t SILLoopUnrollThreshold = 250;
 
 namespace {
 
@@ -187,6 +186,9 @@ static bool canAndShouldUnrollLoop(SILLoop *Loop, uint64_t TripCount) {
   // It is used to estimate the cost of the callee
   // inside a loop.
   const uint64_t InsnsPerBB = 4;
+  // Use command-line threshold for unrolling.
+  const uint64_t SILLoopUnrollThreshold = Loop->getBlocks().empty() ? 0 : 
+    (Loop->getBlocks())[0]->getParent()->getModule().getOptions().UnrollThreshold;
   for (auto *BB : Loop->getBlocks()) {
     for (auto &Inst : *BB) {
       if (!Loop->canDuplicate(&Inst))
@@ -196,7 +198,7 @@ static bool canAndShouldUnrollLoop(SILLoop *Loop, uint64_t TripCount) {
       if (auto AI = FullApplySite::isa(&Inst)) {
         auto Callee = AI.getCalleeFunction();
         if (Callee && getEligibleFunction(AI, InlineSelection::Everything)) {
-          // If callee is rather big and potentialy inlineable, it may be better
+          // If callee is rather big and potentialy inlinable, it may be better
           // not to unroll, so that the body of the calle can be inlined later.
           Cost += Callee->size() * InsnsPerBB;
         }
@@ -379,8 +381,9 @@ static bool tryToUnrollLoop(SILLoop *Loop) {
     if (!isa<CondBranchInst>(Exit->getTerminator()))
       return false;
 
-  DEBUG(llvm::dbgs() << "Unrolling loop in " << Header->getParent()->getName()
-                     << " " << *Loop << "\n");
+  LLVM_DEBUG(llvm::dbgs() << "Unrolling loop in "
+                          << Header->getParent()->getName()
+                          << " " << *Loop << "\n");
 
   SmallVector<SILBasicBlock *, 16> Headers;
   Headers.push_back(Header);

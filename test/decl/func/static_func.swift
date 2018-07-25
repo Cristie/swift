@@ -61,21 +61,21 @@ extension E {
 }
 
 class C {
-  static func f1() {} // expected-note 3{{overridden declaration is here}}
+  static func f1() {} // expected-note 3{{overri}}
   class func f2() {}
   class func f3() {}
-  class func f4() {} // expected-note {{overridden declaration is here}}
-  class func f5() {} // expected-note {{overridden declaration is here}}
+  class func f4() {} // expected-note {{overri}}
+  class func f5() {} // expected-note {{overri}}
   static final func f6() {} // expected-error {{static declarations are already final}} {{10-16=}}
-  final class func f7() {} // expected-note 3{{overridden declaration is here}}
+  final class func f7() {} // expected-note 3{{overri}}
 }
 
 extension C {
   static func ef1() {}
-  class func ef2() {} // expected-note {{overridden declaration is here}}
-  class func ef3() {} // expected-note {{overridden declaration is here}}
-  class func ef4() {} // expected-note {{overridden declaration is here}}
-  class func ef5() {} // expected-note {{overridden declaration is here}}
+  class func ef2() {} // expected-note {{overri}}
+  class func ef3() {} // expected-note {{overri}}
+  class func ef4() {} // expected-note {{overri}}
+  class func ef5() {} // expected-note {{overri}}
 }
 
 class C_Derived : C {
@@ -83,8 +83,8 @@ class C_Derived : C {
   override class func f2() {}
   class override func f3() {}
 
-  override class func ef2() {} // expected-error {{overriding declarations from extensions is not supported}}
-  class override func ef3() {} // expected-error {{overriding declarations from extensions is not supported}}
+  override class func ef2() {} // expected-error {{not supported}}
+  class override func ef3() {} // expected-error {{not supported}}
   override static func f7() {} // expected-error {{static method overrides a 'final' class method}}
 }
 
@@ -98,17 +98,22 @@ class C_Derived3 : C {
 }
 
 extension C_Derived {
-  override class func f4() {} // expected-error {{overriding declarations in extensions is not supported}}
-  class override func f5() {} // expected-error {{overriding declarations in extensions is not supported}}
+  override class func f4() {} // expected-error {{not supported}}
+  class override func f5() {} // expected-error {{not supported}}
 
-  override class func ef4() {} // expected-error {{overriding declarations in extensions is not supported}}
-  class override func ef5() {} // expected-error {{overriding declarations in extensions is not supported}}
+  override class func ef4() {} // expected-error {{not supported}}
+  class override func ef5() {} // expected-error {{not supported}}
 }
 
-protocol P {
+protocol P { // expected-note{{extended type declared here}}
   static func f1()
   static func f2()
   static func f3() {} // expected-error {{protocol methods must not have bodies}}
   static final func f4() // expected-error {{only classes and class members may be marked with 'final'}}
+  class func f5() // expected-error {{class methods are only allowed within classes; use 'static' to declare a requirement fulfilled by either a static or class method}} {{3-8=static}}
+}
+
+extension P {
+  class func f6() {} // expected-error {{class methods are only allowed within classes; use 'static' to declare a static method}} {{3-8=static}}
 }
 

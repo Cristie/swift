@@ -501,8 +501,10 @@ enum class CompletionKind {
   AssignmentRHS,
   CallArg,
   ReturnStmtExpr,
+  YieldStmtExpr,
   ForEachSequence,
   AfterPound,
+  AfterIfStmtElse,
   GenericParams,
   SwiftKeyPath,
 };
@@ -856,14 +858,17 @@ class PrintingCodeCompletionConsumer
     : public SimpleCachingCodeCompletionConsumer {
   llvm::raw_ostream &OS;
   bool IncludeKeywords;
+  bool IncludeComments;
 
 public:
-  PrintingCodeCompletionConsumer(llvm::raw_ostream &OS, bool IncludeKeywords = true)
-      : OS(OS), IncludeKeywords(IncludeKeywords) {
-  }
+ PrintingCodeCompletionConsumer(llvm::raw_ostream &OS,
+                                bool IncludeKeywords = true,
+                                bool IncludeComments = true)
+     : OS(OS),
+       IncludeKeywords(IncludeKeywords),
+       IncludeComments(IncludeComments) {}
 
-  void handleResults(
-      MutableArrayRef<CodeCompletionResult *> Results) override;
+ void handleResults(MutableArrayRef<CodeCompletionResult *> Results) override;
 };
 
 /// \brief Create a factory for code completion callbacks.

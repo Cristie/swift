@@ -94,6 +94,7 @@
                     "fix_lifetime" "mark_dependence"
                     "end_lifetime"
                     "is_unique" "is_unique_or_pinned"
+                    "is_escaping_closure"
                     "copy_block"
                     "strong_unpin" "strong_pin" "is_unique" "is_unique_or_pinned")
                   'words) . font-lock-keyword-face)
@@ -111,17 +112,19 @@
                   'words) . font-lock-keyword-face)
    ;; Metatypes
    `(,(regexp-opt '("metatype" "value_metatype"
-                    "existential_metatype" "init_existential_metatype")
+                    "existential_metatype" "init_existential_metatype"
+                    "objc_protocol")
                   'words) . font-lock-keyword-face)
    ;; Aggregate Types
    `(,(regexp-opt '("retain_value" "release_value_addr" "release_value"
                     "release_value_addr" "tuple" "tuple_extract"
                     "tuple_element_addr" "struct" "struct_extract"
-                    "struct_element_addr" "ref_element_addr"
+                    "struct_element_addr" "ref_element_addr" "ref_tail_addr"
                     "autorelease_value" "copy_value" "destroy_value"
                     "unmanaged_retain_value" "unmanaged_release_value"
                     "unmanaged_autorelease_value"
-                    "copy_unowned_value")
+                    "copy_unowned_value"
+                    "destructure_struct" "destructure_tuple")
                   'words) . font-lock-keyword-face)
    ;; Enums. *NOTE* We do not include enum itself here since enum is a
    ;; swift declaration as well handled at the top.
@@ -149,7 +152,7 @@
                     "unchecked_bitwise_cast"
                     "ref_to_raw_pointer" "raw_pointer_to_ref"
                     "unowned_to_ref" "ref_to_unowned"
-                    "convert_function"
+                    "convert_function" "convert_escape_to_noescape"
                     "ref_to_unmanaged" "unmanaged_to_ref"
                     "thin_function_to_pointer" "pointer_to_thin_function"
                     "ref_to_bridge_object"
@@ -159,7 +162,6 @@
                     "objc_metatype_to_object"
                     "objc_existential_metatype_to_object"
                     "word_to_bridge_object"
-                    "is_nonnull"
 
                     )
                   'words) . font-lock-keyword-face)

@@ -56,7 +56,7 @@ static void lifetimeExtendAddressOnlyRValueSubValues(
     assert(v->getType().isAddressOnly(SGF.getModule()) &&
            "RValue invariants imply that all RValue subtypes that are "
            "addresses must be address only.");
-    auto boxTy = SILBoxType::get(v->getType().getSwiftRValueType());
+    auto boxTy = SILBoxType::get(v->getType().getASTType());
     SILValue box = SGF.B.createAllocBox(loc, boxTy);
     SILValue addr = SGF.B.createProjectBox(loc, box, 0);
     SGF.B.createCopyAddr(loc, v, addr, IsTake, IsInitialization);
@@ -119,32 +119,9 @@ RValue Scope::popPreservingValue(RValue &&rv) {
   return RValue(SGF, std::move(managedValues), type, numEltsRemaining);
 }
 
-void Scope::popPreservingValues(ArrayRef<ManagedValue> innerValues,
-                                MutableArrayRef<ManagedValue> outerValues) {
-  auto &SGF = cleanups.SGF;
-  assert(innerValues.size() == outerValues.size());
-
-  // Record the cleanup information for each preserved value and deactivate its
-  // cleanup.
-  SmallVector<CleanupCloner, 4> cleanups;
-  cleanups.reserve(innerValues.size());
-  for (auto &mv : innerValues) {
-    cleanups.emplace_back(SGF, mv);
-    mv.forward(SGF);
-  }
-
-  // Pop any unpreserved cleanups.
-  pop();
-
-  // Create a managed value for each preserved value, cloning its cleanup.
-  // Since the CleanupCloner does not remember its SILValue, grab it from the
-  // original, now-deactivated managed value.
-  for (auto index : indices(innerValues)) {
-    outerValues[index] = cleanups[index].clone(innerValues[index].getValue());
-  }
-}
-
 void Scope::popImpl() {
+  SmallVector<SILValue, 16> cleanupsToPropagateToOuterScope;
+
   cleanups.stack.checkIterator(depth);
   cleanups.stack.checkIterator(cleanups.innermostScope);
   assert(cleanups.innermostScope == depth && "popping scopes out of order");

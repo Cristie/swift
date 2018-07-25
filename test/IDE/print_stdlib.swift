@@ -25,7 +25,10 @@
 // CHECK-NOT: {{^}}import
 // CHECK-NOT: _Double
 // CHECK-NOT: _StringBuffer
-// CHECK-NOT: _StringCore
+// CHECK-NOT: _LegacyStringCore
+// CHECK-NOT: _SwiftRawStringStorage
+// CHECK-NOT: _SwiftStringStorage
+// CHECK-NOT: _StringGuts
 // CHECK-NOT: _ArrayBody
 // DONT_CHECK-NOT: {{([^I]|$)([^n]|$)([^d]|$)([^e]|$)([^x]|$)([^a]|$)([^b]|$)([^l]|$)([^e]|$)}}
 // CHECK-NOT: buffer: _ArrayBuffer
@@ -41,13 +44,9 @@
 // CHECK-NOT: _ExpressibleByImageLiteral
 
 // CHECK-SUGAR: extension Array :
-// CHECK-SUGAR: extension ImplicitlyUnwrappedOptional :
 // CHECK-SUGAR: extension Optional :
 
 // CHECK-MUTATING-ATTR: mutating func
-
-func foo(x: _Pointer) {} // Checks that this protocol actually exists.
-// CHECK-NOT: _Pointer
 
 // NO-FIXMES-NOT: FIXME
 // RUN: %target-swift-ide-test -print-module-groups -module-to-print=Swift -source-filename %s -print-interface > %t-group.txt

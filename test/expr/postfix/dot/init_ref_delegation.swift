@@ -373,6 +373,35 @@ class TestNestedExpr {
   convenience init(i: Int) {
     _ = ((), try! self.init(error: true)) // expected-error {{initializer delegation ('self.init') cannot be nested in another expression}}
   }
+
+  convenience init(j: Int) throws {
+    _ = {
+      try self.init(error: true)
+      // expected-error@-1 {{initializer delegation ('self.init') cannot be nested in another expression}}
+    }
+
+    _ = {
+      do {
+        try self.init(error: true)
+        // expected-error@-1 {{initializer delegation ('self.init') cannot be nested in another expression}}
+      }
+    }
+
+    defer {
+      try! self.init(error: true)
+      // expected-error@-1 {{initializer delegation ('self.init') cannot be nested in another expression}}
+    }
+
+    func local() throws {
+      try self.init(error: true)
+      // expected-error@-1 {{initializer delegation ('self.init') cannot be nested in another expression}}
+    }
+  }
+
+  convenience init(k: Int) {
+    func use(_ x: Any...) {}
+    use(self.init()) // expected-error {{initializer delegation ('self.init') cannot be nested in another expression}}
+  }
 }
 
 class TestNestedExprSub : TestNestedExpr {
@@ -416,6 +445,11 @@ class TestNestedExprSub : TestNestedExpr {
 
   init(i: Int) {
     _ = ((), try! super.init(error: true)) // expected-error {{initializer chaining ('super.init') cannot be nested in another expression}}
+  }
+
+  init(j: Int) {
+    func use(_ x: Any...) {}
+    use(super.init()) // expected-error {{initializer chaining ('super.init') cannot be nested in another expression}}
   }
 }
 

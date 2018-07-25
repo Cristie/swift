@@ -164,6 +164,12 @@ public:
   }
 };
 
+llvm::Constant *IRGenModule::getTypeRef(CanType type) {
+  IRGenMangler Mangler;
+  auto SymbolicName = Mangler.mangleTypeForReflection(*this, type);
+  return getAddrOfStringForTypeRef(SymbolicName);
+}
+
 class ReflectionMetadataBuilder {
 protected:
   IRGenModule &IGM;
@@ -174,7 +180,7 @@ protected:
     : IGM(IGM), InitBuilder(IGM), B(InitBuilder.beginStruct()) {}
 
   virtual ~ReflectionMetadataBuilder() {}
-
+  
   // Collect any builtin types referenced from this type.
   void addBuiltinTypeRefs(CanType type) {
     type.visit([&](CanType t) {
@@ -203,28 +209,23 @@ protected:
 
   /// Add a 32-bit relative offset to a mangled typeref string
   /// in the typeref reflection section.
-  void addTypeRef(ModuleDecl *ModuleContext, CanType type,
-                  CanGenericSignature Context = {}) {
-    assert(type);
+  void addTypeRef(CanType type) {
+    B.addRelativeAddress(IGM.getTypeRef(type));
+  }
 
-    // Generic parameters should be written in terms of interface types
-    // for the purposes of reflection metadata
-    assert(!type->hasArchetype() && "Forgot to map typeref out of context");
-
-    // TODO: As a compatibility hack, mangle single-field boxes with the legacy
-    // mangling in reflection metadata.
-    bool isSingleFieldOfBox = false;
-    auto boxTy = dyn_cast<SILBoxType>(type);
-    if (boxTy && boxTy->getLayout()->getFields().size() == 1) {
-      GenericContextScope scope(IGM, Context);
-      type = boxTy->getFieldLoweredType(IGM.getSILModule(), 0);
-      isSingleFieldOfBox = true;
+  /// Add a 32-bit relative offset to a mangled nominal type string
+  /// in the typeref reflection section.
+  void addNominalRef(const NominalTypeDecl *nominal) {
+    if (auto proto = dyn_cast<ProtocolDecl>(nominal)) {
+      IRGenMangler mangler;
+      SymbolicMangling mangledStr;
+      mangledStr.String = mangler.mangleBareProtocol(proto);
+      auto mangledName = IGM.getAddrOfStringForTypeRef(mangledStr);
+      B.addRelativeAddress(mangledName);
+    } else {
+      CanType type = nominal->getDeclaredType()->getCanonicalType();
+      B.addRelativeAddress(IGM.getTypeRef(type));
     }
-    IRGenMangler mangler;
-    std::string MangledStr = mangler.mangleTypeForReflection(type,
-                                            ModuleContext, isSingleFieldOfBox);
-    auto mangledName = IGM.getAddrOfStringForTypeRef(MangledStr);
-    B.addRelativeAddress(mangledName);
   }
 
   llvm::GlobalVariable *emit(Optional<LinkEntity> entity,
@@ -246,7 +247,7 @@ protected:
 
     // Others, such as capture descriptors, do not have a name.
     } else {
-      var = B.finishAndCreateGlobal("\x01l__swift3_reflection_descriptor",
+      var = B.finishAndCreateGlobal("\x01l__swift5_reflection_descriptor",
                                     Alignment(4), /*isConstant*/ true,
                                     llvm::GlobalValue::PrivateLinkage);
     }
@@ -254,6 +255,8 @@ protected:
     var->setSection(section);
 
     IGM.addUsedGlobal(var);
+
+    disableAddressSanitizer(IGM, var);
 
     return var;
   }
@@ -276,28 +279,24 @@ class AssociatedTypeMetadataBuilder : public ReflectionMetadataBuilder {
     PrettyStackTraceDecl DebugStack("emitting associated type metadata",
                                     Nominal);
 
-    auto *M = IGM.getSILModule().getSwiftModule();
-
-    addTypeRef(M, Nominal->getDeclaredType()->getCanonicalType());
-
-    auto ProtoTy = Conformance->getProtocol()->getDeclaredType();
-    addTypeRef(M, ProtoTy->getCanonicalType());
+    addTypeRef(Nominal->getDeclaredType()->getCanonicalType());
+    addNominalRef(Conformance->getProtocol());
 
     B.addInt32(AssociatedTypes.size());
     B.addInt32(AssociatedTypeRecordSize);
 
     for (auto AssocTy : AssociatedTypes) {
-      auto NameGlobal = IGM.getAddrOfStringForTypeRef(AssocTy.first);
+      auto NameGlobal = IGM.getAddrOfFieldName(AssocTy.first);
       B.addRelativeAddress(NameGlobal);
       addBuiltinTypeRefs(AssocTy.second);
-      addTypeRef(M, AssocTy.second);
+      addTypeRef(AssocTy.second);
     }
   }
 
 public:
   AssociatedTypeMetadataBuilder(IRGenModule &IGM,
-                                const ProtocolConformance *Conformance,
-                                ArrayRef<std::pair<StringRef, CanType>> AssociatedTypes)
+                        const ProtocolConformance *Conformance,
+                        ArrayRef<std::pair<StringRef, CanType>> AssociatedTypes)
     : ReflectionMetadataBuilder(IGM), Conformance(Conformance),
       AssociatedTypes(AssociatedTypes) {}
 
@@ -316,13 +315,15 @@ class FieldTypeMetadataBuilder : public ReflectionMetadataBuilder {
                     bool indirect=false) {
     reflection::FieldRecordFlags flags;
     flags.setIsIndirectCase(indirect);
+    if (auto var = dyn_cast<VarDecl>(value))
+      flags.setIsVar(!var->isLet());
 
     B.addInt32(flags.getRawValue());
 
     if (!type) {
       B.addInt32(0);
     } else {
-      addTypeRef(value->getModuleContext(), type);
+      addTypeRef(type);
       addBuiltinTypeRefs(type);
     }
 
@@ -351,11 +352,12 @@ class FieldTypeMetadataBuilder : public ReflectionMetadataBuilder {
     B.addInt16(fieldRecordSize);
 
     // Imported classes don't need field descriptors
-    if (NTD->hasClangNode()) {
-      assert(isa<ClassDecl>(NTD));
+    if (NTD->hasClangNode() && isa<ClassDecl>(NTD)) {
       B.addInt32(0);
       return;
     }
+
+    assert(!NTD->hasClangNode() || isa<StructDecl>(NTD));
 
     auto properties = NTD->getStoredProperties();
     B.addInt32(std::distance(properties.begin(), properties.end()));
@@ -418,17 +420,16 @@ class FieldTypeMetadataBuilder : public ReflectionMetadataBuilder {
   void layout() override {
     if (NTD->hasClangNode() &&
         !isa<ClassDecl>(NTD) &&
+        !isa<StructDecl>(NTD) &&
         !isa<ProtocolDecl>(NTD))
       return;
 
     PrettyStackTraceDecl DebugStack("emitting field type metadata", NTD);
-    auto type = NTD->getDeclaredType()->getCanonicalType();
-    addTypeRef(NTD->getModuleContext(), type);
+    addNominalRef(NTD);
 
     auto *CD = dyn_cast<ClassDecl>(NTD);
     if (CD && CD->getSuperclass()) {
-      addTypeRef(NTD->getModuleContext(),
-                 CD->getSuperclass()->getCanonicalType());
+      addTypeRef(CD->getSuperclass()->getCanonicalType());
     } else {
       B.addInt32(0);
     }
@@ -488,9 +489,9 @@ public:
     ti = &cast<FixedTypeInfo>(IGM.getTypeInfoForUnlowered(
         nominalDecl->getDeclaredTypeInContext()->getCanonicalType()));
   }
-
+  
   void layout() override {
-    addTypeRef(module, type);
+    addTypeRef(type);
 
     B.addInt32(ti->getFixedSize().getValue());
     B.addInt32(ti->getFixedAlignment().getValue());
@@ -534,13 +535,13 @@ class BoxDescriptorBuilder : public ReflectionMetadataBuilder {
 public:
   BoxDescriptorBuilder(IRGenModule &IGM, CanType BoxedType)
     : ReflectionMetadataBuilder(IGM), BoxedType(BoxedType) {}
-
+  
   void layout() override {
     B.addInt32(1);
     B.addInt32(0); // Number of sources
     B.addInt32(0); // Number of generic bindings
 
-    addTypeRef(IGM.getSILModule().getSwiftModule(), BoxedType);
+    addTypeRef(BoxedType);
     addBuiltinTypeRefs(BoxedType);
   }
 
@@ -555,21 +556,19 @@ public:
 /// captures are generic.
 class CaptureDescriptorBuilder : public ReflectionMetadataBuilder {
   swift::reflection::MetadataSourceBuilder SourceBuilder;
-  SILFunction &Caller;
   CanSILFunctionType OrigCalleeType;
   CanSILFunctionType SubstCalleeType;
-  SubstitutionList Subs;
+  SubstitutionMap Subs;
   const HeapLayout &Layout;
 
 public:
   CaptureDescriptorBuilder(IRGenModule &IGM,
-                           SILFunction &Caller,
                            CanSILFunctionType OrigCalleeType,
                            CanSILFunctionType SubstCalleeType,
-                           SubstitutionList Subs,
+                           SubstitutionMap Subs,
                            const HeapLayout &Layout)
     : ReflectionMetadataBuilder(IGM),
-      Caller(Caller), OrigCalleeType(OrigCalleeType),
+      OrigCalleeType(OrigCalleeType),
       SubstCalleeType(SubstCalleeType), Subs(Subs),
       Layout(Layout) {}
 
@@ -611,7 +610,7 @@ public:
     auto ElementTypes = Layout.getElementTypes().slice(
         Layout.hasBindings() ? 1 : 0);
     for (auto ElementType : ElementTypes) {
-      auto SwiftType = ElementType.getSwiftRValueType();
+      auto SwiftType = ElementType.getASTType();
       if (SwiftType->hasOpenedExistential())
         return true;
     }
@@ -650,15 +649,12 @@ public:
 
       auto Source = SourceBuilder.createClosureBinding(i);
       auto BindingType = Bindings[i].TypeParameter;
-      auto InterfaceType = Caller.mapTypeOutOfContext(BindingType);
+      auto InterfaceType = BindingType->mapTypeOutOfContext();
       SourceMap.push_back({InterfaceType->getCanonicalType(), Source});
     }
 
     // Check if any requirements were fulfilled by metadata stored inside a
     // captured value.
-
-    auto SubstMap =
-      OrigCalleeType->getGenericSignature()->getSubstitutionMap(Subs);
 
     enumerateGenericParamFulfillments(IGM, OrigCalleeType,
         [&](CanType GenericParam,
@@ -691,8 +687,8 @@ public:
       // parameters.
       auto Src = Path.getMetadataSource(SourceBuilder, Root);
 
-      auto SubstType = GenericParam.subst(SubstMap);
-      auto InterfaceType = Caller.mapTypeOutOfContext(SubstType);
+      auto SubstType = GenericParam.subst(Subs);
+      auto InterfaceType = SubstType->mapTypeOutOfContext();
       SourceMap.push_back({InterfaceType->getCanonicalType(), Src});
     });
 
@@ -705,7 +701,7 @@ public:
     std::vector<CanType> CaptureTypes;
 
     for (auto ElementType : getElementTypes()) {
-      auto SwiftType = ElementType.getSwiftRValueType();
+      auto SwiftType = ElementType.getASTType();
 
       // Erase pseudogeneric captures down to AnyObject.
       if (OrigCalleeType->isPseudogeneric()) {
@@ -718,7 +714,7 @@ public:
         })->getCanonicalType();
       }
 
-      auto InterfaceType = Caller.mapTypeOutOfContext(SwiftType);
+      auto InterfaceType = SwiftType->mapTypeOutOfContext();
       CaptureTypes.push_back(InterfaceType->getCanonicalType());
     }
 
@@ -735,8 +731,7 @@ public:
 
     // Now add typerefs of all of the captures.
     for (auto CaptureType : CaptureTypes) {
-      addTypeRef(IGM.getSILModule().getSwiftModule(), CaptureType,
-                 OrigCalleeType->getGenericSignature());
+      addTypeRef(CaptureType);
       addBuiltinTypeRefs(CaptureType);
     }
 
@@ -746,7 +741,7 @@ public:
       auto GenericParam = GenericAndSource.first->getCanonicalType();
       auto Source = GenericAndSource.second;
 
-      addTypeRef(nullptr, GenericParam);
+      addTypeRef(GenericParam);
       addMetadataSource(Source);
     }
   }
@@ -768,15 +763,15 @@ static std::string getReflectionSectionName(IRGenModule &IGM,
   case llvm::Triple::COFF:
     assert(FourCC.size() <= 4 &&
            "COFF section name length must be <= 8 characters");
-    OS << ".sw3" << FourCC;
+    OS << ".sw5" << FourCC << "$B";
     break;
   case llvm::Triple::ELF:
-    OS << ".swift3_" << LongName;
+    OS << "swift5_" << LongName;
     break;
   case llvm::Triple::MachO:
     assert(LongName.size() <= 7 &&
            "Mach-O section name length must be <= 16 characters");
-    OS << "__TEXT,__swift3_" << LongName << ", regular, no_dead_strip";
+    OS << "__TEXT,__swift5_" << LongName << ", regular, no_dead_strip";
     break;
   case llvm::Triple::Wasm:
     llvm_unreachable("web assembly object format is not supported.");
@@ -828,16 +823,7 @@ llvm::Constant *IRGenModule::getAddrOfFieldName(StringRef Name) {
 
   entry = createStringConstant(Name, /*willBeRelativelyAddressed*/ true,
                                getReflectionStringsSectionName());
-  return entry.second;
-}
-
-llvm::Constant *IRGenModule::getAddrOfStringForTypeRef(StringRef Str) {
-  auto &entry = StringsForTypeRef[Str];
-  if (entry.second)
-    return entry.second;
-
-  entry = createStringConstant(Str, /*willBeRelativelyAddressed*/ true,
-                               getReflectionTypeRefSectionName());
+  disableAddressSanitizer(*this, entry.first);
   return entry.second;
 }
 
@@ -856,7 +842,7 @@ llvm::Constant *
 IRGenModule::getAddrOfCaptureDescriptor(SILFunction &Caller,
                                         CanSILFunctionType OrigCalleeType,
                                         CanSILFunctionType SubstCalleeType,
-                                        SubstitutionList Subs,
+                                        SubstitutionMap Subs,
                                         const HeapLayout &Layout) {
   if (!IRGen.Opts.EnableReflectionMetadata)
     return llvm::Constant::getNullValue(CaptureDescriptorPtrTy);
@@ -864,7 +850,7 @@ IRGenModule::getAddrOfCaptureDescriptor(SILFunction &Caller,
   if (CaptureDescriptorBuilder::hasOpenedExistential(OrigCalleeType, Layout))
     return llvm::Constant::getNullValue(CaptureDescriptorPtrTy);
 
-  CaptureDescriptorBuilder builder(*this, Caller,
+  CaptureDescriptorBuilder builder(*this,
                                    OrigCalleeType, SubstCalleeType, Subs,
                                    Layout);
   auto var = builder.emit();
@@ -881,13 +867,9 @@ emitAssociatedTypeMetadataRecord(const ProtocolConformance *Conformance) {
   auto collectTypeWitness = [&](const AssociatedTypeDecl *AssocTy,
                                 Type Replacement,
                                 const TypeDecl *TD) -> bool {
-
-    auto Subst = Conformance->getDeclContext()->mapTypeOutOfContext(
-        Replacement);
-
     AssociatedTypes.push_back({
       AssocTy->getNameStr(),
-      Subst->getCanonicalType()
+      Replacement->getCanonicalType()
     });
     return false;
   };
@@ -931,6 +913,9 @@ void IRGenModule::emitBuiltinReflectionMetadata() {
   for (auto PD : ImportedProtocols)
     emitFieldMetadataRecord(PD);
 
+  for (auto SD : ImportedStructs)
+    emitFieldMetadataRecord(SD);
+
   for (auto builtinType : BuiltinTypes)
     emitBuiltinTypeMetadataRecord(builtinType);
 
@@ -957,7 +942,7 @@ void IRGenModule::emitFieldMetadataRecord(const NominalTypeDecl *Decl) {
     }
 
   FieldTypeMetadataBuilder builder(*this, Decl);
-  builder.emit();
+  FieldDescriptors.push_back(builder.emit());
 }
 
 void IRGenModule::emitReflectionMetadataVersion() {

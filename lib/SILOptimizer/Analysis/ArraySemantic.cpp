@@ -84,16 +84,9 @@ bool swift::ArraySemanticsCall::isValidSignature() {
       auto *AllocBufferAI = dyn_cast<ApplyInst>(Arg0);
       if (!AllocBufferAI)
         return false;
-
       auto *AllocFn = AllocBufferAI->getReferencedFunction();
-      if (!AllocFn)
-        return false;
-
-      StringRef AllocFuncName = AllocFn->getName();
-      if (AllocFuncName != "swift_bufferAllocate")
-        return false;
-
-      if (!hasOneNonDebugUse(AllocBufferAI))
+      if (!AllocFn || AllocFn->getName() != "swift_bufferAllocate" ||
+          !hasOneNonDebugUse(AllocBufferAI))
         return false;
     }
     return true;
@@ -724,7 +717,7 @@ bool swift::ArraySemanticsCall::replaceByValue(SILValue V) {
 
 bool swift::ArraySemanticsCall::replaceByAppendingValues(
     SILModule &M, SILFunction *AppendFn, SILFunction *ReserveFn,
-    const SmallVectorImpl<SILValue> &Vals, ArrayRef<Substitution> Subs) {
+    const SmallVectorImpl<SILValue> &Vals, SubstitutionMap Subs) {
   assert(getKind() == ArrayCallKind::kAppendContentsOf &&
          "Must be an append_contentsOf call");
   assert(AppendFn && "Must provide an append SILFunction");

@@ -295,6 +295,8 @@ updatePointsTo(CGNode *InitialNode, CGNode *pointsTo) {
       } else {
         Node->pointsTo = pointsTo;
       }
+      // Update use-points if the use-point information is already calculated.
+      pointsTo->mergeUsePoints(Node);
     }
 
     // Add all adjacent nodes to the WorkList.
@@ -402,9 +404,11 @@ void EscapeAnalysis::ConnectionGraph::computeUsePoints() {
 
     for (auto &I : BB) {
       switch (I.getKind()) {
+#define ALWAYS_OR_SOMETIMES_LOADABLE_CHECKED_REF_STORAGE(Name, ...) \
+        case SILInstructionKind::Name##ReleaseInst:
+#include "swift/AST/ReferenceStorage.def"
         case SILInstructionKind::StrongReleaseInst:
         case SILInstructionKind::ReleaseValueInst:
-        case SILInstructionKind::UnownedReleaseInst:
         case SILInstructionKind::ApplyInst:
         case SILInstructionKind::TryApplyInst: {
           /// Actually we only add instructions which may release a reference.
@@ -548,7 +552,7 @@ bool EscapeAnalysis::ConnectionGraph::isUsePoint(SILNode *UsePoint,
                                                  CGNode *Node) {
   assert(Node->getEscapeState() < EscapeState::Global &&
          "Use points are only valid for non-escaping nodes");
-  UsePoint = UsePoint->getCanonicalSILNodeInObject();
+  UsePoint = UsePoint->getRepresentativeSILNodeInObject();
   auto Iter = UsePoints.find(UsePoint);
   if (Iter == UsePoints.end())
     return false;
@@ -989,11 +993,9 @@ void EscapeAnalysis::ConnectionGraph::verifyStructure() const {
 //                          EscapeAnalysis
 //===----------------------------------------------------------------------===//
 
-EscapeAnalysis::EscapeAnalysis(SILModule *M) :
-  BottomUpIPAnalysis(AnalysisKind::Escape), M(M),
-  ArrayType(M->getASTContext().getArrayDecl()), BCA(nullptr) {
-}
-
+EscapeAnalysis::EscapeAnalysis(SILModule *M)
+    : BottomUpIPAnalysis(SILAnalysisKind::Escape), M(M),
+      ArrayType(M->getASTContext().getArrayDecl()), BCA(nullptr) {}
 
 void EscapeAnalysis::initialize(SILPassManager *PM) {
   BCA = PM->getAnalysis<BasicCalleeAnalysis>();
@@ -1014,33 +1016,46 @@ static bool linkBBArgs(SILBasicBlock *BB) {
   return true;
 }
 
-/// Returns true if the type \p Ty is a reference or transitively contains
+/// Returns true if the type \p Ty is a reference or may transitively contains
 /// a reference, i.e. if it is a "pointer" type.
-static bool isOrContainsReference(SILType Ty, SILModule *Mod) {
+static bool mayContainReference(SILType Ty, SILModule *Mod) {
+  // Opaque types may contain a reference. Speculatively track them too.
+  //
+  // 1. It may be possible to optimize opaque values based on known mutation
+  // points.
+  //
+  // 2. A specialized function may call a generic function passing a conrete
+  // reference type via incomplete specialization.
+  //
+  // 3. A generic function may call a specialized function taking a concrete
+  // reference type via devirtualization.
+  if (Ty.isAddressOnly(*Mod))
+    return true;
+
   if (Ty.hasReferenceSemantics())
     return true;
 
-  if (Ty.getSwiftRValueType() == Mod->getASTContext().TheRawPointerType)
+  if (Ty.getASTType() == Mod->getASTContext().TheRawPointerType)
     return true;
 
   if (auto *Str = Ty.getStructOrBoundGenericStruct()) {
     for (auto *Field : Str->getStoredProperties()) {
-      if (isOrContainsReference(Ty.getFieldType(Field, *Mod), Mod))
+      if (mayContainReference(Ty.getFieldType(Field, *Mod), Mod))
         return true;
     }
     return false;
   }
   if (auto TT = Ty.getAs<TupleType>()) {
     for (unsigned i = 0, e = TT->getNumElements(); i != e; ++i) {
-      if (isOrContainsReference(Ty.getTupleElementType(i), Mod))
+      if (mayContainReference(Ty.getTupleElementType(i), Mod))
         return true;
     }
     return false;
   }
   if (auto En = Ty.getEnumOrBoundGenericEnum()) {
     for (auto *ElemDecl : En->getAllElements()) {
-      if (ElemDecl->hasAssociatedValues() &&
-          isOrContainsReference(Ty.getEnumElementType(ElemDecl, *Mod), Mod))
+      if (ElemDecl->hasAssociatedValues()
+          && mayContainReference(Ty.getEnumElementType(ElemDecl, *Mod), Mod))
         return true;
     }
     return false;
@@ -1054,7 +1069,7 @@ bool EscapeAnalysis::isPointer(ValueBase *V) {
   if (Iter != isPointerCache.end())
     return Iter->second;
 
-  bool IP = (Ty.isAddress() || isOrContainsReference(Ty, M));
+  bool IP = (Ty.isAddress() || mayContainReference(Ty, M));
   isPointerCache[Ty] = IP;
   return IP;
 }
@@ -1065,8 +1080,8 @@ void EscapeAnalysis::buildConnectionGraph(FunctionInfo *FInfo,
   if (BottomUpOrder.prepareForVisiting(FInfo))
     return;
 
-  DEBUG(llvm::dbgs() << "  >> build graph for " <<
-        FInfo->Graph.F->getName() << '\n');
+  LLVM_DEBUG(llvm::dbgs() << "  >> build graph for "
+                          << FInfo->Graph.F->getName() << '\n');
 
   FInfo->NeedUpdateSummaryGraph = true;
 
@@ -1123,8 +1138,8 @@ void EscapeAnalysis::buildConnectionGraph(FunctionInfo *FInfo,
       }
     }
   }
-  DEBUG(llvm::dbgs() << "  << finished graph for " <<
-        FInfo->Graph.F->getName() << '\n');
+  LLVM_DEBUG(llvm::dbgs() << "  << finished graph for "
+                          << FInfo->Graph.F->getName() << '\n');
 }
 
 /// Returns true if all uses of \p I are tuple_extract instructions.
@@ -1176,7 +1191,7 @@ bool EscapeAnalysis::buildConnectionGraphForDestructor(
   // of its payload.
   // TODO: Generalize it. Destructor of an aggregate type is equivalent to calling
   // destructors for its components.
-  while (auto payloadTy = Ty.getAnyOptionalObjectType())
+  while (auto payloadTy = Ty.getOptionalObjectType())
     Ty = payloadTy;
   auto Class = Ty.getClassOrBoundGenericClass();
   if (!Class || !Class->hasDestructor())
@@ -1354,11 +1369,14 @@ void EscapeAnalysis::analyzeInstruction(SILInstruction *I,
       ConGraph->getNode(cast<SingleValueInstruction>(I), this);
       return;
 
+#define ALWAYS_OR_SOMETIMES_LOADABLE_CHECKED_REF_STORAGE(Name, ...) \
+    case SILInstructionKind::Name##RetainInst: \
+    case SILInstructionKind::StrongRetain##Name##Inst: \
+    case SILInstructionKind::Copy##Name##ValueInst:
+#include "swift/AST/ReferenceStorage.def"
     case SILInstructionKind::DeallocStackInst:
     case SILInstructionKind::StrongRetainInst:
-    case SILInstructionKind::StrongRetainUnownedInst:
     case SILInstructionKind::RetainValueInst:
-    case SILInstructionKind::UnownedRetainInst:
     case SILInstructionKind::BranchInst:
     case SILInstructionKind::CondBranchInst:
     case SILInstructionKind::SwitchEnumInst:
@@ -1371,12 +1389,17 @@ void EscapeAnalysis::analyzeInstruction(SILInstruction *I,
     case SILInstructionKind::DeallocRefInst:
     case SILInstructionKind::SetDeallocatingInst:
     case SILInstructionKind::FixLifetimeInst:
+    case SILInstructionKind::ClassifyBridgeObjectInst:
+    case SILInstructionKind::ValueToBridgeObjectInst:
       // These instructions don't have any effect on escaping.
       return;
+
+#define ALWAYS_OR_SOMETIMES_LOADABLE_CHECKED_REF_STORAGE(Name, ...) \
+    case SILInstructionKind::Name##ReleaseInst:
+#include "swift/AST/ReferenceStorage.def"
     case SILInstructionKind::StrongReleaseInst:
     case SILInstructionKind::ReleaseValueInst:
-    case SILInstructionKind::StrongUnpinInst:
-    case SILInstructionKind::UnownedReleaseInst: {
+    case SILInstructionKind::StrongUnpinInst: {
       SILValue OpV = I->getOperand(0);
       if (CGNode *AddrNode = ConGraph->getNode(OpV, this)) {
         // A release instruction may deallocate the pointer operand. This may
@@ -1392,8 +1415,11 @@ void EscapeAnalysis::analyzeInstruction(SILInstruction *I,
       }
       return;
     }
+
+#define NEVER_OR_SOMETIMES_LOADABLE_CHECKED_REF_STORAGE(Name, ...) \
+    case SILInstructionKind::Load##Name##Inst:
+#include "swift/AST/ReferenceStorage.def"
     case SILInstructionKind::LoadInst:
-    case SILInstructionKind::LoadWeakInst:
     // We treat ref_element_addr like a load (see NodeType::Content).
     case SILInstructionKind::RefElementAddrInst:
     case SILInstructionKind::RefTailAddrInst:
@@ -1444,9 +1470,11 @@ void EscapeAnalysis::analyzeInstruction(SILInstruction *I,
       }
       return;
     }
-    break;
+
+#define NEVER_OR_SOMETIMES_LOADABLE_CHECKED_REF_STORAGE(Name, ...) \
+    case SILInstructionKind::Store##Name##Inst:
+#include "swift/AST/ReferenceStorage.def"
     case SILInstructionKind::StoreInst:
-    case SILInstructionKind::StoreWeakInst:
       if (CGNode *ValueNode = ConGraph->getNode(I->getOperand(StoreInst::Src),
                                                 this)) {
         CGNode *AddrNode = ConGraph->getNode(I->getOperand(StoreInst::Dest),
@@ -1523,8 +1551,6 @@ void EscapeAnalysis::analyzeInstruction(SILInstruction *I,
     case SILInstructionKind::UpcastInst:
     case SILInstructionKind::InitExistentialRefInst:
     case SILInstructionKind::OpenExistentialRefInst:
-    case SILInstructionKind::UnownedToRefInst:
-    case SILInstructionKind::RefToUnownedInst:
     case SILInstructionKind::RawPointerToRefInst:
     case SILInstructionKind::RefToRawPointerInst:
     case SILInstructionKind::RefToBridgeObjectInst:
@@ -1532,6 +1558,12 @@ void EscapeAnalysis::analyzeInstruction(SILInstruction *I,
     case SILInstructionKind::UncheckedAddrCastInst:
     case SILInstructionKind::UnconditionalCheckedCastInst:
     case SILInstructionKind::StrongPinInst:
+    // DO NOT use LOADABLE_REF_STORAGE because unchecked references don't have
+    // retain/release instructions that trigger the 'default' case.
+#define ALWAYS_OR_SOMETIMES_LOADABLE_CHECKED_REF_STORAGE(Name, ...) \
+    case SILInstructionKind::RefTo##Name##Inst: \
+    case SILInstructionKind::Name##ToRefInst:
+#include "swift/AST/ReferenceStorage.def"
       // A cast is almost like a projection.
       if (CGNode *OpNode = ConGraph->getNode(I->getOperand(0), this)) {
         ConGraph->setNode(cast<SingleValueInstruction>(I), OpNode);
@@ -1631,8 +1663,8 @@ void EscapeAnalysis::setAllEscaping(SILInstruction *I,
 void EscapeAnalysis::recompute(FunctionInfo *Initial) {
   allocNewUpdateID();
 
-  DEBUG(llvm::dbgs() << "recompute escape analysis with UpdateID " <<
-        getCurrentUpdateID() << '\n');
+  LLVM_DEBUG(llvm::dbgs() << "recompute escape analysis with UpdateID "
+                          << getCurrentUpdateID() << '\n');
 
   // Collect and analyze all functions to recompute, starting at Initial.
   FunctionOrder BottomUpOrder(getCurrentUpdateID());
@@ -1647,14 +1679,14 @@ void EscapeAnalysis::recompute(FunctionInfo *Initial) {
   int Iteration = 0;
   bool NeedAnotherIteration;
   do {
-    DEBUG(llvm::dbgs() << "iteration " << Iteration << '\n');
+    LLVM_DEBUG(llvm::dbgs() << "iteration " << Iteration << '\n');
     NeedAnotherIteration = false;
 
     for (FunctionInfo *FInfo : BottomUpOrder) {
       bool SummaryGraphChanged = false;
       if (FInfo->NeedUpdateSummaryGraph) {
-        DEBUG(llvm::dbgs() << "  create summary graph for " <<
-              FInfo->Graph.F->getName() << '\n');
+        LLVM_DEBUG(llvm::dbgs() << "  create summary graph for "
+                                << FInfo->Graph.F->getName() << '\n');
 
         FInfo->Graph.propagateEscapeStates();
 
@@ -1676,8 +1708,10 @@ void EscapeAnalysis::recompute(FunctionInfo *Initial) {
 
             // Only include callers which we are actually recomputing.
             if (BottomUpOrder.wasRecomputedWithCurrentUpdateID(E.Caller)) {
-              DEBUG(llvm::dbgs() << "  merge  " << FInfo->Graph.F->getName() <<
-                    " into " << E.Caller->Graph.F->getName() << '\n');
+              LLVM_DEBUG(llvm::dbgs() << "  merge  "
+                                      << FInfo->Graph.F->getName()
+                                      << " into "
+                                      << E.Caller->Graph.F->getName() << '\n');
 
               if (mergeCalleeGraph(E.FAS, &E.Caller->Graph,
                                    &FInfo->SummaryGraph)) {
@@ -1694,8 +1728,8 @@ void EscapeAnalysis::recompute(FunctionInfo *Initial) {
         // Limit the total number of iterations. First to limit compile time,
         // second to make sure that the loop terminates. Theoretically this
         // should always be the case, but who knows?
-        DEBUG(llvm::dbgs() << "  finalize conservatively " <<
-              FInfo->Graph.F->getName() << '\n');
+        LLVM_DEBUG(llvm::dbgs() << "  finalize conservatively "
+                                << FInfo->Graph.F->getName() << '\n');
         for (const auto &E : FInfo->getCallers()) {
           assert(E.isValid());
           if (BottomUpOrder.wasRecomputedWithCurrentUpdateID(E.Caller)) {
@@ -1768,7 +1802,8 @@ bool EscapeAnalysis::mergeCalleeGraph(SILInstruction *AS,
       CallerReturnVal = cast<ApplyInst>(AS);
     }
     CGNode *CallerRetNd = CallerGraph->getNode(CallerReturnVal, this);
-    Callee2CallerMapping.add(RetNd, CallerRetNd);
+    if (CallerRetNd)
+      Callee2CallerMapping.add(RetNd, CallerRetNd);
   }
   return CallerGraph->mergeFrom(CalleeGraph, Callee2CallerMapping);
 }
@@ -1806,7 +1841,29 @@ bool EscapeAnalysis::canEscapeToUsePoint(SILValue V, SILNode *UsePoint,
     return true;
 
   // No hidden escapes: check if the Node is reachable from the UsePoint.
-  return ConGraph->isUsePoint(UsePoint, Node);
+  // Check if the object itself can escape to the called function.
+  if (ConGraph->isUsePoint(UsePoint, Node))
+    return true;
+
+  assert(isPointer(V) && "should not have a node for a non-pointer");
+
+  // Check if the object "content" can escape to the called function.
+  // This will catch cases where V is a reference and a pointer to a stored
+  // property escapes.
+  // It's also important in case of a pointer assignment, e.g.
+  //    V = V1
+  //    apply(V1)
+  // In this case the apply is only a use-point for V1 and V1's content node.
+  // As V1's content node is the same as V's content node, we also make the
+  // check for the content node.
+  CGNode *ContentNode = ConGraph->getContentNode(Node);
+  if (ContentNode->escapesInsideFunction(false))
+    return true;
+
+  if (ConGraph->isUsePoint(UsePoint, ContentNode))
+    return true;
+
+  return false;
 }
 
 bool EscapeAnalysis::canEscapeTo(SILValue V, FullApplySite FAS) {
@@ -1820,46 +1877,6 @@ bool EscapeAnalysis::canEscapeTo(SILValue V, FullApplySite FAS) {
 static bool hasReferenceSemantics(SILType T) {
   // Exclude address types.
   return T.isObject() && T.hasReferenceSemantics();
-}
-
-bool EscapeAnalysis::canObjectOrContentEscapeTo(SILValue V, FullApplySite FAS) {
-  // If it's not a local object we don't know anything about the value.
-  if (!pointsToLocalObject(V))
-    return true;
-
-  auto *ConGraph = getConnectionGraph(FAS.getFunction());
-  CGNode *Node = ConGraph->getNodeOrNull(V, this);
-  if (!Node)
-    return true;
-
-  // First check if there are escape paths which we don't explicitly see
-  // in the graph.
-  if (Node->escapesInsideFunction(isNotAliasingArgument(V)))
-    return true;
-
-  // Check if the object itself can escape to the called function.
-  SILInstruction *UsePoint = FAS.getInstruction();
-  if (ConGraph->isUsePoint(UsePoint, Node))
-    return true;
-
-  if (isPointer(V)) {
-    // Check if the object "content" can escape to the called function.
-    // This will catch cases where V is a reference and a pointer to a stored
-    // property escapes.
-    // It's also important in case of a pointer assignment, e.g.
-    //    V = V1
-    //    apply(V1)
-    // In this case the apply is only a use-point for V1 and V1's content node.
-    // As V1's content node is the same as V's content node, we also make the
-    // check for the content node.
-    CGNode *ContentNode = ConGraph->getContentNode(Node);
-    if (ContentNode->escapesInsideFunction(false))
-      return true;
-
-    if (ConGraph->isUsePoint(UsePoint, ContentNode))
-      return true;
-  }
-  return false;
 }
 
 bool EscapeAnalysis::canEscapeTo(SILValue V, RefCountingInst *RI) {
@@ -1987,12 +2004,13 @@ bool EscapeAnalysis::canParameterEscape(FullApplySite FAS, int ParamIdx,
 void EscapeAnalysis::invalidate() {
   Function2Info.clear();
   Allocator.DestroyAll();
-  DEBUG(llvm::dbgs() << "invalidate all\n");
+  LLVM_DEBUG(llvm::dbgs() << "invalidate all\n");
 }
 
 void EscapeAnalysis::invalidate(SILFunction *F, InvalidationKind K) {
   if (FunctionInfo *FInfo = Function2Info.lookup(F)) {
-    DEBUG(llvm::dbgs() << "  invalidate " << FInfo->Graph.F->getName() << '\n');
+    LLVM_DEBUG(llvm::dbgs() << "  invalidate "
+                            << FInfo->Graph.F->getName() << '\n');
     invalidateIncludingAllCallers(FInfo);
   }
 }

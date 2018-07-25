@@ -1,4 +1,4 @@
-// RUN: %target-typecheck-verify-swift
+// RUN: %target-typecheck-verify-swift -enable-objc-interop
 
 // Test the use of 'as' for type coercion (which requires no checking).
 @objc protocol P1 {
@@ -60,7 +60,7 @@ if let p = cc as? P {
 
 // Test that 'as?' coercion fails.
 let strImplicitOpt: String! = nil
-_ = strImplicitOpt as? String // expected-warning{{conditional downcast from 'String!' to 'String' does nothing}}{{19-30=}}
+_ = strImplicitOpt as? String // expected-warning{{conditional downcast from 'String?' to 'String' does nothing}}{{19-30=}}
 
 class C3 {}
 class C4 : C3 {}

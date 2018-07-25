@@ -78,6 +78,33 @@ public struct ElementsEqualTest {
   }
 }
 
+public struct ElementsEqualWithPredicateTest {
+    public let expected: Bool
+    public let sequence: [Int]
+    public let other: [String]
+    public let predicate: (Int, String) -> Bool
+    public let expectedLeftoverSequence: [Int]
+    public let expectedLeftoverOther: [String]
+    public let loc: SourceLoc
+    
+    public init(
+        _ expected: Bool, _ sequence: [Int], _ other: [String],
+        _ predicate: @escaping (Int, String) -> Bool,
+        _ expectedLeftoverSequence: [Int],
+        _ expectedLeftoverOther: [String],
+        file: String = #file, line: UInt = #line,
+        comment: String = ""
+        ) {
+        self.expected = expected
+        self.sequence = sequence
+        self.other = other
+        self.predicate = predicate
+        self.expectedLeftoverSequence = expectedLeftoverSequence
+        self.expectedLeftoverOther = expectedLeftoverOther
+        self.loc = SourceLoc(file, line, comment: "test data" + comment)
+    }
+}
+
 public struct EnumerateTest {
   public let expected: [(Int, Int)]
   public let sequence: [Int]
@@ -122,7 +149,7 @@ public struct FindTest {
 
   public init(
     expected: Int?, element: Int, sequence: [Int],
-    expectedLeftoverSequence: [Int],
+    expectedLeftoverSequence: [Int] = [],
     file: String = #file, line: UInt = #line
   ) {
     self.expected = expected
@@ -449,6 +476,30 @@ public let elementsEqualTests: [ElementsEqualTest] = [
   ElementsEqualTest(false, [ 1, 2, 3, 4 ], [ 1, 2 ], [ 4 ], []),
   ElementsEqualTest(false, [ 1, 2 ], [ 1, 2, 3, 4 ], [], [ 4 ]),
 ].flatMap { [ $0, $0.flip() ] }
+
+func elementsEqualPredicate(_ x: Int, y: String) -> Bool {
+    if let intVal = Int(y) {
+        return x == intVal
+    } else {
+        return false
+    }
+}
+
+public let elementsEqualWithPredicateTests: [ElementsEqualWithPredicateTest] = [
+    ElementsEqualWithPredicateTest(true, [], [], elementsEqualPredicate, [], []),
+    
+    ElementsEqualWithPredicateTest(false, [ 1 ], [], elementsEqualPredicate, [ 1 ], []),
+    ElementsEqualWithPredicateTest(false, [], [ "1" ], elementsEqualPredicate, [], [ "1" ]),
+    
+    ElementsEqualWithPredicateTest(false, [ 1, 2 ], [], elementsEqualPredicate, [ 1, 2 ], []),
+    ElementsEqualWithPredicateTest(false, [], [ "1", "2" ], elementsEqualPredicate, [], [ "1", "2" ]),
+    
+    ElementsEqualWithPredicateTest(false, [ 1, 2, 3, 4 ], [ "1", "2" ], elementsEqualPredicate, [ 3, 4 ], []),
+    ElementsEqualWithPredicateTest(false, [ 1, 2 ], [ "1", "2", "3", "4" ], elementsEqualPredicate, [], [ "3", "4" ]),
+    
+    ElementsEqualWithPredicateTest(true, [ 1, 2, 3, 4 ], [ "1", "2", "3", "4" ], elementsEqualPredicate, [], []),
+    ElementsEqualWithPredicateTest(true, [ 1, 2 ], [ "1", "2" ], elementsEqualPredicate, [], []),
+]
 
 public let enumerateTests = [
   EnumerateTest([], []),
@@ -1526,17 +1577,17 @@ extension TestSuite {
     SequenceWithEquatableElement : Sequence
   >(
     _ testNamePrefix: String = "",
-    makeSequence: @escaping ([S.Iterator.Element]) -> S,
-    wrapValue: @escaping (OpaqueValue<Int>) -> S.Iterator.Element,
-    extractValue: @escaping (S.Iterator.Element) -> OpaqueValue<Int>,
+    makeSequence: @escaping ([S.Element]) -> S,
+    wrapValue: @escaping (OpaqueValue<Int>) -> S.Element,
+    extractValue: @escaping (S.Element) -> OpaqueValue<Int>,
 
-    makeSequenceOfEquatable: @escaping ([SequenceWithEquatableElement.Iterator.Element]) -> SequenceWithEquatableElement,
-    wrapValueIntoEquatable: @escaping (MinimalEquatableValue) -> SequenceWithEquatableElement.Iterator.Element,
-    extractValueFromEquatable: @escaping ((SequenceWithEquatableElement.Iterator.Element) -> MinimalEquatableValue),
+    makeSequenceOfEquatable: @escaping ([SequenceWithEquatableElement.Element]) -> SequenceWithEquatableElement,
+    wrapValueIntoEquatable: @escaping (MinimalEquatableValue) -> SequenceWithEquatableElement.Element,
+    extractValueFromEquatable: @escaping ((SequenceWithEquatableElement.Element) -> MinimalEquatableValue),
 
     resiliencyChecks: CollectionMisuseResiliencyChecks = .all
   ) where
-    SequenceWithEquatableElement.Iterator.Element : Equatable {
+    SequenceWithEquatableElement.Element : Equatable {
 
     var testNamePrefix = testNamePrefix
 
@@ -1884,17 +1935,17 @@ self.test("\(testNamePrefix).forEach/semantics") {
 }
 
 //===----------------------------------------------------------------------===//
-// first()
+// first(where:)
 //===----------------------------------------------------------------------===//
 
-self.test("\(testNamePrefix).first/semantics") {
+self.test("\(testNamePrefix).first(where:)/semantics") {
   for test in findTests {
     let s = makeWrappedSequenceWithEquatableElement(test.sequence)
     let closureLifetimeTracker = LifetimeTracked(0)
-    let found = s.first {
+    let found = s.first(where: {
       _blackHole(closureLifetimeTracker)
       return $0 == wrapValueIntoEquatable(test.element)
-    }
+    })
     expectEqual(
       test.expected == nil ? nil : wrapValueIntoEquatable(test.element),
       found,

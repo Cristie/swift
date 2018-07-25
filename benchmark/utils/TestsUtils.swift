@@ -21,7 +21,7 @@ public enum BenchmarkCategory : String {
   // we know is important to measure.
   case validation
   // subsystems to validate and their subcategories.
-  case api, Array, String, Dictionary, Codable, Set
+  case api, Array, String, Dictionary, Codable, Set, Data
   case sdk
   case runtime, refcount, metadata
   // Other general areas of compiled code validation.
@@ -70,42 +70,103 @@ public enum BenchmarkCategory : String {
   case skip
 }
 
+extension BenchmarkCategory : CustomStringConvertible {
+  public var description: String {
+    return self.rawValue
+  }
+}
+
+extension BenchmarkCategory : Comparable {
+    public static func < (lhs: BenchmarkCategory, rhs: BenchmarkCategory) -> Bool {
+        return lhs.rawValue < rhs.rawValue
+    }
+}
+
+public struct BenchmarkPlatformSet : OptionSet {
+  public let rawValue: Int
+
+  public init(rawValue: Int) {
+    self.rawValue = rawValue
+  }
+
+  public static let darwin = BenchmarkPlatformSet(rawValue: 1 << 0)
+  public static let linux = BenchmarkPlatformSet(rawValue: 1 << 1)
+
+  public static var currentPlatform: BenchmarkPlatformSet {
+    #if os(Linux)
+      return .linux
+    #else
+      return .darwin
+    #endif
+  }
+
+  public static var allPlatforms: BenchmarkPlatformSet {
+    return [.darwin, .linux]
+  }
+}
+
 public struct BenchmarkInfo {
   /// The name of the benchmark that should be displayed by the harness.
   public var name: String
 
+  /// Shadow static variable for runFunction.
+  private var _runFunction: (Int) -> ()
+
   /// A function that invokes the specific benchmark routine.
-  public var runFunction: (Int) -> ()
+  public var runFunction: ((Int) -> ())? {
+    if !shouldRun {
+      return nil
+    }
+    return _runFunction
+  }
 
   /// A set of category tags that describe this benchmark. This is used by the
   /// harness to allow for easy slicing of the set of benchmarks along tag
   /// boundaries, e.x.: run all string benchmarks or ref count benchmarks, etc.
-  public var tags: [BenchmarkCategory]
+  public var tags: Set<BenchmarkCategory>
+
+  /// The platforms that this benchmark supports. This is an OptionSet.
+  private var unsupportedPlatforms: BenchmarkPlatformSet
+
+  /// Shadow variable for setUpFunction.
+  private var _setUpFunction: (() -> ())?
 
   /// An optional function that if non-null is run before benchmark samples
   /// are timed.
-  public var setUpFunction: (() -> ())?
+  public var setUpFunction : (() -> ())? {
+    if !shouldRun {
+      return nil
+    }
+    return _setUpFunction
+  }
+
+  /// Shadow static variable for computed property tearDownFunction.
+  private var _tearDownFunction: (() -> ())?
 
   /// An optional function that if non-null is run immediately after a sample is
   /// taken.
-  public var tearDownFunction: (() -> ())?
-
-  public init(name: String, runFunction: @escaping (Int) -> (), tags: [BenchmarkCategory]) {
-    self.name = name
-    self.runFunction = runFunction
-    self.tags = tags
-    self.setUpFunction = nil
-    self.tearDownFunction = nil
+  public var tearDownFunction: (() -> ())? {
+    if !shouldRun {
+      return nil
+    }
+    return _tearDownFunction
   }
 
   public init(name: String, runFunction: @escaping (Int) -> (), tags: [BenchmarkCategory],
-              setUpFunction: (() -> ())?,
-              tearDownFunction: (() -> ())?) {
+              setUpFunction: (() -> ())? = nil,
+              tearDownFunction: (() -> ())? = nil,
+              unsupportedPlatforms: BenchmarkPlatformSet = []) {
     self.name = name
-    self.runFunction = runFunction
-    self.tags = tags
-    self.setUpFunction = setUpFunction
-    self.tearDownFunction = tearDownFunction
+    self._runFunction = runFunction
+    self.tags = Set(tags)
+    self._setUpFunction = setUpFunction
+    self._tearDownFunction = tearDownFunction
+    self.unsupportedPlatforms = unsupportedPlatforms
+  }
+
+  /// Returns true if this benchmark should be run on the current platform.
+  var shouldRun: Bool {
+    return !unsupportedPlatforms.contains(.currentPlatform)
   }
 }
 
@@ -119,8 +180,8 @@ extension BenchmarkInfo : Comparable {
 }
 
 extension BenchmarkInfo : Hashable {
-  public var hashValue: Int {
-    return name.hashValue
+  public func hash(into hasher: inout Hasher) {
+    hasher.combine(name)
   }
 }
 
@@ -170,20 +231,6 @@ public func CheckResults(
     }
 }
 
-// Due to potential overhead of passing closures around on the
-// performance measurements, this version is now deprecated
-@available(*, deprecated,
-  message: "For debugging test failures only! Use the version without message.")
-public func CheckResults(
-    _ resultsMatch: Bool,
-    _ message: @autoclosure () -> String
-    ) {
-    guard resultsMatch else {
-        print(message())
-        abort()
-    }
-}
-
 public func False() -> Bool { return false }
 
 /// This is a dummy protocol to test the speed of our protocol dispatch.
@@ -197,7 +244,14 @@ public func someProtocolFactory() -> SomeProtocol { return MyStruct() }
 // Just consume the argument.
 // It's important that this function is in another module than the tests
 // which are using it.
+@inline(never)
 public func blackHole<T>(_ x: T) {
+}
+
+// Return the passed argument without letting the optimizer know that.
+@inline(never)
+public func identity<T>(_ x: T) -> T {
+  return x
 }
 
 // Return the passed argument without letting the optimizer know that.
@@ -209,3 +263,8 @@ public func getInt(_ x: Int) -> Int { return x }
 // The same for String.
 @inline(never)
 public func getString(_ s: String) -> String { return s }
+
+// The same for Substring.
+@inline(never)
+public func getSubstring(_ s: Substring) -> Substring { return s }
+

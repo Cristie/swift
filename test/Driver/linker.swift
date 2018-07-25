@@ -33,6 +33,9 @@
 // RUN: %swiftc_driver -driver-print-jobs -target x86_64-unknown-windows-cygnus -Ffoo -Fsystem car -F cdr -framework bar -Lbaz -lboo -Xlinker -undefined %s 2>&1 > %t.cygwin.txt
 // RUN: %FileCheck -check-prefix CYGWIN-x86_64 %s < %t.cygwin.txt
 
+// RUN: %swiftc_driver -driver-print-jobs -target x86_64-unknown-windows-msvc -Ffoo -Fsystem car -F cdr -framework bar -Lbaz -lboo -Xlinker -undefined %s 2>&1 > %t.windows.txt
+// RUN: %FileCheck -check-prefix WINDOWS-x86_64 %s < %t.windows.txt
+
 // RUN: %swiftc_driver -driver-print-jobs -emit-library -target x86_64-unknown-linux-gnu %s -Lbar -o dynlib.out 2>&1 > %t.linux.dynlib.txt
 // RUN: %FileCheck -check-prefix LINUX_DYNLIB-x86_64 %s < %t.linux.dynlib.txt
 
@@ -42,6 +45,13 @@
 
 // RUN: %swiftc_driver -driver-print-jobs -target x86_64-apple-macosx10.9 -g %s | %FileCheck -check-prefix DEBUG %s
 
+// RUN: %empty-directory(%t)
+// RUN: touch %t/a.o
+// RUN: touch %t/a.swiftmodule
+// RUN: touch %t/b.o
+// RUN: touch %t/b.swiftmodule
+// RUN: %swiftc_driver -driver-print-jobs -target x86_64-apple-macosx10.9 %s %t/a.o %t/a.swiftmodule %t/b.o %t/b.swiftmodule -o linker | %FileCheck -check-prefix LINK-SWIFTMODULES %s
+
 // RUN: %swiftc_driver -driver-print-jobs -target x86_64-apple-macosx10.10   %s > %t.simple-macosx10.10.txt
 // RUN: %FileCheck %s < %t.simple-macosx10.10.txt
 // RUN: %FileCheck -check-prefix SIMPLE %s < %t.simple-macosx10.10.txt
@@ -49,10 +59,17 @@
 // RUN: %empty-directory(%t)
 // RUN: touch %t/a.o
 // RUN: %swiftc_driver -driver-print-jobs -target x86_64-apple-macosx10.9 %s %t/a.o -o linker 2>&1 | %FileCheck -check-prefix COMPILE_AND_LINK %s
-// RUN: %swiftc_driver -driver-print-jobs -target x86_64-apple-macosx10.9 %s %t/a.o -driver-use-filelists -o linker 2>&1 | %FileCheck -check-prefix FILELIST %s
+// RUN: %swiftc_driver -driver-print-jobs -target x86_64-apple-macosx10.9 %s %t/a.o -driver-filelist-threshold=0 -o linker 2>&1 | %FileCheck -check-prefix FILELIST %s
 
-// RUN: %swiftc_driver -driver-print-jobs -target x86_64-apple-macosx10.9 -emit-library %s -module-name LINKER | %FileCheck -check-prefix INFERRED_NAME %s
-// RUN: %swiftc_driver -driver-print-jobs -target x86_64-apple-macosx10.9 -emit-library %s -o libLINKER.dylib | %FileCheck -check-prefix INFERRED_NAME %s
+// RUN: %swiftc_driver -driver-print-jobs -target x86_64-apple-macosx10.9 -emit-library %s -module-name LINKER | %FileCheck -check-prefix INFERRED_NAME_DARWIN %s
+// RUN: %swiftc_driver -driver-print-jobs -target x86_64-unknown-linux-gnu -emit-library %s -module-name LINKER | %FileCheck -check-prefix INFERRED_NAME_LINUX %s
+// RUN: %swiftc_driver -driver-print-jobs -target x86_64-unknown-windows-cygnus -emit-library %s -module-name LINKER | %FileCheck -check-prefix INFERRED_NAME_WINDOWS %s
+// RUN: %swiftc_driver -driver-print-jobs -target x86_64-unknown-windows-msvc -emit-library %s -module-name LINKER | %FileCheck -check-prefix INFERRED_NAME_WINDOWS %s
+
+// Here we specify an output file name using '-o'. For ease of writing these
+// tests, we happen to specify the same file name as is inferred in the
+// INFERRED_NAMED_DARWIN tests above: 'libLINKER.dylib'.
+// RUN: %swiftc_driver -driver-print-jobs -target x86_64-apple-macosx10.9 -emit-library %s -o libLINKER.dylib | %FileCheck -check-prefix INFERRED_NAME_DARWIN %s
 
 // There are more RUN lines further down in the file.
 
@@ -70,7 +87,7 @@
 
 // SIMPLE: bin/ld{{"? }}
 // SIMPLE-NOT: -syslibroot
-// SIMPLE-DAG: -macosx_version_min 10.{{[0-9]+}}.{{[0-9]+}}
+// SIMPLE: -macosx_version_min 10.{{[0-9]+}}.{{[0-9]+}}
 // SIMPLE-NOT: -syslibroot
 // SIMPLE: -o linker
 
@@ -227,6 +244,20 @@
 // CYGWIN-x86_64-DAG: -Xlinker -undefined
 // CYGWIN-x86_64: -o linker
 
+// WINDOWS-x86_64: swift
+// WINDOWS-x86_64: -o [[OBJECTFILE:.*]]
+
+// WINDOWS-x86_64: clang++{{"? }}
+// WINDOWS-x86_64-DAG: [[OBJECTFILE]]
+// WINDOWS-x86_64-DAG: -L [[STDLIB_PATH:[^ ]+/lib/swift/windows/x86_64]]
+// WINDOWS-x86_64-DAG: -F foo -iframework car -F cdr
+// WINDOWS-x86_64-DAG: -framework bar
+// WINDOWS-x86_64-DAG: -L baz
+// WINDOWS-x86_64-DAG: -lboo
+// WINDOWS-x86_64-DAG: -Xlinker -undefined
+// WINDOWS-x86_64: -o linker
+
+
 // COMPLEX: bin/ld{{"? }}
 // COMPLEX-DAG: -dylib
 // COMPLEX-DAG: -syslibroot {{.*}}/Inputs/clang-importer-sdk
@@ -247,13 +278,12 @@
 // LINUX_DYNLIB-x86_64-DAG: -fuse-ld=gold
 // LINUX_DYNLIB-x86_64-NOT: -pie
 // LINUX_DYNLIB-x86_64-DAG: -Xlinker -rpath -Xlinker [[STDLIB_PATH:[^ ]+/lib/swift/linux]]
-// LINUX_DYNLIB-x86_64: [[STDLIB_PATH]]/x86_64/swift_begin.o
+// LINUX_DYNLIB-x86_64: [[STDLIB_PATH]]/x86_64/swiftrt.o
 // LINUX_DYNLIB-x86_64-DAG: [[OBJECTFILE]]
 // LINUX_DYNLIB-x86_64-DAG: @[[AUTOLINKFILE]]
 // LINUX_DYNLIB-x86_64-DAG: [[STDLIB_PATH]]
 // LINUX_DYNLIB-x86_64-DAG: -lswiftCore
 // LINUX_DYNLIB-x86_64-DAG: -L bar
-// LINUX_DYNLIB-x86_64: [[STDLIB_PATH]]/x86_64/swift_end.o
 // LINUX_DYNLIB-x86_64: -o dynlib.out
 
 // DEBUG: bin/swift
@@ -265,6 +295,11 @@
 // DEBUG: linker
 // DEBUG: -o linker.dSYM
 
+// LINK-SWIFTMODULES: bin/swift
+// LINK-SWIFTMODULES-NEXT: bin/ld{{"? }}
+// LINK-SWIFTMODULES-SAME: -add_ast_path {{.*}}/a.swiftmodule
+// LINK-SWIFTMODULES-SAME: -add_ast_path {{.*}}/b.swiftmodule
+// LINK-SWIFTMODULES-SAME: -o linker
 
 // COMPILE_AND_LINK: bin/swift
 // COMPILE_AND_LINK-NOT: /a.o
@@ -277,18 +312,20 @@
 
 
 // FILELIST: bin/ld{{"? }}
-// FILELIST-NOT: .o
+// FILELIST-NOT: .o{{"? }}
 // FILELIST: -filelist {{"?[^-]}}
-// FILELIST-NOT: .o
-// FILELIST: /a.o
-// FILELIST-NOT: .o
+// FILELIST-NOT: .o{{"? }}
+// FILELIST: /a.o{{"? }}
+// FILELIST-NOT: .o{{"? }}
 // FILELIST: -o linker
 
 
-// INFERRED_NAME: bin/swift
-// INFERRED_NAME: -module-name LINKER
-// INFERRED_NAME: bin/ld{{"? }}
-// INFERRED_NAME: -o libLINKER.{{dylib|so}}
+// INFERRED_NAME_DARWIN: bin/swift
+// INFERRED_NAME_DARWIN: -module-name LINKER
+// INFERRED_NAME_DARWIN: bin/ld{{"? }}
+// INFERRED_NAME_DARWIN:  -o libLINKER.dylib
+// INFERRED_NAME_LINUX:   -o libLINKER.so
+// INFERRED_NAME_WINDOWS: -o LINKER.dll
 
 
 // Test ld detection. We use hard links to make sure

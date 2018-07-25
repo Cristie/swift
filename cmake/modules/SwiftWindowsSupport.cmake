@@ -37,8 +37,8 @@ function(swift_windows_include_for_arch arch var)
   set(paths
         "$ENV{VCToolsInstallDir}/include"
         "$ENV{UniversalCRTSdkDir}/Include/$ENV{UCRTVersion}/ucrt"
-        "$ENV{UniversalCRTSdkDir}/Include/$ENV{UCRTVersion}/um"
-        "$ENV{UniversalCRTSdkDir}/Include/$ENV{UCRTVersion}/shared")
+        "$ENV{UniversalCRTSdkDir}/Include/$ENV{UCRTVersion}/shared"
+        "$ENV{UniversalCRTSdkDir}/Include/$ENV{UCRTVersion}/um")
   set(${var} ${paths} PARENT_SCOPE)
 endfunction()
 
@@ -56,5 +56,22 @@ function(swift_windows_lib_for_arch arch var)
           "$ENV{UniversalCRTSdkDir}/Lib/$ENV{UCRTVersion}/ucrt/${ARCH}"
           "$ENV{UniversalCRTSdkDir}/Lib/$ENV{UCRTVersion}/um/${ARCH}")
   set(${var} ${paths} PARENT_SCOPE)
+endfunction()
+
+function(swift_windows_generate_sdk_vfs_overlay flags)
+  swift_verify_windows_environment_variables()
+
+  get_filename_component(VCToolsInstallDir $ENV{VCToolsInstallDir} ABSOLUTE)
+  get_filename_component(UniversalCRTSdkDir $ENV{UniversalCRTSdkDir} ABSOLUTE)
+  set(UCRTVersion $ENV{UCRTVersion})
+
+  # TODO(compnerd) use a target to avoid re-creating this file all the time
+  configure_file("${CMAKE_SOURCE_DIR}/utils/WindowsSDKVFSOverlay.yaml.in"
+                 "${CMAKE_BINARY_DIR}/windows-sdk-vfs-overlay.yaml"
+                 @ONLY)
+
+  set(${flags}
+      -Xclang;-ivfsoverlay;-Xclang;"${CMAKE_BINARY_DIR}/windows-sdk-vfs-overlay.yaml"
+      PARENT_SCOPE)
 endfunction()
 

@@ -10,12 +10,13 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "llvm/Support/CommandLine.h"
 #include "swift/Basic/LLVMInitialize.h"
 #include "swift/Frontend/Frontend.h"
 #include "swift/Frontend/PrintingDiagnosticConsumer.h"
 #include "swift/IDE/Refactoring.h"
 #include "swift/IDE/Utils.h"
+#include "llvm/Support/CommandLine.h"
+#include "llvm/Support/FileSystem.h"
 
 #include <regex>
 
@@ -36,9 +37,11 @@ Action(llvm::cl::desc("kind:"), llvm::cl::init(RefactoringKind::None),
                       "fill-stub", "Perform fill protocol stub refactoring"),
            clEnumValN(RefactoringKind::ExpandDefault,
                       "expand-default", "Perform expand default statement refactoring"),
+           clEnumValN(RefactoringKind::ExpandSwitchCases,
+                      "expand-switch-cases", "Perform switch cases expand refactoring"),
            clEnumValN(RefactoringKind::LocalizeString,
                       "localize-string", "Perform string localization refactoring"),
-           clEnumValN(RefactoringKind::CollapseNestedIfExpr,
+           clEnumValN(RefactoringKind::CollapseNestedIfStmt,
                       "collapse-nested-if", "Perform collapse nested if statements"),
            clEnumValN(RefactoringKind::ConvertToDoCatch,
                       "convert-to-do-catch", "Perform force try to do try catch refactoring"),
@@ -46,14 +49,24 @@ Action(llvm::cl::desc("kind:"), llvm::cl::init(RefactoringKind::None),
                       "simplify-long-number", "Perform simplify long number literal refactoring"),
            clEnumValN(RefactoringKind::ConvertStringsConcatenationToInterpolation,
                       "strings-concatenation-to-interpolation", "Perform strings concatenation to interpolation refactoring"),
+           clEnumValN(RefactoringKind::ExpandTernaryExpr,
+                     "expand-ternary-expr", "Perform expand ternary expression"),
+           clEnumValN(RefactoringKind::ConvertToTernaryExpr,
+                      "convert-to-ternary-expr", "Perform convert to ternary expression"),
            clEnumValN(RefactoringKind::ExtractFunction,
                       "extract-function", "Perform extract function refactoring"),
+           clEnumValN(RefactoringKind::MoveMembersToExtension,
+                      "move-to-extension", "Move selected members to an extension"),
            clEnumValN(RefactoringKind::GlobalRename,
                       "syntactic-rename", "Perform syntactic rename"),
            clEnumValN(RefactoringKind::FindGlobalRenameRanges,
                       "find-rename-ranges", "Find detailed ranges for syntactic rename"),
            clEnumValN(RefactoringKind::FindLocalRenameRanges,
-                      "find-local-rename-ranges", "Find detailed ranges for local rename")));
+                      "find-local-rename-ranges", "Find detailed ranges for local rename"),
+           clEnumValN(RefactoringKind::TrailingClosure,
+                      "trailingclosure", "Perform trailing closure refactoring"),
+           clEnumValN(RefactoringKind::ReplaceBodiesWithFatalError,
+                      "replace-bodies-with-fatalError", "Perform trailing closure refactoring")));
 
 
 static llvm::cl::opt<std::string>
@@ -208,7 +221,8 @@ RangeConfig getRange(unsigned BufferID, SourceManager &SM,
 void anchorForGetMainExecutable() {}
 
 int main(int argc, char *argv[]) {
-  INITIALIZE_LLVM(argc, argv);
+  PROGRAM_START(argc, argv);
+  INITIALIZE_LLVM();
   llvm::cl::ParseCommandLineOptions(argc, argv, "Swift refactor\n");
   if (options::SourceFilename.empty()) {
     llvm::errs() << "cannot find source filename\n";
@@ -223,12 +237,14 @@ int main(int argc, char *argv[]) {
   Invocation.setMainExecutablePath(
     llvm::sys::fs::getMainExecutable(argv[0],
     reinterpret_cast<void *>(&anchorForGetMainExecutable)));
-  Invocation.addInputFilename(options::SourceFilename);
+  Invocation.getFrontendOptions().InputsAndOutputs.addInputFile(
+      options::SourceFilename);
   Invocation.getLangOptions().AttachCommentsToDecls = true;
-  Invocation.getLangOptions().KeepTokensInSourceFile = true;
+  Invocation.getLangOptions().CollectParsedToken = true;
+  Invocation.getLangOptions().BuildSyntaxTree = true;
 
   for (auto FileName : options::InputFilenames)
-    Invocation.addInputFilename(FileName);
+    Invocation.getFrontendOptions().InputsAndOutputs.addInputFile(FileName);
   Invocation.setModuleName(options::ModuleName);
   CompilerInstance CI;
   // Display diagnostics to stderr.
@@ -263,7 +279,7 @@ int main(int argc, char *argv[]) {
 
   auto Start = getLocsByLabelOrPosition(options::LineColumnPair, Buffer);
   if (Start.empty()) {
-    llvm::errs() << "cannot parse position pair.";
+    llvm::errs() << "cannot parse position pair.\n";
     return 1;
   }
 

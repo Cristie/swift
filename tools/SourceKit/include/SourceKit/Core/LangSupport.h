@@ -188,9 +188,15 @@ struct DiagnosticEntryInfo : DiagnosticEntryInfoBase {
   SmallVector<DiagnosticEntryInfoBase, 1> Notes;
 };
 
+struct SourceFileRange {
+  /// The byte offset at which the range begins
+  uintptr_t Start;
+  /// The byte offset at which the end ends
+  uintptr_t End;
+};
+
 class EditorConsumer {
   virtual void anchor();
-
 public:
   virtual ~EditorConsumer() { }
 
@@ -238,7 +244,18 @@ public:
 
   virtual bool handleSourceText(StringRef Text) = 0;
 
+  virtual bool handleSerializedSyntaxTree(StringRef Text) = 0;
+  virtual bool syntaxTreeEnabled() = 0;
+
+  virtual bool syntaxReuseInfoEnabled() = 0;
+  virtual bool handleSyntaxReuseRegions(
+      std::vector<SourceFileRange> ReuseRegions) = 0;
+
   virtual void finished() {}
+
+  // FIXME: This is just for bootstrapping incremental syntax tree parsing.
+  // Remove it once when we are able to incrementally transfer the syntax tree
+  virtual bool forceLibSyntaxBasedProcessing() = 0;
 };
 
 class OptionsDictionary {
@@ -250,6 +267,9 @@ public:
   virtual bool valueForOption(UIdent Key, bool &Val) = 0;
   virtual bool valueForOption(UIdent Key, StringRef &Val) = 0;
 };
+
+struct Statistic;
+typedef std::function<void(ArrayRef<Statistic *> stats)> StatisticsReceiver;
 
 struct RefactoringInfo {
   UIdent Kind;
@@ -283,7 +303,7 @@ struct CursorInfoData {
   StringRef ModuleInterfaceName;
   /// This is an (offset,length) pair.
   /// It is set only if the declaration has a source location.
-  llvm::Optional<std::pair<unsigned, unsigned>> DeclarationLoc;
+  llvm::Optional<std::pair<unsigned, unsigned>> DeclarationLoc = None;
   /// Set only if the declaration has a source location.
   StringRef Filename;
   /// For methods this lists the USRs of the overrides in the class hierarchy.
@@ -512,7 +532,6 @@ public:
   codeCompleteSetCustom(ArrayRef<CustomCompletionInfo> completions) = 0;
 
   virtual void editorOpen(StringRef Name, llvm::MemoryBuffer *Buf,
-                          bool EnableSyntaxMap,
                           EditorConsumer &Consumer,
                           ArrayRef<const char *> Args) = 0;
 
@@ -534,7 +553,7 @@ public:
                                          ArrayRef<const char *> Args,
                                          bool UsingSwiftArgs,
                                          bool SynthesizedExtensions,
-                                         Optional<unsigned> swiftVersion) = 0;
+                                         StringRef swiftVersion) = 0;
 
   virtual void editorOpenSwiftSourceInterface(StringRef Name,
                                               StringRef SourceName,
@@ -626,6 +645,8 @@ public:
                           StringRef ModuleName,
                           ArrayRef<const char *> Args,
                           DocInfoConsumer &Consumer) = 0;
+
+  virtual void getStatistics(StatisticsReceiver) = 0;
 };
 
 } // namespace SourceKit

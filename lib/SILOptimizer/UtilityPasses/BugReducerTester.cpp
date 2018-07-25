@@ -77,13 +77,15 @@ class BugReducerTester : public SILFunctionTransform {
     auto EmptyTupleCanType = getFunction()
                                  ->getModule()
                                  .Types.getEmptyTupleType()
-                                 .getSwiftRValueType();
+                                 .getASTType();
     ResultInfoArray.push_back(
         SILResultInfo(EmptyTupleCanType, ResultConvention::Unowned));
     auto FuncType = SILFunctionType::get(
         nullptr, SILFunctionType::ExtInfo(SILFunctionType::Representation::Thin,
-                                          false /*isPseudoGeneric*/),
-        ParameterConvention::Direct_Unowned, ArrayRef<SILParameterInfo>(),
+                                          false /*isPseudoGeneric*/,
+                                          false /*noescape*/),
+        SILCoroutineKind::None, ParameterConvention::Direct_Unowned,
+        ArrayRef<SILParameterInfo>(), ArrayRef<SILYieldInfo>(),
         ResultInfoArray, None, getFunction()->getModule().getASTContext());
 
     SILFunction *F = getFunction()->getModule().getOrCreateSharedFunction(
@@ -111,14 +113,25 @@ class BugReducerTester : public SILFunctionTransform {
     assert(TargetFailureKind != FailureKind::None);
     SILModule &M = getFunction()->getModule();
     for (auto &BB : *getFunction()) {
-      for (auto &II : BB) {
-        auto *Apply = dyn_cast<ApplyInst>(&II);
-        if (!Apply)
+      for (auto II = BB.begin(), IE = BB.end(); II != IE;) {
+        // Skip try_apply. We do not support them for now.
+        if (isa<TryApplyInst>(&*II)) {
+          ++II;
           continue;
-        auto *FRI = dyn_cast<FunctionRefInst>(Apply->getCallee());
+        }
+
+        auto FAS = FullApplySite::isa(&*II);
+        if (!FAS) {
+          ++II;
+          continue;
+        }
+
+        auto *FRI = dyn_cast<FunctionRefInst>(FAS.getCallee());
         if (!FRI ||
-            !FRI->getReferencedFunction()->getName().equals(FunctionTarget))
+            !FRI->getReferencedFunction()->getName().equals(FunctionTarget)) {
+          ++II;
           continue;
+        }
 
         // Ok, we found the Apply that we want! If we are asked to crash, crash
         // here.
@@ -128,8 +141,12 @@ class BugReducerTester : public SILFunctionTransform {
         // Otherwise, if we are asked to perform a runtime time miscompile,
         // delete the apply target.
         if (TargetFailureKind == FailureKind::RuntimeMiscompile) {
-          Apply->replaceAllUsesWith(SILUndef::get(Apply->getType(), M));
-          Apply->eraseFromParent();
+          // Ok, we need to insert a runtime miscompile. Move II to
+          // the next instruction and then replace its current value
+          // with undef.
+          auto *Inst = cast<SingleValueInstruction>(&*II);
+          Inst->replaceAllUsesWith(SILUndef::get(Inst->getType(), M));
+          Inst->eraseFromParent();
 
           // Mark that we found the miscompile and return so we do not try to
           // visit any more instructions in this function.
@@ -144,20 +161,21 @@ class BugReducerTester : public SILFunctionTransform {
         SILFunction *RuntimeCrasherFunc = getRuntimeCrasherFunction();
         llvm::dbgs() << "Runtime Crasher Func!\n";
         RuntimeCrasherFunc->dump();
-        SILBuilder B(Apply->getIterator());
+        SILBuilder B(II);
         B.createApply(Loc, B.createFunctionRef(Loc, RuntimeCrasherFunc),
-                      SubstitutionList(),
+                      SubstitutionMap(),
                       ArrayRef<SILValue>(), false /*NoThrow*/);
 
-        Apply->replaceAllUsesWith(SILUndef::get(Apply->getType(), M));
-        Apply->eraseFromParent();
+        auto *Inst = cast<SingleValueInstruction>(&*II);
+        ++II;
+        Inst->replaceAllUsesWith(SILUndef::get(Inst->getType(), M));
+        Inst->eraseFromParent();
 
         CausedError = true;
         return;
       }
     }
   }
-
 };
 
 } // end anonymous namespace

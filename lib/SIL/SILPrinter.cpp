@@ -104,6 +104,7 @@ public:
       DEF_COL(ID::SILUndef, RED)
       DEF_COL(ID::SILBasicBlock, GREEN)
       DEF_COL(ID::SSAValue, MAGENTA)
+      DEF_COL(ID::Null, YELLOW)
     }
     OS.resetColor();
     OS.changeColor(Color);
@@ -128,6 +129,7 @@ void SILPrintContext::ID::print(raw_ostream &OS) {
     return;
   case ID::SILBasicBlock: OS << "bb"; break;
   case ID::SSAValue: OS << '%'; break;
+  case ID::Null: OS << "<<NULL OPERAND>>"; return;
   }
   OS << Number;
 }
@@ -276,39 +278,49 @@ void SILDeclRef::print(raw_ostream &OS) const {
     OS << "<anonymous function>";
   } else if (kind == SILDeclRef::Kind::Func) {
     auto *FD = cast<FuncDecl>(getDecl());
-    switch (FD->getAccessorKind()) {
-    case AccessorKind::IsWillSet:
-      printValueDecl(FD->getAccessorStorageDecl(), OS);
-      OS << "!willSet";
-      break;
-    case AccessorKind::IsDidSet:
-      printValueDecl(FD->getAccessorStorageDecl(), OS);
-      OS << "!didSet";
-      break;
-    case AccessorKind::NotAccessor:
+    auto accessor = dyn_cast<AccessorDecl>(FD);
+    if (!accessor) {
       printValueDecl(FD, OS);
       isDot = false;
-      break;
-    case AccessorKind::IsGetter:
-      printValueDecl(FD->getAccessorStorageDecl(), OS);
-      OS << "!getter";
-      break;
-    case AccessorKind::IsSetter:
-      printValueDecl(FD->getAccessorStorageDecl(), OS);
-      OS << "!setter";
-      break;
-    case AccessorKind::IsMaterializeForSet:
-      printValueDecl(FD->getAccessorStorageDecl(), OS);
-      OS << "!materializeForSet";
-      break;
-    case AccessorKind::IsAddressor:
-      printValueDecl(FD->getAccessorStorageDecl(), OS);
-      OS << "!addressor";
-      break;
-    case AccessorKind::IsMutableAddressor:
-      printValueDecl(FD->getAccessorStorageDecl(), OS);
-      OS << "!mutableAddressor";
-      break;
+    } else {
+      switch (accessor->getAccessorKind()) {
+      case AccessorKind::WillSet:
+        printValueDecl(accessor->getStorage(), OS);
+        OS << "!willSet";
+        break;
+      case AccessorKind::DidSet:
+        printValueDecl(accessor->getStorage(), OS);
+        OS << "!didSet";
+        break;
+      case AccessorKind::Get:
+        printValueDecl(accessor->getStorage(), OS);
+        OS << "!getter";
+        break;
+      case AccessorKind::Set:
+        printValueDecl(accessor->getStorage(), OS);
+        OS << "!setter";
+        break;
+      case AccessorKind::MaterializeForSet:
+        printValueDecl(accessor->getStorage(), OS);
+        OS << "!materializeForSet";
+        break;
+      case AccessorKind::Address:
+        printValueDecl(accessor->getStorage(), OS);
+        OS << "!addressor";
+        break;
+      case AccessorKind::MutableAddress:
+        printValueDecl(accessor->getStorage(), OS);
+        OS << "!mutableAddressor";
+        break;
+      case AccessorKind::Read:
+        printValueDecl(accessor->getStorage(), OS);
+        OS << "!read";
+        break;
+      case AccessorKind::Modify:
+        printValueDecl(accessor->getStorage(), OS);
+        OS << "!modify";
+        break;
+      }
     }
   } else {
     printValueDecl(getDecl(), OS);
@@ -340,9 +352,6 @@ void SILDeclRef::print(raw_ostream &OS) const {
   case SILDeclRef::Kind::GlobalAccessor:
     OS << "!globalaccessor";
     break;
-  case SILDeclRef::Kind::GlobalGetter:
-    OS << "!globalgetter";
-    break;
   case SILDeclRef::Kind::DefaultArgGenerator:
     OS << "!defaultarg" << "." << defaultArgIndex;
     break;
@@ -351,7 +360,7 @@ void SILDeclRef::print(raw_ostream &OS) const {
     break;
   }
 
-  auto uncurryLevel = getUncurryLevel();
+  auto uncurryLevel = getParameterListCount() - 1;
   if (uncurryLevel != 0)
     OS << (isDot ? '.' : '!')  << uncurryLevel;
 
@@ -371,14 +380,14 @@ void SILDeclRef::dump() const {
 static void printGenericSpecializationInfo(
     raw_ostream &OS, StringRef Kind, StringRef Name,
     const GenericSpecializationInformation *SpecializationInfo,
-    SubstitutionList Subs = SubstitutionList()) {
+    SubstitutionMap Subs = { }) {
   if (!SpecializationInfo)
     return;
 
-  auto PrintSubstitutions = [&](SubstitutionList Subs) {
+  auto PrintSubstitutions = [&](SubstitutionMap Subs) {
     OS << '<';
-    interleave(Subs,
-               [&](const Substitution &s) { OS << s.getReplacement(); },
+    interleave(Subs.getReplacementTypes(),
+               [&](Type type) { OS << type; },
                [&] { OS << ", "; });
     OS << '>';
   };
@@ -435,7 +444,7 @@ void SILType::print(raw_ostream &OS) const {
   
   // Print other types as their Swift representation.
   PrintOptions SubPrinter = PrintOptions::printSIL();
-  getSwiftRValueType().print(OS, SubPrinter);
+  getASTType().print(OS, SubPrinter);
 }
 
 void SILType::dump() const {
@@ -445,6 +454,8 @@ void SILType::dump() const {
 
 namespace {
   
+class SILPrinter;
+
 /// SILPrinter class - This holds the internal implementation details of
 /// printing SIL structures.
 class SILPrinter : public SILInstructionVisitor<SILPrinter> {
@@ -493,7 +504,7 @@ class SILPrinter : public SILInstructionVisitor<SILPrinter> {
   
   SILPrinter &operator<<(SILType t) {
     printSILTypeColorAndSigil(PrintState.OS, t);
-    t.getSwiftRValueType().print(PrintState.OS, PrintState.ASTOptions);
+    t.getASTType().print(PrintState.OS, PrintState.ASTOptions);
     return *this;
   }
   
@@ -509,10 +520,10 @@ public:
   }
 
   SILValuePrinterInfo getIDAndType(SILValue V) {
-    return {Ctx.getID(V), V->getType()};
+    return {Ctx.getID(V), V ? V->getType() : SILType()};
   }
   SILValuePrinterInfo getIDAndTypeAndOwnership(SILValue V) {
-    return {Ctx.getID(V), V->getType(), V.getOwnershipKind()};
+    return {Ctx.getID(V), V ? V->getType() : SILType(), V.getOwnershipKind()};
   }
 
   //===--------------------------------------------------------------------===//
@@ -578,8 +589,7 @@ public:
 
     // If SIL ownership is enabled and the given function has not had ownership
     // stripped out, print out ownership of SILArguments.
-    if (BB->getModule().getOptions().EnableSILOwnership &&
-        BB->getParent()->hasQualifiedOwnership()) {
+    if (BB->getParent()->hasQualifiedOwnership()) {
       *this << getIDAndTypeAndOwnership(Args[0]);
       for (SILArgument *Arg : Args.drop_front()) {
         *this << ", " << getIDAndTypeAndOwnership(Arg);
@@ -635,7 +645,7 @@ public:
           if (AI.getSpecializationInfo() && AI.getCalleeFunction())
             printGenericSpecializationInfo(
                 PrintState.OS, "call-site", AI.getCalleeFunction()->getName(),
-                AI.getSpecializationInfo(), AI.getSubstitutions());
+                AI.getSpecializationInfo(), AI.getSubstitutionMap());
       }
       print(&I);
     }
@@ -660,13 +670,14 @@ public:
   /// Print out the users of the SILValue \p V. Return true if we printed out
   /// either an id or a use list. Return false otherwise.
   bool printUsersOfSILNode(const SILNode *node, bool printedSlashes) {
-    SILInstruction::ResultArrayRef values;
-    if (auto value = dyn_cast<ValueBase>(node)) {
-      // The base pointer of the ultimate ArrayRef here is just the
-      // ValueBase; we aren't forming a reference to a temporary array.
-      values = ArrayRef<ValueBase>(value, 1);
-    } else if (auto inst = dyn_cast<SILInstruction>(node)) {
-      values = inst->getResults();
+    llvm::SmallVector<SILValue, 8> values;
+    if (auto *value = dyn_cast<ValueBase>(node)) {
+      values.push_back(value);
+    } else if (auto *inst = dyn_cast<SILInstruction>(node)) {
+      assert(!isa<SingleValueInstruction>(inst) && "SingleValueInstruction was "
+                                                   "handled by the previous "
+                                                   "value base check.");
+      copy(inst->getResults(), std::back_inserter(values));
     }
 
     // If the set of values is empty, we need to print the ID of
@@ -911,8 +922,6 @@ public:
       print(cast<SILInstruction>(node));
       return;
 
-    // TODO: MultiValueInstruction
-
 #define ARGUMENT(ID, PARENT) \
     case SILNodeKind::ID:
 #include "swift/SIL/SILNodes.def"
@@ -921,6 +930,13 @@ public:
 
     case SILNodeKind::SILUndef:
       printSILUndef(cast<SILUndef>(node));
+      return;
+
+#define MULTIPLE_VALUE_INST_RESULT(ID, PARENT) \
+    case SILNodeKind::ID:
+#include "swift/SIL/SILNodes.def"
+      printSILMultipleValueInstructionResult(
+          cast<MultipleValueInstructionResult>(node));
       return;
     }
     llvm_unreachable("bad kind");
@@ -941,7 +957,38 @@ public:
     // This should really only happen during debugging.
     *this << "undef<" << undef->getType() << ">\n";
   }
-  
+
+  void printSILMultipleValueInstructionResult(
+      const MultipleValueInstructionResult *result) {
+    // This should really only happen during debugging.
+    if (result->getParent()->getNumResults() == 1) {
+      *this << "**" << Ctx.getID(result) << "** = ";
+    } else {
+      *this << '(';
+      interleave(result->getParent()->getResults(),
+                 [&](SILValue value) {
+                   if (value == SILValue(result)) {
+                     *this << "**" << Ctx.getID(result) << "**";
+                     return;
+                   }
+                   *this << Ctx.getID(value);
+                 },
+                 [&] { *this << ", "; });
+      *this << ')';
+    }
+
+    *this << " = ";
+    printInstOpCode(result->getParent());
+    auto *nonConstParent =
+        const_cast<MultipleValueInstruction *>(result->getParent());
+    visit(static_cast<SILInstruction *>(nonConstParent));
+
+    // Print users.
+    (void)printUsersOfSILNode(result, false);
+
+    *this << '\n';
+  }
+
   void printInContext(const SILNode *node) {
     auto sortByID = [&](const SILNode *a, const SILNode *b) {
       return Ctx.getID(a).Number < Ctx.getID(b).Number;
@@ -975,16 +1022,16 @@ public:
     }
   }
 
-  void printDebugVar(SILDebugVariable Var) {
-    if (Var.Name.empty())
+  void printDebugVar(Optional<SILDebugVariable> Var) {
+    if (!Var || Var->Name.empty())
       return;
-    if (Var.Constant)
+    if (Var->Constant)
       *this << ", let";
     else
       *this << ", var";
-    *this << ", name \"" << Var.Name << '"';
-    if (Var.ArgNo)
-      *this << ", argno " << Var.ArgNo;
+    *this << ", name \"" << Var->Name << '"';
+    if (Var->ArgNo)
+      *this << ", argno " << Var->ArgNo;
   }
 
   void visitAllocStackInst(AllocStackInst *AVI) {
@@ -1025,37 +1072,55 @@ public:
     printDebugVar(ABI->getVarInfo());
   }
 
-  void printSubstitutions(SubstitutionList Subs) {
-    if (Subs.empty())
-      return;
-    
+  void printSubstitutions(SubstitutionMap Subs,
+                          GenericSignature *Sig = nullptr) {
+    if (!Subs.hasAnySubstitutableParams()) return;
+
+    // FIXME: This is a hack to cope with cases where the substitution map uses
+    // a generic signature that's close-to-but-not-the-same-as expected.
+    auto genericSig = Sig ? Sig : Subs.getGenericSignature();
+
     *this << '<';
-    interleave(Subs,
-               [&](const Substitution &s) { *this << s.getReplacement(); },
-               [&] { *this << ", "; });
+    bool first = true;
+    for (auto gp : genericSig->getGenericParams()) {
+      if (first) first = false;
+      else *this << ", ";
+
+      *this << Type(gp).subst(Subs);
+    }
     *this << '>';
+  }
+
+  template <class Inst>
+  void visitApplyInstBase(Inst *AI) {
+    *this << Ctx.getID(AI->getCallee());
+    printSubstitutions(AI->getSubstitutionMap(),
+                       AI->getOrigCalleeType()->getGenericSignature());
+    *this << '(';
+    interleave(AI->getArguments(),
+               [&](const SILValue &arg) { *this << Ctx.getID(arg); },
+               [&] { *this << ", "; });
+    *this << ") : ";
+    if (auto callee = AI->getCallee())
+      *this << callee->getType();
+    else
+      *this << "<<NULL CALLEE>>";
   }
 
   void visitApplyInst(ApplyInst *AI) {
     if (AI->isNonThrowing())
       *this << "[nothrow] ";
-    *this << Ctx.getID(AI->getCallee());
-    printSubstitutions(AI->getSubstitutions());
-    *this << '(';
-    interleave(AI->getArguments(),
-               [&](const SILValue &arg) { *this << Ctx.getID(arg); },
-               [&] { *this << ", "; });
-    *this << ") : " << AI->getCallee()->getType();
+    visitApplyInstBase(AI);
+  }
+
+  void visitBeginApplyInst(BeginApplyInst *AI) {
+    if (AI->isNonThrowing())
+      *this << "[nothrow] ";
+    visitApplyInstBase(AI);
   }
 
   void visitTryApplyInst(TryApplyInst *AI) {
-    *this << Ctx.getID(AI->getCallee());
-    printSubstitutions(AI->getSubstitutions());
-    *this << '(';
-    interleave(AI->getArguments(),
-               [&](const SILValue &arg) { *this << Ctx.getID(arg); },
-               [&] { *this << ", "; });
-    *this << ") : " << AI->getCallee()->getType();
+    visitApplyInstBase(AI);
     *this << ", normal " << Ctx.getID(AI->getNormalBB());
     *this << ", error " << Ctx.getID(AI->getErrorBB());
   }
@@ -1078,13 +1143,15 @@ public:
     case ParameterConvention::Indirect_InoutAliasable:
       llvm_unreachable("unexpected callee convention!");
     }
-    *this << Ctx.getID(CI->getCallee());
-    printSubstitutions(CI->getSubstitutions());
-    *this << '(';
-    interleave(CI->getArguments(),
-               [&](const SILValue &arg) { *this << Ctx.getID(arg); },
-               [&] { *this << ", "; });
-    *this << ") : " << CI->getCallee()->getType();
+    visitApplyInstBase(CI);
+  }
+
+  void visitAbortApplyInst(AbortApplyInst *AI) {
+    *this << Ctx.getID(AI->getOperand());
+  }
+
+  void visitEndApplyInst(EndApplyInst *AI) {
+    *this << Ctx.getID(AI->getOperand());
   }
 
   void visitFunctionRefInst(FunctionRefInst *FRI) {
@@ -1246,6 +1313,9 @@ public:
     switch (MU->getKind()) {
     case MarkUninitializedInst::Var: *this << "[var] "; break;
     case MarkUninitializedInst::RootSelf:  *this << "[rootself] "; break;
+    case MarkUninitializedInst::CrossModuleRootSelf:
+      *this << "[crossmodulerootself] ";
+      break;
     case MarkUninitializedInst::DerivedSelf:  *this << "[derivedself] "; break;
     case MarkUninitializedInst::DerivedSelfOnly:
       *this << "[derivedselfonly] ";
@@ -1281,29 +1351,21 @@ public:
     printDebugVar(DVAI->getVarInfo());
   }
 
-  void visitLoadUnownedInst(LoadUnownedInst *LI) {
-    if (LI->isTake())
-      *this << "[take] ";
-    *this << getIDAndType(LI->getOperand());
+#define NEVER_LOADABLE_CHECKED_REF_STORAGE(Name, ...) \
+  void visitLoad##Name##Inst(Load##Name##Inst *LI) { \
+    if (LI->isTake()) \
+      *this << "[take] "; \
+    *this << getIDAndType(LI->getOperand()); \
+  } \
+  void visitStore##Name##Inst(Store##Name##Inst *SI) { \
+    *this << Ctx.getID(SI->getSrc()) << " to "; \
+    if (SI->isInitializationOfDest()) \
+      *this << "[initialization] "; \
+    *this << getIDAndType(SI->getDest()); \
   }
-  void visitStoreUnownedInst(StoreUnownedInst *SI) {
-    *this << Ctx.getID(SI->getSrc()) << " to ";
-    if (SI->isInitializationOfDest())
-      *this << "[initialization] ";
-    *this << getIDAndType(SI->getDest());
-  }
-
-  void visitLoadWeakInst(LoadWeakInst *LI) {
-    if (LI->isTake())
-      *this << "[take] ";
-    *this << getIDAndType(LI->getOperand());
-  }
-  void visitStoreWeakInst(StoreWeakInst *SI) {
-    *this << Ctx.getID(SI->getSrc()) << " to ";
-    if (SI->isInitializationOfDest())
-      *this << "[initialization] ";
-    *this << getIDAndType(SI->getDest());
-  }
+#define SOMETIMES_LOADABLE_CHECKED_REF_STORAGE(Name, ...) \
+  NEVER_LOADABLE_CHECKED_REF_STORAGE(Name, "...")
+#include "swift/AST/ReferenceStorage.def"
 
   void visitCopyAddrInst(CopyAddrInst *CI) {
     if (CI->isTakeOfSrc())
@@ -1380,6 +1442,11 @@ public:
   void visitConvertFunctionInst(ConvertFunctionInst *CI) {
     printUncheckedConversionInst(CI, CI->getOperand());
   }
+  void visitConvertEscapeToNoEscapeInst(ConvertEscapeToNoEscapeInst *CI) {
+    *this << (CI->isLifetimeGuaranteed() ? "" : "[not_guaranteed] ")
+          << (CI->isEscapedByUser() ? "[escaped] " : "")
+          << getIDAndType(CI->getOperand()) << " to " << CI->getType();
+  }
   void visitThinFunctionToPointerInst(ThinFunctionToPointerInst *CI) {
     printUncheckedConversionInst(CI, CI->getOperand());
   }
@@ -1423,18 +1490,15 @@ public:
   void visitRawPointerToRefInst(RawPointerToRefInst *CI) {
     printUncheckedConversionInst(CI, CI->getOperand());
   }
-  void visitRefToUnownedInst(RefToUnownedInst *CI) {
-    printUncheckedConversionInst(CI, CI->getOperand());
+
+#define LOADABLE_REF_STORAGE(Name, ...) \
+  void visitRefTo##Name##Inst(RefTo##Name##Inst *CI) { \
+    printUncheckedConversionInst(CI, CI->getOperand()); \
+  } \
+  void visit##Name##ToRefInst(Name##ToRefInst *CI) { \
+    printUncheckedConversionInst(CI, CI->getOperand()); \
   }
-  void visitUnownedToRefInst(UnownedToRefInst *CI) {
-    printUncheckedConversionInst(CI, CI->getOperand());
-  }
-  void visitRefToUnmanagedInst(RefToUnmanagedInst *CI) {
-    printUncheckedConversionInst(CI, CI->getOperand());
-  }
-  void visitUnmanagedToRefInst(UnmanagedToRefInst *CI) {
-    printUncheckedConversionInst(CI, CI->getOperand());
-  }
+#include "swift/AST/ReferenceStorage.def"
   void visitThinToThickFunctionInst(ThinToThickFunctionInst *CI) {
     printUncheckedConversionInst(CI, CI->getOperand());
   }
@@ -1467,17 +1531,15 @@ public:
     printUncheckedConversionInst(I, I->getOperand());
   }
 
-  void visitIsNonnullInst(IsNonnullInst *I) {
-    *this << getIDAndType(I->getOperand());
-  }
-
   void visitCopyValueInst(CopyValueInst *I) {
     *this << getIDAndType(I->getOperand());
   }
 
-  void visitCopyUnownedValueInst(CopyUnownedValueInst *I) {
-    *this << getIDAndType(I->getOperand());
+#define ALWAYS_OR_SOMETIMES_LOADABLE_CHECKED_REF_STORAGE(Name, ...) \
+  void visitCopy##Name##ValueInst(Copy##Name##ValueInst *I) { \
+    *this << getIDAndType(I->getOperand()); \
   }
+#include "swift/AST/ReferenceStorage.def"
 
   void visitDestroyValueInst(DestroyValueInst *I) {
     *this << getIDAndType(I->getOperand());
@@ -1496,7 +1558,7 @@ public:
     interleave(OI->getBaseElements(),
                [&](const SILValue &V) { *this << getIDAndType(V); },
                [&] { *this << ", "; });
-    if (OI->getTailElements().size() > 0) {
+    if (!OI->getTailElements().empty()) {
       *this << ", [tail_elems] ";
       interleave(OI->getTailElements(),
                  [&](const SILValue &V) { *this << getIDAndType(V); },
@@ -1565,6 +1627,7 @@ public:
   void visitTupleExtractInst(TupleExtractInst *EI) {
     *this << getIDAndType(EI->getOperand()) << ", " << EI->getFieldNo();
   }
+
   void visitTupleElementAddrInst(TupleElementAddrInst *EI) {
     *this << getIDAndType(EI->getOperand()) << ", " << EI->getFieldNo();
   }
@@ -1586,6 +1649,14 @@ public:
 
   void visitRefTailAddrInst(RefTailAddrInst *RTAI) {
     *this << getIDAndType(RTAI->getOperand()) << ", " << RTAI->getTailType();
+  }
+
+  void visitDestructureStructInst(DestructureStructInst *DSI) {
+    *this << getIDAndType(DSI->getOperand());
+  }
+
+  void visitDestructureTupleInst(DestructureTupleInst *DTI) {
+    *this << getIDAndType(DTI->getOperand());
   }
 
   void printMethodInst(MethodInst *I, SILValue Operand) {
@@ -1620,8 +1691,6 @@ public:
     PrintOptions QualifiedSILTypeOptions =
         PrintOptions::printQualifiedSILType();
     QualifiedSILTypeOptions.CurrentModule = WMI->getModule().getSwiftModule();
-    if (WMI->isVolatile())
-      *this << "[volatile] ";
     *this << "$" << WMI->getLookupType() << ", " << WMI->getMember() << " : ";
     WMI->getMember().getDecl()->getInterfaceType().print(
         PrintState.OS, QualifiedSILTypeOptions);
@@ -1706,13 +1775,22 @@ public:
   void visitEndLifetimeInst(EndLifetimeInst *ELI) {
     *this << getIDAndType(ELI->getOperand());
   }
-
+  void visitValueToBridgeObjectInst(ValueToBridgeObjectInst *VBOI) {
+    *this << getIDAndType(VBOI->getOperand());
+  }
+  void visitClassifyBridgeObjectInst(ClassifyBridgeObjectInst *CBOI) {
+    *this << getIDAndType(CBOI->getOperand());
+  }
   void visitMarkDependenceInst(MarkDependenceInst *MDI) {
     *this << getIDAndType(MDI->getValue()) << " on "
           << getIDAndType(MDI->getBase());
   }
   void visitCopyBlockInst(CopyBlockInst *RI) {
     *this << getIDAndType(RI->getOperand());
+  }
+  void visitCopyBlockWithoutEscapingInst(CopyBlockWithoutEscapingInst *RI) {
+    *this << getIDAndType(RI->getBlock()) << " withoutEscaping "
+          << getIDAndType(RI->getClosure());
   }
   void visitRefCountingInst(RefCountingInst *I) {
     if (I->isNonAtomic())
@@ -1728,6 +1806,11 @@ public:
     *this << getIDAndType(CUI->getOperand());
   }
   void visitIsUniqueOrPinnedInst(IsUniqueOrPinnedInst *CUI) {
+    *this << getIDAndType(CUI->getOperand());
+  }
+  void visitIsEscapingClosureInst(IsEscapingClosureInst *CUI) {
+    if (CUI->getVerificationType())
+      *this << "[objc] ";
     *this << getIDAndType(CUI->getOperand());
   }
   void visitDeallocStackInst(DeallocStackInst *DI) {
@@ -1764,8 +1847,10 @@ public:
   }
   void visitBeginAccessInst(BeginAccessInst *BAI) {
     *this << '[' << getSILAccessKindName(BAI->getAccessKind()) << "] ["
-          << getSILAccessEnforcementName(BAI->getEnforcement())
-          << "] " << getIDAndType(BAI->getOperand());
+          << getSILAccessEnforcementName(BAI->getEnforcement()) << "] "
+          << (BAI->hasNoNestedConflict() ? "[no_nested_conflict] " : "")
+          << (BAI->isFromBuiltin() ? "[builtin] " : "")
+          << getIDAndType(BAI->getOperand());
   }
   void visitEndAccessInst(EndAccessInst *EAI) {
     *this << (EAI->isAborting() ? "[abort] " : "")
@@ -1773,13 +1858,16 @@ public:
   }
   void visitBeginUnpairedAccessInst(BeginUnpairedAccessInst *BAI) {
     *this << '[' << getSILAccessKindName(BAI->getAccessKind()) << "] ["
-          << getSILAccessEnforcementName(BAI->getEnforcement())
-          << "] " << getIDAndType(BAI->getSource()) << ", "
+          << getSILAccessEnforcementName(BAI->getEnforcement()) << "] "
+          << (BAI->hasNoNestedConflict() ? "[no_nested_conflict] " : "")
+          << (BAI->isFromBuiltin() ? "[builtin] " : "")
+          << getIDAndType(BAI->getSource()) << ", " 
           << getIDAndType(BAI->getBuffer());
   }
   void visitEndUnpairedAccessInst(EndUnpairedAccessInst *EAI) {
-    *this << (EAI->isAborting() ? "[abort] " : "")
-          << '[' << getSILAccessEnforcementName(EAI->getEnforcement()) << "] "
+    *this << (EAI->isAborting() ? "[abort] " : "") << '['
+          << getSILAccessEnforcementName(EAI->getEnforcement()) << "] "
+          << (EAI->isFromBuiltin() ? "[builtin] " : "")
           << getIDAndType(EAI->getOperand());
   }
 
@@ -1810,6 +1898,21 @@ public:
   
   void visitThrowInst(ThrowInst *TI) {
     *this << getIDAndType(TI->getOperand());
+  }
+
+  void visitUnwindInst(UnwindInst *UI) {
+    // no operands
+  }
+
+  void visitYieldInst(YieldInst *YI) {
+    auto values = YI->getYieldedValues();
+    if (values.size() != 1) *this << '(';
+    interleave(values,
+               [&](SILValue value) { *this << getIDAndType(value); },
+               [&] { *this << ", "; });
+    if (values.size() != 1) *this << ')';
+    *this << ", resume " << Ctx.getID(YI->getResumeBB())
+          << ", unwind " << Ctx.getID(YI->getUnwindBB());
   }
 
   void visitSwitchValueInst(SwitchValueInst *SII) {
@@ -1938,95 +2041,11 @@ public:
       *this << "objc \"" << pattern->getObjCString() << "\"; ";
     
     *this << "root $" << KPI->getPattern()->getRootType();
-    
+
     for (auto &component : pattern->getComponents()) {
       *this << "; ";
-      
-      switch (auto kind = component.getKind()) {
-      case KeyPathPatternComponent::Kind::StoredProperty: {
-        auto prop = component.getStoredPropertyDecl();
-        *this << "stored_property #";
-        printValueDecl(prop, PrintState.OS);
-        *this << " : $" << component.getComponentType();
-        break;
-      }
-      case KeyPathPatternComponent::Kind::GettableProperty:
-      case KeyPathPatternComponent::Kind::SettableProperty: {
-        *this << (kind == KeyPathPatternComponent::Kind::GettableProperty
-                    ? "gettable_property $" : "settable_property $")
-              << component.getComponentType() << ", "
-              << " id ";
-        auto id = component.getComputedPropertyId();
-        switch (id.getKind()) {
-        case KeyPathPatternComponent::ComputedPropertyId::DeclRef: {
-          auto declRef = id.getDeclRef();
-          *this << declRef << " : "
-                << declRef.getDecl()->getInterfaceType();
-          break;
-        }
-        case KeyPathPatternComponent::ComputedPropertyId::Function: {
-          id.getFunction()->printName(PrintState.OS);
-          *this << " : " << id.getFunction()->getLoweredType();
-          break;
-        }
-        case KeyPathPatternComponent::ComputedPropertyId::Property: {
-          *this << "##";
-          printValueDecl(id.getProperty(), PrintState.OS);
-          break;
-        }
-        }
-        *this << ", getter ";
-        component.getComputedPropertyGetter()->printName(PrintState.OS);
-        *this << " : "
-              << component.getComputedPropertyGetter()->getLoweredType();
-        if (kind == KeyPathPatternComponent::Kind::SettableProperty) {
-          *this << ", setter ";
-          component.getComputedPropertySetter()->printName(PrintState.OS);
-          *this << " : "
-                << component.getComputedPropertySetter()->getLoweredType();
-        }
-        
-        if (!component.getComputedPropertyIndices().empty()) {
-          *this << ", indices [";
-          interleave(component.getComputedPropertyIndices(),
-            [&](const KeyPathPatternComponent::Index &i) {
-              *this << "%$" << i.Operand << " : $"
-                    << i.FormalType << " : "
-                    << i.LoweredType;
-            }, [&]{
-              *this << ", ";
-            });
-          *this << "], indices_equals ";
-          component.getComputedPropertyIndexEquals()->printName(PrintState.OS);
-          *this << " : "
-                << component.getComputedPropertyIndexEquals()->getLoweredType();
-          *this << ", indices_hash ";
-          component.getComputedPropertyIndexHash()->printName(PrintState.OS);
-          *this << " : "
-                << component.getComputedPropertyIndexHash()->getLoweredType();
-        }
-        break;
-      }
-      case KeyPathPatternComponent::Kind::OptionalWrap:
-      case KeyPathPatternComponent::Kind::OptionalChain:
-      case KeyPathPatternComponent::Kind::OptionalForce: {
-        switch (kind) {
-        case KeyPathPatternComponent::Kind::OptionalWrap:
-          *this << "optional_wrap : $";
-          break;
-        case KeyPathPatternComponent::Kind::OptionalChain:
-          *this << "optional_chain : $";
-          break;
-        case KeyPathPatternComponent::Kind::OptionalForce:
-          *this << "optional_force : $";
-          break;
-        default:
-          llvm_unreachable("out of sync");
-        }
-        *this << component.getComponentType();
-        break;
-      }
-      }
+
+      printKeyPathPatternComponent(component);
     }
     
     *this << ')';
@@ -2045,6 +2064,112 @@ public:
         });
       
       *this << ")";
+    }
+  }
+  
+  void
+  printKeyPathPatternComponent(const KeyPathPatternComponent &component) {
+    auto printComponentIndices =
+      [&](ArrayRef<KeyPathPatternComponent::Index> indices) {
+        *this << '[';
+        interleave(indices,
+          [&](const KeyPathPatternComponent::Index &i) {
+            *this << "%$" << i.Operand << " : $"
+                  << i.FormalType << " : "
+                  << i.LoweredType;
+          }, [&]{
+            *this << ", ";
+          });
+        *this << ']';
+      };
+
+    switch (auto kind = component.getKind()) {
+    case KeyPathPatternComponent::Kind::StoredProperty: {
+      auto prop = component.getStoredPropertyDecl();
+      *this << "stored_property #";
+      printValueDecl(prop, PrintState.OS);
+      *this << " : $" << component.getComponentType();
+      break;
+    }
+    case KeyPathPatternComponent::Kind::GettableProperty:
+    case KeyPathPatternComponent::Kind::SettableProperty: {
+      *this << (kind == KeyPathPatternComponent::Kind::GettableProperty
+                  ? "gettable_property $" : "settable_property $")
+            << component.getComponentType() << ", "
+            << " id ";
+      auto id = component.getComputedPropertyId();
+      switch (id.getKind()) {
+      case KeyPathPatternComponent::ComputedPropertyId::DeclRef: {
+        auto declRef = id.getDeclRef();
+        *this << declRef << " : "
+              << declRef.getDecl()->getInterfaceType();
+        break;
+      }
+      case KeyPathPatternComponent::ComputedPropertyId::Function: {
+        id.getFunction()->printName(PrintState.OS);
+        *this << " : " << id.getFunction()->getLoweredType();
+        break;
+      }
+      case KeyPathPatternComponent::ComputedPropertyId::Property: {
+        *this << "##";
+        printValueDecl(id.getProperty(), PrintState.OS);
+        break;
+      }
+      }
+      *this << ", getter ";
+      component.getComputedPropertyGetter()->printName(PrintState.OS);
+      *this << " : "
+            << component.getComputedPropertyGetter()->getLoweredType();
+      if (kind == KeyPathPatternComponent::Kind::SettableProperty) {
+        *this << ", setter ";
+        component.getComputedPropertySetter()->printName(PrintState.OS);
+        *this << " : "
+              << component.getComputedPropertySetter()->getLoweredType();
+      }
+      
+      if (!component.getSubscriptIndices().empty()) {
+        *this << ", indices ";
+        printComponentIndices(component.getSubscriptIndices());
+        *this << ", indices_equals ";
+        component.getSubscriptIndexEquals()->printName(PrintState.OS);
+        *this << " : "
+              << component.getSubscriptIndexEquals()->getLoweredType();
+        *this << ", indices_hash ";
+        component.getSubscriptIndexHash()->printName(PrintState.OS);
+        *this << " : "
+              << component.getSubscriptIndexHash()->getLoweredType();
+      }
+      
+      if (auto external = component.getExternalDecl()) {
+        *this << ", external #";
+        printValueDecl(external, PrintState.OS);
+        auto subs = component.getExternalSubstitutions();
+        if (!subs.empty()) {
+          printSubstitutions(subs);
+        }
+      }
+      
+      break;
+    }
+    case KeyPathPatternComponent::Kind::OptionalWrap:
+    case KeyPathPatternComponent::Kind::OptionalChain:
+    case KeyPathPatternComponent::Kind::OptionalForce: {
+      switch (kind) {
+      case KeyPathPatternComponent::Kind::OptionalWrap:
+        *this << "optional_wrap : $";
+        break;
+      case KeyPathPatternComponent::Kind::OptionalChain:
+        *this << "optional_chain : $";
+        break;
+      case KeyPathPatternComponent::Kind::OptionalForce:
+        *this << "optional_force : $";
+        break;
+      default:
+        llvm_unreachable("out of sync");
+      }
+      *this << component.getComponentType();
+      break;
+    }
     }
   }
 };
@@ -2093,6 +2218,14 @@ void SILBasicBlock::dump() const {
 /// Pretty-print the SILBasicBlock to the designated stream.
 void SILBasicBlock::print(raw_ostream &OS) const {
   SILPrintContext Ctx(OS);
+
+  // Print the debug scope (and compute if we didn't do it already).
+  auto &SM = this->getParent()->getModule().getASTContext().SourceMgr;
+  for (auto &I : *this) {
+    SILPrinter P(Ctx);
+    P.printDebugScope(I.getDebugScope(), SM);
+  }
+
   SILPrinter(Ctx).print(this);
 }
 
@@ -2120,6 +2253,7 @@ void SILFunction::dump(const char *FileName) const {
 static StringRef getLinkageString(SILLinkage linkage) {
   switch (linkage) {
   case SILLinkage::Public: return "public ";
+  case SILLinkage::PublicNonABI: return "non_abi ";
   case SILLinkage::Hidden: return "hidden ";
   case SILLinkage::Shared: return "shared ";
   case SILLinkage::Private: return "private ";
@@ -2176,24 +2310,38 @@ void SILFunction::print(SILPrintContext &PrintCtx) const {
   switch (isThunk()) {
   case IsNotThunk: break;
   case IsThunk: OS << "[thunk] "; break;
+  case IsSignatureOptimizedThunk:
+    OS << "[signature_optimized_thunk] ";
+    break;
   case IsReabstractionThunk: OS << "[reabstraction_thunk] "; break;
   }
 
   if (isGlobalInit())
     OS << "[global_init] ";
-  
+  if (isWeakLinked())
+    OS << "[_weakLinked] ";
+
   switch (getInlineStrategy()) {
     case NoInline: OS << "[noinline] "; break;
     case AlwaysInline: OS << "[always_inline] "; break;
     case InlineDefault: break;
   }
 
+  switch (getOptimizationMode()) {
+    case OptimizationMode::NoOptimization: OS << "[Onone] "; break;
+    case OptimizationMode::ForSpeed: OS << "[Ospeed] "; break;
+    case OptimizationMode::ForSize: OS << "[Osize] "; break;
+    default: break;
+  }
+
   if (getEffectsKind() == EffectsKind::ReadOnly)
     OS << "[readonly] ";
   else if (getEffectsKind() == EffectsKind::ReadNone)
       OS << "[readnone] ";
-  if (getEffectsKind() == EffectsKind::ReadWrite)
+  else if (getEffectsKind() == EffectsKind::ReadWrite)
     OS << "[readwrite] ";
+  else if (getEffectsKind() == EffectsKind::ReleaseNone)
+    OS << "[releasenone] ";
 
   for (auto &Attr : getSemanticsAttrs())
     OS << "[_semantics \"" << Attr << "\"] ";
@@ -2208,6 +2356,15 @@ void SILFunction::print(SILPrintContext &PrintCtx) const {
     printValueDecl(getClangNodeOwner(), OS);
     OS << "] ";
   }
+
+  // Handle functions that are deserialized from canonical SIL. Normally, we
+  // should emit SIL with the correct SIL stage, so preserving this attribute
+  // won't be necessary. But consider serializing raw SIL (either textual SIL or
+  // SIB) after importing canonical SIL from another module. If the imported
+  // functions are reserialized (e.g. shared linkage), then we must preserve
+  // this attribute.
+  if (WasDeserializedCanonical && getModule().getStage() == SILStage::Raw)
+    OS << "[canonical] ";
 
   printName(OS);
   OS << " : $";
@@ -2446,23 +2603,55 @@ printSILDefaultWitnessTables(SILPrintContext &Ctx,
 
 static void
 printSILCoverageMaps(SILPrintContext &Ctx,
-                     const SILModule::CoverageMapListType &CoverageMaps) {
+                     const SILModule::CoverageMapCollectionType &CoverageMaps) {
   if (!Ctx.sortSIL()) {
-    for (const SILCoverageMap &M : CoverageMaps)
-      M.print(Ctx);
+    for (const auto &M : CoverageMaps)
+      M.second->print(Ctx);
     return;
   }
 
   std::vector<const SILCoverageMap *> Maps;
   Maps.reserve(CoverageMaps.size());
-  for (const SILCoverageMap &M : CoverageMaps)
-    Maps.push_back(&M);
+  for (const auto &M : CoverageMaps)
+    Maps.push_back(M.second);
   std::sort(Maps.begin(), Maps.end(),
             [](const SILCoverageMap *LHS, const SILCoverageMap *RHS) -> bool {
               return LHS->getName().compare(RHS->getName()) == -1;
             });
   for (const SILCoverageMap *M : Maps)
     M->print(Ctx);
+}
+
+void SILProperty::print(SILPrintContext &Ctx) const {
+  PrintOptions Options = PrintOptions::printSIL();
+  
+  auto &OS = Ctx.OS();
+  OS << "sil_property ";
+  if (isSerialized())
+    OS << "[serialized] ";
+  
+  OS << '#';
+  printValueDecl(getDecl(), OS);
+  if (auto sig = getDecl()->getInnermostDeclContext()
+                          ->getGenericSignatureOfContext()) {
+    sig->getCanonicalSignature()->print(OS, Options);
+  }
+  OS << " (";
+  if (auto component = getComponent())
+    SILPrinter(Ctx).printKeyPathPatternComponent(*component);
+  OS << ")\n";
+}
+
+void SILProperty::dump() const {
+  SILPrintContext context(llvm::errs());
+  print(context);
+}
+
+static void printSILProperties(SILPrintContext &Ctx,
+                               const SILModule::PropertyListType &Properties) {
+  for (const SILProperty &P : Properties) {
+    P.print(Ctx);
+  }
 }
 
 /// Pretty-print the SILModule to the designated stream.
@@ -2482,12 +2671,13 @@ void SILModule::print(SILPrintContext &PrintCtx, ModuleDecl *M,
     break;
   }
   
-  OS << "\n\nimport Builtin\nimport " << STDLIB_NAME
-     << "\nimport SwiftShims" << "\n\n";
+  OS << "\n\nimport " << BUILTIN_NAME
+     << "\nimport " << STDLIB_NAME
+     << "\nimport " << SWIFT_SHIMS_NAME << "\n\n";
 
-  // Print the declarations and types from the origin module, unless we're not
-  // in whole-module mode.
-  if (M && AssociatedDeclContext == M && PrintASTDecls) {
+  // Print the declarations and types from the associated context (origin module or
+  // current file).
+  if (M && PrintASTDecls) {
     PrintOptions Options = PrintOptions::printSIL();
     Options.TypeDefinitions = true;
     Options.VarInitializers = true;
@@ -2497,16 +2687,27 @@ void SILModule::print(SILPrintContext &PrintCtx, ModuleDecl *M,
     Options.PrintGetSetOnRWProperties = true;
     Options.PrintInSILBody = false;
     Options.PrintDefaultParameterPlaceholder = false;
+    bool WholeModuleMode = (M == AssociatedDeclContext);
 
     SmallVector<Decl *, 32> topLevelDecls;
     M->getTopLevelDecls(topLevelDecls);
     for (const Decl *D : topLevelDecls) {
+      if (!WholeModuleMode && !(D->getDeclContext() == AssociatedDeclContext))
+          continue;
       if ((isa<ValueDecl>(D) || isa<OperatorDecl>(D) ||
-           isa<ExtensionDecl>(D)) &&
+           isa<ExtensionDecl>(D) || isa<ImportDecl>(D)) &&
           !D->isImplicit()) {
-        if (auto *FD = dyn_cast<FuncDecl>(D))
-          if (FD->isAccessor())
+        if (isa<AccessorDecl>(D))
+          continue;
+
+        // skip to visit ASTPrinter to avoid sil-opt prints duplicated import declarations
+        if (auto importDecl = dyn_cast<ImportDecl>(D)) {
+          StringRef importName = importDecl->getModule()->getName().str();
+          if (importName == BUILTIN_NAME ||
+              importName == STDLIB_NAME ||
+              importName == SWIFT_SHIMS_NAME)
             continue;
+        }
         D->print(OS, Options);
         OS << "\n\n";
       }
@@ -2518,7 +2719,8 @@ void SILModule::print(SILPrintContext &PrintCtx, ModuleDecl *M,
   printSILVTables(PrintCtx, getVTableList());
   printSILWitnessTables(PrintCtx, getWitnessTableList());
   printSILDefaultWitnessTables(PrintCtx, getDefaultWitnessTableList());
-  printSILCoverageMaps(PrintCtx, getCoverageMapList());
+  printSILCoverageMaps(PrintCtx, getCoverageMaps());
+  printSILProperties(PrintCtx, getPropertyList());
   
   OS << "\n\n";
 }
@@ -2540,7 +2742,11 @@ void SILInstruction::printInContext(llvm::raw_ostream &OS) const {
 }
 
 void SILVTable::print(llvm::raw_ostream &OS, bool Verbose) const {
-  OS << "sil_vtable " << getClass()->getName() << " {\n";
+  OS << "sil_vtable ";
+  if (isSerialized())
+    OS << "[serialized] ";
+  OS << getClass()->getName() << " {\n";
+
   PrintOptions QualifiedSILTypeOptions = PrintOptions::printQualifiedSILType();
   for (auto &entry : getEntries()) {
     OS << "  ";
@@ -2569,7 +2775,7 @@ void SILVTable::print(llvm::raw_ostream &OS, bool Verbose) const {
         stripExternalFromLinkage(entry.Implementation->getLinkage())) {
       OS << getLinkageString(entry.Linkage);
     }
-    OS << entry.Implementation->getName();
+    OS << '@' << entry.Implementation->getName();
     switch (entry.TheKind) {
     case SILVTable::Entry::Kind::Normal:
       break;
@@ -2612,6 +2818,8 @@ void SILWitnessTable::print(llvm::raw_ostream &OS, bool Verbose) const {
     OS << "[serialized] ";
 
   getConformance()->printName(OS, Options);
+  Options.GenericEnv =
+    getConformance()->getDeclContext()->getGenericEnvironmentOfContext();
 
   if (isDeclaration()) {
     OS << "\n\n";
@@ -2652,7 +2860,7 @@ void SILWitnessTable::print(llvm::raw_ostream &OS, bool Verbose) const {
       auto &assocWitness = witness.getAssociatedTypeWitness();
       OS << "associated_type ";
       OS << assocWitness.Requirement->getName() << ": ";
-      assocWitness.Witness->print(OS, PrintOptions::printSIL());
+      assocWitness.Witness->print(OS, Options);
       break;
     }
     case AssociatedTypeProtocol: {
@@ -2675,17 +2883,25 @@ void SILWitnessTable::print(llvm::raw_ostream &OS, bool Verbose) const {
       baseProtoWitness.Witness->printName(OS, Options);
       break;
     }
-    case MissingOptional: {
-      // optional requirement 'declref': <<not present>>
-      OS << "optional requirement '"
-         << witness.getMissingOptionalWitness().Witness->getBaseName()
-         << "': <<not present>>";
-      break;
-    }
     }
     OS << '\n';
   }
-  
+
+  for (auto conditionalConformance : getConditionalConformances()) {
+    // conditional_conformance (TypeName: Protocol):
+    // <conformance>
+    OS << "  conditional_conformance (";
+    conditionalConformance.Requirement.print(OS, Options);
+    OS << ": " << conditionalConformance.Conformance.getRequirement()->getName()
+       << "): ";
+    if (conditionalConformance.Conformance.isConcrete())
+      conditionalConformance.Conformance.getConcrete()->printName(OS, Options);
+    else
+      OS << "dependent";
+
+    OS << '\n';
+  }
+
   OS << "}\n\n";
 }
 
@@ -2730,9 +2946,9 @@ void SILDefaultWitnessTable::dump() const {
 
 void SILCoverageMap::print(SILPrintContext &PrintCtx) const {
   llvm::raw_ostream &OS = PrintCtx.OS();
-  OS << "sil_coverage_map " << QuotedString(getFile()) << " " << getName()
-     << " " << getHash() << " {\t// " << demangleSymbol(getName())
-     << "\n";
+  OS << "sil_coverage_map " << QuotedString(getFile()) << " "
+     << QuotedString(getName()) << " " << QuotedString(getPGOFuncName()) << " "
+     << getHash() << " {\t// " << demangleSymbol(getName()) << "\n";
   if (PrintCtx.sortSIL())
     std::sort(MappedRegions.begin(), MappedRegions.end(),
               [](const MappedRegion &LHS, const MappedRegion &RHS) {
@@ -2797,9 +3013,12 @@ void SILSpecializeAttr::print(llvm::raw_ostream &OS) const {
     SILFunction *F = getFunction();
     assert(F);
     auto GenericEnv = F->getGenericEnvironment();
-    assert(GenericEnv);
     interleave(getRequirements(),
                [&](Requirement req) {
+                 if (!GenericEnv) {
+                   req.print(OS, SubPrinter);
+                   return;
+                 }
                  // Use GenericEnvironment to produce user-friendly
                  // names instead of something like t_0_0.
                  auto FirstTy = GenericEnv->getSugaredType(req.getFirstType());
@@ -2882,6 +3101,9 @@ ID SILPrintContext::getID(const SILBasicBlock *Block) {
 }
 
 ID SILPrintContext::getID(const SILNode *node) {
+  if (node == nullptr)
+    return {ID::Null, ~0U};
+
   if (isa<SILUndef>(node))
     return {ID::SILUndef, 0};
   
@@ -2891,29 +3113,37 @@ ID SILPrintContext::getID(const SILNode *node) {
     // Lazily initialize the instruction -> ID mapping.
     if (ValueToIDMap.empty())
       F->numberValues(ValueToIDMap);
-  } else {
-    setContext(BB);
-    // Lazily initialize the instruction -> ID mapping.
-    if (ValueToIDMap.empty()) {
-      unsigned idx = 0;
-      for (auto &I : *BB) {
-        // Give the instruction itself the next ID.
-        ValueToIDMap[&I] = idx;
+    ID R = {ID::SSAValue, ValueToIDMap[node]};
+    return R;
+  }
 
-        // If there are no results, make sure we don't reuse that ID.
-        auto results = I.getResults();
-        if (results.empty()) {
-          idx++;
+  setContext(BB);
 
-        // Otherwise, assign all of the results an index.  Note that
-        // we'll assign the same ID to both the instruction and the
-        // first result.
-        } else {
-          for (auto result : results) {
-            ValueToIDMap[result] = idx++;
-          }
-        }
-      }
+  // Check if we have initialized our ValueToIDMap yet. If we have, just use
+  // that.
+  if (!ValueToIDMap.empty()) {
+    ID R = {ID::SSAValue, ValueToIDMap[node]};
+    return R;
+  }
+
+  // Otherwise, initialize the instruction -> ID mapping cache.
+  unsigned idx = 0;
+  for (auto &I : *BB) {
+    // Give the instruction itself the next ID.
+    ValueToIDMap[&I] = idx;
+
+    // If there are no results, make sure we don't reuse that ID.
+    auto results = I.getResults();
+    if (results.empty()) {
+      idx++;
+      continue;
+    }
+
+    // Otherwise, assign all of the results an index.  Note that
+    // we'll assign the same ID to both the instruction and the
+    // first result.
+    for (auto result : results) {
+      ValueToIDMap[result] = idx++;
     }
   }
 

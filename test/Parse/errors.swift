@@ -4,8 +4,8 @@ enum MSV : Error {
   case Foo, Bar, Baz
   case CarriesInt(Int)
 
-  var domain: String { return "" }
-  var code: Int { return 0 }
+  var _domain: String { return "" }
+  var _code: Int { return 0 }
 }
 
 func opaque_error() -> Error { return MSV.Foo }
@@ -84,20 +84,6 @@ func testAutoclosures() throws {
                                        // expected-note@-2 {{did you mean to handle error as optional value?}} {{28-28=try? }}
                                        // expected-note@-3 {{did you mean to disable error propagation?}} {{28-28=try! }}
   takesThrowingAutoclosure(genNoError())
-}
-
-struct IllegalContext {
-  var x: Int = genError() // expected-error {{call can throw, but errors cannot be thrown out of a property initializer}}
-
-  func foo(_ x: Int = genError()) {} // expected-error {{call can throw, but errors cannot be thrown out of a default argument}}
-
-  func catcher() throws {
-    do {
-      _ = try genError()
-    } catch MSV.CarriesInt(genError()) { // expected-error {{call can throw, but errors cannot be thrown out of a catch pattern}}
-    } catch MSV.CarriesInt(let i) where i == genError() { // expected-error {{call can throw, but errors cannot be thrown out of a catch guard expression}}
-    }
-  }
 }
 
 func illformed() throws {

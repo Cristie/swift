@@ -9,29 +9,40 @@
     "Character.swift",
     "CharacterUnicodeScalars.swift",
     "ICU.swift",
+    "NormalizedCodeUnitIterator.swift",
+    "SmallString.swift",
     "StaticString.swift",
     "String.swift",
     "StringBridge.swift",
-    "StringBuffer.swift",
-    "StringCharacterView.swift",
     "StringComparable.swift",
-    "StringCore.swift",
+    "StringComparison.swift",
+    "StringObject.swift",
+    "StringGuts.swift",
+    "StringGutsVisitor.swift",
+    "StringGraphemeBreaking.swift",  
     "StringHashable.swift",
     "StringIndex.swift",
     "StringIndexConversions.swift",
     "StringInterpolation.swift",
     "StringLegacy.swift",
+    "StringNormalization.swift",
+    "StringProtocol.swift",
     "StringRangeReplaceableCollection.swift",
+    "StringStorage.swift",
     "StringSwitch.swift",
     "StringUTF16.swift",
     "StringUTF8.swift",
     "StringUnicodeScalarView.swift",
+    "StringVariant.swift",  
     "Substring.swift",
     "Unicode.swift",
     "UnicodeEncoding.swift",
     "UnicodeParser.swift",
     "UnicodeScalar.swift",
+    "UnicodeScalarProperties.swift",
     "UnavailableStringAPIs.swift",
+    "UnmanagedOpaqueString.swift",
+    "UnmanagedString.swift",
     "UTFEncoding.swift",
     "UTF8.swift",
     "UTF16.swift",
@@ -52,7 +63,6 @@
     "Repeat.swift",
     "Sort.swift",
     "Range.swift",
-    "SentinelCollection.swift",
     "ClosedRange.swift",
     "CollectionOfOne.swift",
     "HeapBuffer.swift",
@@ -60,7 +70,6 @@
     "SequenceAlgorithms.swift",
     "RangeReplaceableCollection.swift",
     "Indices.swift",
-    "Existential.swift",
     "WriteBackMutableSlice.swift",
     "UnfoldSequence.swift",
     "UIntBuffer.swift",
@@ -84,20 +93,24 @@
         "LazyCollection.swift",
         "LazySequence.swift"],
       "Array": [
+        "Array.swift",
         "ArrayBody.swift",
         "ArrayBuffer.swift",
         "ArrayBufferProtocol.swift",
         "ArrayCast.swift",
         "ArrayType.swift",
-        "Arrays.swift",
+        "ArrayShared.swift",
+        "ArraySlice.swift",
         "CocoaArray.swift",
+        "ContiguousArray.swift",
         "ContiguousArrayBuffer.swift",
         "FixedArray.swift",
         "SliceBuffer.swift",
         "SwiftNativeNSArray.swift"],
       "HashedCollections": [
-        "HashedCollections.swift",
-        "HashedCollectionsAnyHashableExtensions.swift"
+        "Dictionary.swift",
+        "HashedCollectionsAnyHashableExtensions.swift",
+        "Set.swift",
       ]
     }
   ],
@@ -116,16 +129,14 @@
     "Dump.swift",
     "Mirror.swift",
     "Mirrors.swift",
-    "ObjCMirrors.swift",
-    "ObjectIdentifier.swift",
-    "ReflectionLegacy.swift"
+    "ReflectionMirror.swift",
+    "ObjectIdentifier.swift"
   ],
   "Math": [
     "SetAlgebra.swift",
     "BuiltinMath.swift",
     {
     "Integers": [
-      "DoubleWidth.swift",
       "Integers.swift",
       "IntegerParsing.swift"],
     "Floating": [
@@ -134,7 +145,6 @@
       "FloatingPointTypes.swift"]}
   ],
   "Optional": [
-    "ImplicitlyUnwrappedOptional.swift",
     "Optional.swift"
   ],
   "Pointer": [
@@ -148,11 +158,15 @@
     "CompilerProtocols.swift",
     "ShadowProtocols.swift"
   ],
+  "Playground": [
+    "PlaygroundDisplay.swift"
+  ],
   "Misc": [
     "AnyHashable.swift",
     "Interval.swift",
     "Hashing.swift",
     "SipHash.swift",
+    "Hasher.swift",
     "ErrorType.swift",
     "InputStream.swift",
     "LifetimeManager.swift",
@@ -163,6 +177,7 @@
     "Policy.swift",
     "Print.swift",
     "REPL.swift",
+    "Random.swift",
     "Runtime.swift",
     "RuntimeFunctionCounters.swift",
     "Shims.swift",
@@ -177,6 +192,7 @@
     "Equatable.swift",
     "Comparable.swift",
     "Hashable.swift",
-    "Codable.swift"
+    "Codable.swift",
+    "MigrationSupport.swift"
   ]
 }

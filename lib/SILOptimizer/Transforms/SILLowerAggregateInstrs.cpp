@@ -80,6 +80,9 @@ static bool expandCopyAddr(CopyAddrInst *CA) {
     return false;
 
   bool expand = shouldExpand(M, SrcType.getObjectType());
+  using TypeExpansionKind = Lowering::TypeLowering::TypeExpansionKind;
+  auto expansionKind = expand ? TypeExpansionKind::MostDerivedDescendents
+                              : TypeExpansionKind::None;
 
   SILBuilderWithScope Builder(CA);
 
@@ -112,8 +115,7 @@ static bool expandCopyAddr(CopyAddrInst *CA) {
     //   retain_value %new : $*T
     IsTake_t IsTake = CA->isTakeOfSrc();
     if (IsTake_t::IsNotTake == IsTake) {
-      TL.emitLoweredCopyValue(Builder, CA->getLoc(), New,
-                              TypeLowering::getLoweringStyle(expand));
+      TL.emitLoweredCopyValue(Builder, CA->getLoc(), New, expansionKind);
     }
 
     // If we are not initializing:
@@ -121,8 +123,7 @@ static bool expandCopyAddr(CopyAddrInst *CA) {
     //   *or*
     // release_value %old : $*T
     if (Old) {
-      TL.emitLoweredDestroyValue(Builder, CA->getLoc(), Old,
-                                 TypeLowering::getLoweringStyle(expand));
+      TL.emitLoweredDestroyValue(Builder, CA->getLoc(), Old, expansionKind);
     }
   }
 
@@ -155,8 +156,10 @@ static bool expandDestroyAddr(DestroyAddrInst *DA) {
     LoadInst *LI = Builder.createLoad(DA->getLoc(), Addr,
                                       LoadOwnershipQualifier::Unqualified);
     auto &TL = Module.getTypeLowering(Type);
-    TL.emitLoweredDestroyValue(Builder, DA->getLoc(), LI,
-                               TypeLowering::getLoweringStyle(expand));
+    using TypeExpansionKind = Lowering::TypeLowering::TypeExpansionKind;
+    auto expansionKind = expand ? TypeExpansionKind::MostDerivedDescendents
+                                : TypeExpansionKind::None;
+    TL.emitLoweredDestroyValue(Builder, DA->getLoc(), LI, expansionKind);
   }
 
   ++NumExpand;
@@ -181,10 +184,10 @@ static bool expandReleaseValue(ReleaseValueInst *DV) {
     return false;
 
   auto &TL = Module.getTypeLowering(Type);
-  TL.emitLoweredDestroyValue(Builder, DV->getLoc(), Value,
-                             TypeLowering::LoweringStyle::Deep);
+  TL.emitLoweredDestroyValueMostDerivedDescendents(Builder, DV->getLoc(),
+                                                   Value);
 
-  DEBUG(llvm::dbgs() << "    Expanding Destroy Value: " << *DV);
+  LLVM_DEBUG(llvm::dbgs() << "    Expanding Destroy Value: " << *DV);
 
   ++NumExpand;
   return true;
@@ -208,10 +211,9 @@ static bool expandRetainValue(RetainValueInst *CV) {
     return false;
 
   auto &TL = Module.getTypeLowering(Type);
-  TL.emitLoweredCopyValue(Builder, CV->getLoc(), Value,
-                          TypeLowering::LoweringStyle::Deep);
+  TL.emitLoweredCopyValueMostDerivedDescendents(Builder, CV->getLoc(), Value);
 
-  DEBUG(llvm::dbgs() << "    Expanding Copy Value: " << *CV);
+  LLVM_DEBUG(llvm::dbgs() << "    Expanding Copy Value: " << *CV);
 
   ++NumExpand;
   return true;
@@ -228,7 +230,7 @@ static bool processFunction(SILFunction &Fn) {
     while (II != IE) {
       SILInstruction *Inst = &*II;
 
-      DEBUG(llvm::dbgs() << "Visiting: " << *Inst);
+      LLVM_DEBUG(llvm::dbgs() << "Visiting: " << *Inst);
 
       if (auto *CA = dyn_cast<CopyAddrInst>(Inst))
         if (expandCopyAddr(CA)) {
@@ -274,7 +276,7 @@ class SILLowerAggregate : public SILFunctionTransform {
   /// The entry point to the transformation.
   void run() override {
     SILFunction *F = getFunction();
-    DEBUG(llvm::dbgs() << "***** LowerAggregate on function: " <<
+    LLVM_DEBUG(llvm::dbgs() << "***** LowerAggregate on function: " <<
           F->getName() << " *****\n");
     bool Changed = processFunction(*F);
     if (Changed) {

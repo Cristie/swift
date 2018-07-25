@@ -12,6 +12,7 @@
 
 #include "swift/SILOptimizer/Utils/SpecializationMangler.h"
 #include "swift/SIL/SILGlobalVariable.h"
+#include "swift/AST/GenericSignature.h"
 #include "swift/AST/SubstitutionMap.h"
 #include "swift/Demangling/ManglingMacros.h"
 
@@ -79,7 +80,6 @@ std::string GenericSpecializationMangler::mangle() {
   SILFunctionType *FTy = Function->getLoweredFunctionType();
   CanGenericSignature Sig = FTy->getGenericSignature();
 
-  auto SubMap = Sig->getSubstitutionMap(Subs);
   bool First = true;
   for (auto ParamType : Sig->getSubstitutableParams()) {
     appendType(Type(ParamType).subst(SubMap)->getCanonicalType());
@@ -156,6 +156,18 @@ void FunctionSignatureSpecializationMangler::setArgumentSROA(
   OrigArgs[OrigArgIdx].first |= ArgumentModifierIntBase(ArgumentModifier::SROA);
 }
 
+void FunctionSignatureSpecializationMangler::setArgumentGuaranteedToOwned(
+    unsigned OrigArgIdx) {
+  OrigArgs[OrigArgIdx].first |=
+      ArgumentModifierIntBase(ArgumentModifier::GuaranteedToOwned);
+}
+
+void FunctionSignatureSpecializationMangler::setArgumentExistentialToGeneric(
+    unsigned OrigArgIdx) {
+  OrigArgs[OrigArgIdx].first |=
+      ArgumentModifierIntBase(ArgumentModifier::ExistentialToGeneric);
+}
+
 void FunctionSignatureSpecializationMangler::setArgumentBoxToValue(
     unsigned OrigArgIdx) {
   OrigArgs[OrigArgIdx].first =
@@ -210,7 +222,7 @@ FunctionSignatureSpecializationMangler::mangleConstantProp(LiteralInst *LI) {
     StringRef V = SLI->getValue();
     assert(V.size() <= 32 && "Cannot encode string of length > 32");
     std::string VBuffer;
-    if (V.size() > 0 && (isDigit(V[0]) || V[0] == '_')) {
+    if (!V.empty() && (isDigit(V[0]) || V[0] == '_')) {
       VBuffer = "_";
       VBuffer.append(V.data(), V.size());
       V = VBuffer;
@@ -249,7 +261,7 @@ FunctionSignatureSpecializationMangler::mangleClosureProp(SILInstruction *Inst) 
   // specializing.
   for (auto &Op : PAI->getArgumentOperands()) {
     SILType Ty = Op.get()->getType();
-    appendType(Ty.getSwiftRValueType());
+    appendType(Ty.getASTType());
   }
 }
 
@@ -281,6 +293,11 @@ void FunctionSignatureSpecializationMangler::mangleArgument(
   }
 
   bool hasSomeMod = false;
+  if (ArgMod & ArgumentModifierIntBase(ArgumentModifier::ExistentialToGeneric)) {
+    ArgOpBuffer << 'e';
+    hasSomeMod = true;
+  }
+
   if (ArgMod & ArgumentModifierIntBase(ArgumentModifier::Dead)) {
     ArgOpBuffer << 'd';
     hasSomeMod = true;
@@ -290,6 +307,12 @@ void FunctionSignatureSpecializationMangler::mangleArgument(
     ArgOpBuffer << (hasSomeMod ? 'G' : 'g');
     hasSomeMod = true;
   }
+
+  if (ArgMod & ArgumentModifierIntBase(ArgumentModifier::GuaranteedToOwned)) {
+    ArgOpBuffer << (hasSomeMod ? 'O' : 'o');
+    hasSomeMod = true;
+  }
+
   if (ArgMod & ArgumentModifierIntBase(ArgumentModifier::SROA)) {
     ArgOpBuffer << (hasSomeMod ? 'X' : 'x');
     hasSomeMod = true;
@@ -316,12 +339,9 @@ mangleReturnValue(ReturnValueModifierIntBase RetMod) {
   }
 }
 
-std::string FunctionSignatureSpecializationMangler::mangle(int UniqueID) {
+std::string FunctionSignatureSpecializationMangler::mangle() {
   ArgOpStorage.clear();
   beginMangling();
-
-  if (UniqueID)
-    ArgOpBuffer << UniqueID;
 
   for (unsigned i : indices(OrigArgs)) {
     ArgumentModifierIntBase ArgMod;

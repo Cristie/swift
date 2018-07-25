@@ -19,9 +19,9 @@
 
 #include "llvm/Support/DataTypes.h"
 #include "swift/AST/ClangModuleLoader.h"
+#include "swift/AST/Evaluator.h"
 #include "swift/AST/Identifier.h"
 #include "swift/AST/SearchPathOptions.h"
-#include "swift/AST/SubstitutionList.h"
 #include "swift/AST/Type.h"
 #include "swift/AST/TypeAlignments.h"
 #include "swift/Basic/LangOptions.h"
@@ -90,13 +90,11 @@ namespace swift {
   class PrecedenceGroupDecl;
   class TupleTypeElt;
   class EnumElementDecl;
-  enum OptionalTypeKind : unsigned;
   class ProtocolDecl;
   class SubstitutableType;
   class SourceManager;
   class ValueDecl;
   class DiagnosticEngine;
-  class Substitution;
   class TypeCheckerDebugConsumer;
   struct RawComment;
   class DocComment;
@@ -106,6 +104,10 @@ namespace swift {
   class UnifiedStatsReporter;
 
   enum class KnownProtocolKind : uint8_t;
+
+namespace syntax {
+  class SyntaxArena;
+}
 
 /// \brief The arena in which a particular ASTContext allocation will go.
 enum class AllocationArena {
@@ -170,10 +172,6 @@ public:
 };
 
 class SILLayout; // From SIL
-/// \brief Describes either a nominal type declaration or an extension
-/// declaration.
-typedef llvm::PointerUnion<NominalTypeDecl *, ExtensionDecl *>
-  TypeOrExtensionDecl;
 
 /// ASTContext - This object creates and owns the AST objects.
 /// However, this class does more than just maintain context within an AST.
@@ -187,19 +185,26 @@ typedef llvm::PointerUnion<NominalTypeDecl *, ExtensionDecl *>
 /// DispatchQueues. Summary: if you think you need a global or static variable,
 /// you probably need to put it here instead.
 
-class ASTContext {
+class ASTContext final {
   ASTContext(const ASTContext&) = delete;
   void operator=(const ASTContext&) = delete;
+
+  ASTContext(LangOptions &langOpts, SearchPathOptions &SearchPathOpts,
+             SourceManager &SourceMgr, DiagnosticEngine &Diags);
 
 public:
   // Members that should only be used by ASTContext.cpp.
   struct Implementation;
-  Implementation &Impl;
-  
+  Implementation &getImpl() const;
+
   friend ConstraintCheckerArenaRAII;
-public:
-  ASTContext(LangOptions &langOpts, SearchPathOptions &SearchPathOpts,
-             SourceManager &SourceMgr, DiagnosticEngine &Diags);
+
+  void operator delete(void *Data) throw();
+
+  static ASTContext *get(LangOptions &langOpts,
+                         SearchPathOptions &SearchPathOpts,
+                         SourceManager &SourceMgr,
+                         DiagnosticEngine &Diags);
   ~ASTContext();
 
   /// \brief The language options used for translation.
@@ -213,6 +218,9 @@ public:
 
   /// Diags - The diagnostics engine.
   DiagnosticEngine &Diags;
+
+  /// The request-evaluator that is used to process various requests.
+  Evaluator evaluator;
 
   /// The set of top-level modules we have loaded.
   /// This map is used for iteration, therefore it's a MapVector and not a
@@ -254,6 +262,9 @@ public:
 
   /// Optional table of counters to report, nullptr when not collecting.
   UnifiedStatsReporter *Stats = nullptr;
+
+  /// Set a new stats reporter.
+  void setStatsReporter(UnifiedStatsReporter *stats);
 
 private:
   /// \brief The current generation number, which reflects the number of
@@ -380,6 +391,9 @@ public:
                               setVector.size());
   }
 
+  /// Retrive the syntax node memory manager for this context.
+  syntax::SyntaxArena &getSyntaxArena() const;
+
   /// Retrieve the lazy resolver for this context.
   LazyResolver *getLazyResolver() const;
 
@@ -403,23 +417,11 @@ public:
   DECL_CLASS *get##NAME##Decl() const;
 #include "swift/AST/KnownStdlibTypes.def"
 
-  /// Retrieve the declaration of Swift.Optional or ImplicitlyUnwrappedOptional.
-  EnumDecl *getOptionalDecl(OptionalTypeKind kind) const;
-
   /// Retrieve the declaration of Swift.Optional<T>.Some.
   EnumElementDecl *getOptionalSomeDecl() const;
   
   /// Retrieve the declaration of Swift.Optional<T>.None.
   EnumElementDecl *getOptionalNoneDecl() const;
-
-  /// Retrieve the declaration of Swift.ImplicitlyUnwrappedOptional<T>.Some.
-  EnumElementDecl *getImplicitlyUnwrappedOptionalSomeDecl() const;
-
-  /// Retrieve the declaration of Swift.ImplicitlyUnwrappedOptional<T>.None.
-  EnumElementDecl *getImplicitlyUnwrappedOptionalNoneDecl() const;
-
-  EnumElementDecl *getOptionalSomeDecl(OptionalTypeKind kind) const;
-  EnumElementDecl *getOptionalNoneDecl(OptionalTypeKind kind) const;
 
   /// Retrieve the declaration of the "pointee" property of a pointer type.
   VarDecl *getPointerPointeePropertyDecl(PointerTypeKind ptrKind) const;
@@ -481,6 +483,9 @@ public:
   /// Retrieve the declaration of Swift.==(Int, Int) -> Bool.
   FuncDecl *getEqualIntDecl() const;
 
+  /// Retrieve the declaration of Swift._hashValue<H>(for: H) -> Int.
+  FuncDecl *getHashValueForDecl() const;
+
   /// Retrieve the declaration of Array.append(element:)
   FuncDecl *getArrayAppendElementDecl() const;
 
@@ -536,6 +541,11 @@ public:
   /// nested within it.
   void addExternalDecl(Decl *decl);
 
+  /// Add a declaration that was synthesized to a per-source file list if
+  /// if is part of a source file, or the external declarations list if
+  /// it is part of an imported type context.
+  void addSynthesizedDecl(Decl *decl);
+
   /// Add a cleanup function to be called when the ASTContext is deallocated.
   void addCleanup(std::function<void(void)> cleanup);
 
@@ -566,6 +576,7 @@ public:
   const CanType TheUnknownObjectType;     /// Builtin.UnknownObject
   const CanType TheRawPointerType;        /// Builtin.RawPointer
   const CanType TheUnsafeValueBufferType; /// Builtin.UnsafeValueBuffer
+  const CanType TheSILTokenType;          /// Builtin.SILToken
   
   const CanType TheIEEE32Type;            /// 32-bit IEEE floating point
   const CanType TheIEEE64Type;            /// 64-bit IEEE floating point
@@ -741,29 +752,11 @@ public:
   /// \param generic The generic conformance.
   ///
   /// \param substitutions The set of substitutions required to produce the
-  /// specialized conformance from the generic conformance. This list is
-  /// copied so passing a temporary is permitted.
-  SpecializedProtocolConformance *
+  /// specialized conformance from the generic conformance.
+  ProtocolConformance *
   getSpecializedConformance(Type type,
                             ProtocolConformance *generic,
-                            SubstitutionList substitutions);
-
-  /// \brief Produce a specialized conformance, which takes a generic
-  /// conformance and substitutions written in terms of the generic
-  /// conformance's signature.
-  ///
-  /// \param type The type for which we are retrieving the conformance.
-  ///
-  /// \param generic The generic conformance.
-  ///
-  /// \param substitutions The set of substitutions required to produce the
-  /// specialized conformance from the generic conformance. The keys must
-  /// be generic parameters, not archetypes, so for example passing in
-  /// TypeBase::getContextSubstitutionMap() is OK.
-  SpecializedProtocolConformance *
-  getSpecializedConformance(Type type,
-                            ProtocolConformance *generic,
-                            const SubstitutionMap &substitutions);
+                            SubstitutionMap substitutions);
 
   /// \brief Produce an inherited conformance, for subclasses of a type
   /// that already conforms to a protocol.
@@ -862,31 +855,20 @@ private:
   /// generic signature builder for the given signature, if we don't already
   /// have one.
   void registerGenericSignatureBuilder(GenericSignature *sig,
-                                       ModuleDecl &module,
                                        GenericSignatureBuilder &&builder);
   friend class GenericSignatureBuilder;
 
 public:
   /// Retrieve or create the stored generic signature builder for the given
   /// canonical generic signature and module.
-  GenericSignatureBuilder *getOrCreateGenericSignatureBuilder(CanGenericSignature sig,
-                                                ModuleDecl *mod);
+  GenericSignatureBuilder *getOrCreateGenericSignatureBuilder(
+                                                     CanGenericSignature sig);
 
   /// Retrieve or create the canonical generic environment of a canonical
   /// generic signature builder.
   GenericEnvironment *getOrCreateCanonicalGenericEnvironment(
                                        GenericSignatureBuilder *builder,
-                                       GenericSignature *sig,
-                                       ModuleDecl &module);
-
-  /// Retrieve the inherited name set for the given class.
-  const InheritedNameSet *getAllPropertyNames(ClassDecl *classDecl,
-                                              bool forInstance);
-
-  /// Retrieve the inherited name set for the given Objective-C class.
-  const InheritedNameSet *getAllPropertyNames(
-                            clang::ObjCInterfaceDecl *classDecl,
-                            bool forInstance);
+                                       GenericSignature *sig);
 
   /// Retrieve a generic signature with a single unconstrained type parameter,
   /// like `<T>`.
@@ -905,8 +887,8 @@ public:
   /// This is usually the check you want; for example, when introducing
   /// a new language feature which is only visible in Swift 5, you would
   /// check for isSwiftVersionAtLeast(5).
-  bool isSwiftVersionAtLeast(unsigned major) const {
-    return LangOpts.isSwiftVersionAtLeast(major);
+  bool isSwiftVersionAtLeast(unsigned major, unsigned minor = 0) const {
+    return LangOpts.isSwiftVersionAtLeast(major, minor);
   }
 
 private:

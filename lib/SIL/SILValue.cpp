@@ -22,6 +22,14 @@
 using namespace swift;
 
 //===----------------------------------------------------------------------===//
+//                       Check SILNode Type Properties
+//===----------------------------------------------------------------------===//
+
+/// These are just for performance and verification. If one needs to make
+/// changes that cause the asserts the fire, please update them. The purpose is
+/// to prevent these predicates from changing values by mistake.
+
+//===----------------------------------------------------------------------===//
 //                       Check SILValue Type Properties
 //===----------------------------------------------------------------------===//
 
@@ -58,57 +66,82 @@ void ValueBase::replaceAllUsesWithUndef() {
 }
 
 SILInstruction *ValueBase::getDefiningInstruction() {
-  if (auto inst = dyn_cast<SingleValueInstruction>(this))
+  if (auto *inst = dyn_cast<SingleValueInstruction>(this))
     return inst;
-  // TODO: MultiValueInstruction
+  if (auto *result = dyn_cast<MultipleValueInstructionResult>(this))
+    return result->getParent();
   return nullptr;
 }
 
 Optional<ValueBase::DefiningInstructionResult>
 ValueBase::getDefiningInstructionResult() {
-  if (auto inst = dyn_cast<SingleValueInstruction>(this))
-    return DefiningInstructionResult{ inst, 0 };
-  // TODO: MultiValueInstruction
+  if (auto *inst = dyn_cast<SingleValueInstruction>(this))
+    return DefiningInstructionResult{inst, 0};
+  if (auto *result = dyn_cast<MultipleValueInstructionResult>(this))
+    return DefiningInstructionResult{result->getParent(), result->getIndex()};
   return None;
 }
 
 SILBasicBlock *SILNode::getParentBlock() const {
-  auto *NonConstThis = const_cast<SILNode *>(this);
-  if (auto *Inst = dyn_cast<SILInstruction>(NonConstThis))
+  auto *CanonicalNode =
+      const_cast<SILNode *>(this)->getRepresentativeSILNodeInObject();
+  if (auto *Inst = dyn_cast<SILInstruction>(CanonicalNode))
     return Inst->getParent();
-  // TODO: MultiValueInstruction
-  if (auto *Arg = dyn_cast<SILArgument>(NonConstThis))
+  if (auto *Arg = dyn_cast<SILArgument>(CanonicalNode))
     return Arg->getParent();
   return nullptr;
 }
 
 SILFunction *SILNode::getFunction() const {
-  auto *NonConstThis = const_cast<SILNode *>(this);
-  if (auto *Inst = dyn_cast<SILInstruction>(NonConstThis))
+  auto *CanonicalNode =
+      const_cast<SILNode *>(this)->getRepresentativeSILNodeInObject();
+  if (auto *Inst = dyn_cast<SILInstruction>(CanonicalNode))
     return Inst->getFunction();
-  // TODO: MultiValueInstruction
-  if (auto *Arg = dyn_cast<SILArgument>(NonConstThis))
+  if (auto *Arg = dyn_cast<SILArgument>(CanonicalNode))
     return Arg->getFunction();
   return nullptr;
 }
 
 SILModule *SILNode::getModule() const {
-  auto *NonConstThis = const_cast<SILNode *>(this);
-  if (auto *Inst = dyn_cast<SILInstruction>(NonConstThis))
+  auto *CanonicalNode =
+      const_cast<SILNode *>(this)->getRepresentativeSILNodeInObject();
+  if (auto *Inst = dyn_cast<SILInstruction>(CanonicalNode))
     return &Inst->getModule();
-  // TODO: MultiValueInstruction
-  if (auto *Arg = dyn_cast<SILArgument>(NonConstThis))
+  if (auto *Arg = dyn_cast<SILArgument>(CanonicalNode))
     return &Arg->getModule();
   return nullptr;
 }
 
-const SILNode *SILNode::getCanonicalSILNodeSlowPath() const {
-  assert(getStorageLoc() != SILNodeStorageLocation::Instruction &&
-         hasMultipleSILNodes(getKind()));
-  return &static_cast<const SILInstruction &>(
-            static_cast<const SingleValueInstruction &>(
-              static_cast<const ValueBase &>(*this)));
+const SILNode *SILNode::getRepresentativeSILNodeSlowPath() const {
+  assert(getStorageLoc() != SILNodeStorageLocation::Instruction);
+
+  if (isa<SingleValueInstruction>(this)) {
+    assert(hasMultipleSILNodeBases(getKind()));
+    return &static_cast<const SILInstruction &>(
+        static_cast<const SingleValueInstruction &>(
+            static_cast<const ValueBase &>(*this)));
+  }
+
+  if (auto *MVR = dyn_cast<MultipleValueInstructionResult>(this)) {
+    return MVR->getParent();
+  }
+
+  llvm_unreachable("Invalid value for slow path");
 }
+
+/// Get a location for this value.
+SILLocation SILValue::getLoc() const {
+  if (auto *instr = Value->getDefiningInstruction())
+    return instr->getLoc();
+
+  if (auto *arg = dyn_cast<SILArgument>(*this)) {
+    if (arg->getDecl())
+      return RegularLocation(const_cast<ValueDecl *>(arg->getDecl()));
+  }
+  // TODO: bbargs should probably use one of their operand locations.
+  return Value->getFunction()->getLocation();
+}
+
 
 //===----------------------------------------------------------------------===//
 //                             ValueOwnershipKind
@@ -201,6 +234,14 @@ ValueOwnershipKind::ValueOwnershipKind(StringRef S) {
   if (!Result.hasValue())
     llvm_unreachable("Invalid string representation of ValueOwnershipKind");
   Value = Result.getValue();
+}
+
+ValueOwnershipKind
+ValueOwnershipKind::getProjectedOwnershipKind(SILModule &M,
+                                              SILType Proj) const {
+  if (Proj.isTrivial(M))
+    return ValueOwnershipKind::Trivial;
+  return *this;
 }
 
 ValueOwnershipKind SILValue::getOwnershipKind() const {

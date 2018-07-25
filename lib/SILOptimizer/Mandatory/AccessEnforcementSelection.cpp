@@ -13,19 +13,19 @@
 /// This pass eliminates 'unknown' access enforcement by selecting either
 /// static or dynamic enforcement.
 ///
-/// TODO: This is currently a module transform so that closures can be
-/// transformed after their parent scope is analyzed. This isn't a big problem
-/// now because AccessMarkerElimination is also a module pass that follows this
-/// pass. However, we would like to mostly eliminate module transforms. This
-/// could be done by changing the PassManager to follow CloseScopeAnalysis. A
-/// new ClosureTransform type would be pipelined just like FunctionTransform,
-/// but would have an entry point that handled a parent closure scope and all
-/// its children in one invocation. For function pipelining to be upheld, we
-/// would need to verify that BasicCalleeAnalysis never conflicts with
-/// ClosureScopeAnalysis. i.e. we could never create a caller->callee edge when
-/// the callee is passed as a function argument. Normal FunctionTransforms would
-/// then be called on each closure function and its parent scope before calling
-/// the ClosureTransform.
+/// TODO: This is currently a module transform so that it can process closures
+/// after analyzing their parent scope. This isn't a big problem now because
+/// AccessMarkerElimination is also a module pass that follows this pass, so all
+/// markers will still be present when this pass runs. However, we would like to
+/// mostly eliminate module transforms. This could be done by changing the
+/// PassManager to follow ClosureScopeAnalysis. A new ClosureTransform type
+/// would be pipelined just like FunctionTransform, but would have an entry
+/// point that handled a parent closure scope and all its children in one
+/// invocation. For function pipelining to be upheld, we would need to verify
+/// that BasicCalleeAnalysis never conflicts with ClosureScopeAnalysis. i.e. we
+/// could never create a caller->callee edge when the callee is passed as a
+/// function argument. Normal FunctionTransforms would then be called on each
+/// closure function and its parent scope before calling the ClosureTransform.
 ///
 /// FIXME: handle boxes used by copy_value when neither copy is captured.
 ///
@@ -44,14 +44,14 @@ static void setStaticEnforcement(BeginAccessInst *access) {
   // TODO: delete if we're not using static enforcement?
   access->setEnforcement(SILAccessEnforcement::Static);
 
-  DEBUG(llvm::dbgs() << "Static Access: " << *access);
+  LLVM_DEBUG(llvm::dbgs() << "Static Access: " << *access);
 }
 
 static void setDynamicEnforcement(BeginAccessInst *access) {
   // TODO: delete if we're not using dynamic enforcement?
   access->setEnforcement(SILAccessEnforcement::Dynamic);
 
-  DEBUG(llvm::dbgs() << "Dynamic Access: " << *access);
+  LLVM_DEBUG(llvm::dbgs() << "Dynamic Access: " << *access);
 }
 
 namespace {
@@ -81,6 +81,7 @@ struct AddressCapture {
   bool isValid() const { return bool(site); }
 };
 
+LLVM_ATTRIBUTE_UNUSED
 raw_ostream &operator<<(raw_ostream &os, const AddressCapture &capture) {
   os << *capture.site.getInstruction() << " captures Arg #"
      << capture.calleeArgIdx;
@@ -102,7 +103,7 @@ public:
   DynamicCaptures() = default;
 
   void recordCapture(AddressCapture capture) {
-    DEBUG(llvm::dbgs() << "Dynamic Capture: " << capture);
+    LLVM_DEBUG(llvm::dbgs() << "Dynamic Capture: " << capture);
 
     auto callee = capture.site.getCalleeFunction();
     assert(callee && "cannot locate function ref for nonescaping closure");
@@ -200,7 +201,7 @@ private:
 } // end anonymous namespace
 
 void SelectEnforcement::run() {
-  DEBUG(llvm::dbgs() << "  Box: " << *Box);
+  LLVM_DEBUG(llvm::dbgs() << "  Box: " << *Box);
 
   // Set up the data-flow problem.
   analyzeUsesOfBox(Box);
@@ -244,6 +245,20 @@ void SelectEnforcement::analyzeUsesOfBox(SingleValueInstruction *source) {
   // capture and, for some reason, the closure is dead.
 }
 
+// Verify that accesses are not nested before mandatory inlining.
+// Closure captures should also not be nested within an access.
+static void checkUsesOfAccess(BeginAccessInst *access) {
+#ifndef NDEBUG
+  // These conditions are only true prior to mandatory inlining.
+  assert(!access->getFunction()->wasDeserializedCanonical());
+  for (auto *use : access->getUses()) {
+    auto user = use->getUser();
+    assert(!isa<BeginAccessInst>(user));
+    assert(!isa<PartialApplyInst>(user));
+  }
+#endif
+}
+
 void SelectEnforcement::analyzeProjection(ProjectBoxInst *projection) {
   for (auto *use : projection->getUses()) {
     auto user = use->getUser();
@@ -253,6 +268,8 @@ void SelectEnforcement::analyzeProjection(ProjectBoxInst *projection) {
       if (access->getEnforcement() == SILAccessEnforcement::Unknown)
         Accesses.push_back(access);
 
+      checkUsesOfAccess(access);
+
       continue;
     }
     if (isa<PartialApplyInst>(user))
@@ -261,7 +278,7 @@ void SelectEnforcement::analyzeProjection(ProjectBoxInst *projection) {
 }
 
 void SelectEnforcement::noteEscapingUse(SILInstruction *inst) {
-  DEBUG(llvm::dbgs() << "    Escape: " << *inst);
+  LLVM_DEBUG(llvm::dbgs() << "    Escape: " << *inst);
 
   // Add it to the escapes set.
   Escapes.insert(inst);
@@ -406,11 +423,11 @@ bool SelectEnforcement::hasPotentiallyEscapedAtAnyReachableBlock(
 
 void SelectEnforcement::updateAccesses() {
   for (auto *access : Accesses) {
-    DEBUG(llvm::dbgs() << "    Access: " << *access);
+    LLVM_DEBUG(llvm::dbgs() << "    Access: " << *access);
     updateAccess(access);
   }
   for (AddressCapture &capture : Captures) {
-    DEBUG(llvm::dbgs() << "    Capture: " << capture);
+    LLVM_DEBUG(llvm::dbgs() << "    Capture: " << capture);
     updateCapture(capture);
   }
 }
@@ -442,30 +459,67 @@ void SelectEnforcement::updateAccess(BeginAccessInst *access) {
 }
 
 void SelectEnforcement::updateCapture(AddressCapture capture) {
-  llvm::SmallSetVector<PartialApplyInst *, 8> worklist;
+  auto captureIfEscaped = [&](SILInstruction *user) {
+    if (hasPotentiallyEscapedAt(user))
+      dynamicCaptures.recordCapture(capture);
+  };
+  llvm::SmallSetVector<SingleValueInstruction *, 8> worklist;
   auto visitUse = [&](Operand *oper) {
-    if (FullApplySite::isa(oper->getUser())) {
+    auto *user = oper->getUser();
+    if (FullApplySite::isa(user)) {
       // A call is considered a closure access regardless of whether it calls
       // the closure or accepts the closure as an argument.
-      if (hasPotentiallyEscapedAt(oper->getUser())) {
-        dynamicCaptures.recordCapture(capture);
-        return;
-      }
+      captureIfEscaped(user);
+      return;
     }
-    if (auto *PAI = dyn_cast<PartialApplyInst>(oper->getUser())) {
-      assert(oper->get() != PAI->getCallee() && "cannot re-partially apply");
-      // The closure is capture by another closure. Transitively consider any
-      // calls to the parent closure as an access.
-      worklist.insert(PAI);
+    switch (user->getKind()) {
+    case SILInstructionKind::ConvertEscapeToNoEscapeInst:
+    case SILInstructionKind::MarkDependenceInst:
+    case SILInstructionKind::ConvertFunctionInst:
+    case SILInstructionKind::BeginBorrowInst:
+    case SILInstructionKind::CopyValueInst:
+    case SILInstructionKind::EnumInst:
+    case SILInstructionKind::StructInst:
+    case SILInstructionKind::TupleInst:
+    case SILInstructionKind::PartialApplyInst:
+      // Propagate the closure.
+      worklist.insert(cast<SingleValueInstruction>(user));
+      return;
+    case SILInstructionKind::StrongRetainInst:
+    case SILInstructionKind::StrongReleaseInst:
+    case SILInstructionKind::DebugValueInst:
+    case SILInstructionKind::DestroyValueInst:
+    case SILInstructionKind::RetainValueInst:
+    case SILInstructionKind::ReleaseValueInst:
+    case SILInstructionKind::EndBorrowInst:
+      // Benign use.
+      return;
+    case SILInstructionKind::TupleExtractInst:
+    case SILInstructionKind::StructExtractInst:
+    case SILInstructionKind::AssignInst:
+    case SILInstructionKind::BranchInst:
+    case SILInstructionKind::CondBranchInst:
+    case SILInstructionKind::ReturnInst:
+    case SILInstructionKind::StoreInst:
+      // These are all valid partial_apply users, however we don't expect them
+      // to occur with non-escaping closures. Handle them conservatively just in
+      // case they occur.
+      LLVM_FALLTHROUGH;
+    default:
+      LLVM_DEBUG(llvm::dbgs() << "    Unrecognized partial_apply user: "
+                              << *user);
+
+      // Handle unknown uses conservatively by assuming a capture.
+      captureIfEscaped(user);
     }
   };
-  auto *PAI = dyn_cast<PartialApplyInst>(capture.site);
+  SingleValueInstruction *PAIUser = dyn_cast<PartialApplyInst>(capture.site);
   while (true) {
-    for (auto *oper : PAI->getUses())
+    for (auto *oper : PAIUser->getUses())
       visitUse(oper);
     if (worklist.empty())
       break;
-    PAI = worklist.pop_back_val();
+    PAIUser = worklist.pop_back_val();
   }
 }
 
@@ -487,6 +541,12 @@ struct SourceAccess {
 };
 
 /// The pass.
+///
+/// This can't be a SILFunctionTransform because DynamicCaptures need to be
+/// recorded while analyzing a closure's parent scopes before processing the
+/// closures.
+///
+/// TODO: Make this a "ClosureTransform". See the file-level comments above.
 class AccessEnforcementSelection : public SILModuleTransform {
   // Reference back to the known dynamically enforced non-escaping closure
   // arguments in this module. Parent scopes are processed before the closures
@@ -520,18 +580,29 @@ void AccessEnforcementSelection::run() {
 }
 
 void AccessEnforcementSelection::processFunction(SILFunction *F) {
-  DEBUG(llvm::dbgs() << "Access Enforcement Selection in " << F->getName()
-                     << "\n");
+  LLVM_DEBUG(llvm::dbgs() << "Access Enforcement Selection in " << F->getName()
+                          << "\n");
+
+  // This ModuleTransform needs to analyze closures and their parent scopes in
+  // the same pass, and the parent needs to be analyzed before the closure.
 #ifndef NDEBUG
   auto *CSA = getAnalysis<ClosureScopeAnalysis>();
   if (isNonEscapingClosure(F->getLoweredFunctionType())) {
     for (auto *scopeF : CSA->getClosureScopes(F)) {
-      DEBUG(llvm::dbgs() << "  Parent scope: " << scopeF->getName() << "\n");
+      LLVM_DEBUG(llvm::dbgs() << "  Parent scope: " << scopeF->getName()
+                              << "\n");
       assert(visited.count(scopeF));
+      // Closures must be defined in the same module as their parent scope.
+      assert(scopeF->wasDeserializedCanonical()
+             == F->wasDeserializedCanonical());
     }
   }
   visited.insert(F);
 #endif
+  // Deserialized functions, which have been mandatory inlined, no longer meet
+  // the structural requirements on access markers required by this pass.
+  if (F->wasDeserializedCanonical())
+    return;
 
   for (auto &bb : *F) {
     for (auto ii = bb.begin(), ie = bb.end(); ii != ie;) {
@@ -599,6 +670,10 @@ SourceAccess AccessEnforcementSelection::getSourceAccess(SILValue address) {
       //  
       // FIXME: When we have borrowed arguments, a "read" needs to be enforced
       // on the caller side.
+      return SourceAccess::getStaticAccess();
+
+    case SILArgumentConvention::Indirect_Out:
+      // We use an initialized 'out' argument as a parameter.
       return SourceAccess::getStaticAccess();
 
     default:

@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2018 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -61,21 +61,25 @@ void ConstraintLocator::Profile(llvm::FoldingSetNodeID &id, Expr *anchor,
     case SubscriptMember:
     case SubscriptResult:
     case ConstructorMember:
-    case RvalueAdjustment:
+    case LValueConversion:
+    case RValueAdjustment:
     case ClosureResult:
     case ParentType:
     case InstanceType:
     case SequenceIteratorProtocol:
     case GeneratorElementType:
-    case ArrayElementType:
     case ScalarToTuple:
-    case Load:
+    case AutoclosureResult:
     case GenericArgument:
     case NamedTupleElement:
     case TupleElement:
     case ApplyArgToParam:
     case OpenedGeneric:
     case KeyPathComponent:
+    case ConditionalRequirement:
+    case TypeParameterRequirement:
+    case ImplicitlyUnwrappedDisjunctionChoice:
+    case DynamicLookupResult:
       if (unsigned numValues = numNumericValuesInPathElement(elt.getKind())) {
         id.AddInteger(elt.getValue());
         if (numValues > 1)
@@ -111,10 +115,6 @@ void ConstraintLocator::dump(SourceManager *sm, raw_ostream &out) {
   for (auto elt : getPath()) {
     out << " -> ";
     switch (elt.getKind()) {
-    case ArrayElementType:
-      out << "array element";
-      break;
-
     case Archetype:
       out << "archetype '" << elt.getArchetype()->getString() << "'";
       break;
@@ -169,8 +169,8 @@ void ConstraintLocator::dump(SourceManager *sm, raw_ostream &out) {
       out << "instance type";
       break;
 
-    case Load:
-      out << "load";
+    case AutoclosureResult:
+      out << "@autoclosure result";
       break;
 
     case Member:
@@ -193,7 +193,11 @@ void ConstraintLocator::dump(SourceManager *sm, raw_ostream &out) {
       out << "parent type";
       break;
 
-    case RvalueAdjustment:
+    case LValueConversion:
+      out << "@lvalue-to-inout conversion";
+      break;
+
+    case RValueAdjustment:
       out << "rvalue adjustment";
       break;
 
@@ -237,6 +241,22 @@ void ConstraintLocator::dump(SourceManager *sm, raw_ostream &out) {
         
     case OpenedGeneric:
       out << "opened generic";
+      break;
+
+    case ConditionalRequirement:
+      out << "conditional requirement #" << llvm::utostr(elt.getValue());
+      break;
+
+    case TypeParameterRequirement:
+      out << "type parameter requirement #" << llvm::utostr(elt.getValue());
+      break;
+
+    case ImplicitlyUnwrappedDisjunctionChoice:
+      out << "implicitly unwrapped disjunction choice";
+      break;
+
+    case DynamicLookupResult:
+      out << "dynamic lookup result";
       break;
     }
   }

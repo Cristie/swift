@@ -35,7 +35,7 @@ public let Exclusivity = [
   BenchmarkInfo(
     name: "ExclusivityInMatSet",
     runFunction: run_accessInMatSet,
-    tags: [.runtime, .cpubench]
+    tags: [.runtime, .cpubench, .unstable]
   ),
   // At -Onone
   // 25% swift_release
@@ -80,7 +80,7 @@ public func run_accessGlobal(_ N: Int) {
 // Hopefully the optimizer will not see this as "final" and optimize away the
 // materializeForSet.
 public class C {
-  var counter = 0
+  public var counter = 0
 
   func inc() {
     counter += 1

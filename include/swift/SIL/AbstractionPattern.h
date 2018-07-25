@@ -369,7 +369,7 @@ class AbstractionPattern {
                              Kind kind,
                              ImportAsMemberStatus memberStatus) {
     initClangType(signature, origType, clangType, kind);
-    OtherData = memberStatus.rawValue;
+    OtherData = memberStatus.getRawValue();
   }
 
   AbstractionPattern() {}
@@ -482,9 +482,7 @@ public:
   /// method with no `self` parameter.
   ImportAsMemberStatus getImportAsMemberStatus() const {
     assert(hasImportAsMemberStatus());
-    ImportAsMemberStatus status;
-    status.rawValue = OtherData;
-    return status;
+    return ImportAsMemberStatus(OtherData);
   }
   
   /// Return an abstraction pattern for a value that is discarded after being
@@ -664,8 +662,7 @@ public:
   /// The based abstraction pattern must be either opaque or based on
   /// a Clang or Swift type.  That is, it cannot be a tuple or an ObjC
   /// method type.
-  static AbstractionPattern getOptional(AbstractionPattern objectPattern,
-                                        OptionalTypeKind optionalKind);
+  static AbstractionPattern getOptional(AbstractionPattern objectPattern);
 
   /// Does this abstraction pattern have something that can be used as a key?
   bool hasCachingKey() const {
@@ -705,34 +702,9 @@ public:
 
   /// Is this an interface type that is subject to a concrete
   /// same-type constraint?
-  bool isConcreteType(ModuleDecl &module) const {
-    assert(isTypeParameter());
-    return (getKind() != Kind::Opaque &&
-            GenericSig != nullptr &&
-            GenericSig->isConcreteType(getType(), module));
-  }
+  bool isConcreteType() const;
 
-  bool requiresClass(ModuleDecl &module) {
-    switch (getKind()) {
-    case Kind::Opaque:
-      return false;
-    case Kind::Type:
-    case Kind::Discard: {
-      auto type = getType();
-      if (auto archetype = dyn_cast<ArchetypeType>(type))
-        return archetype->requiresClass();
-      else if (isa<DependentMemberType>(type) ||
-               isa<GenericTypeParamType>(type)) {
-        assert(GenericSig &&
-               "Dependent type in pattern without generic signature?");
-        return GenericSig->requiresClass(type, module);
-      }
-      return false;
-    }
-    default:
-      return false;
-    }
-  }
+  bool requiresClass();
 
   /// Return the Swift type which provides structure for this
   /// abstraction pattern.
@@ -1047,7 +1019,7 @@ public:
 
   /// Given that the value being abstracted is optional, return the
   /// abstraction pattern for its object type.
-  AbstractionPattern getAnyOptionalObjectType() const;
+  AbstractionPattern getOptionalObjectType() const;
 
   /// If this pattern refers to a reference storage type, look through
   /// it.

@@ -12,9 +12,12 @@
 
 #include "IRGenMangler.h"
 #include "swift/AST/ExistentialLayout.h"
+#include "swift/AST/IRGenOptions.h"
 #include "swift/Demangling/ManglingMacros.h"
 #include "swift/Demangling/Demangle.h"
-#include "swift/Runtime/Metadata.h"
+#include "swift/ABI/MetadataValues.h"
+#include "swift/ClangImporter/ClangModule.h"
+#include "llvm/Support/SaveAndRestore.h"
 
 using namespace swift;
 using namespace irgen;
@@ -42,7 +45,8 @@ std::string IRGenMangler::mangleValueWitness(Type type, ValueWitness witness) {
     GET_MANGLING(AssignWithCopy) \
     GET_MANGLING(InitializeWithTake) \
     GET_MANGLING(AssignWithTake) \
-    GET_MANGLING(InitializeBufferWithTakeOfBuffer) \
+    GET_MANGLING(GetEnumTagSinglePayload) \
+    GET_MANGLING(StoreEnumTagSinglePayload) \
     GET_MANGLING(StoreExtraInhabitant) \
     GET_MANGLING(GetExtraInhabitantIndex) \
     GET_MANGLING(GetEnumTag) \
@@ -74,15 +78,36 @@ std::string IRGenMangler::manglePartialApplyForwarder(StringRef FuncName) {
   return finalize();
 }
 
-std::string IRGenMangler::mangleTypeForReflection(Type Ty,
-                                                  ModuleDecl *Module,
-                                                  bool isSingleFieldOfBox) {
-  Mod = Module;
+SymbolicMangling
+IRGenMangler::mangleTypeForReflection(IRGenModule &IGM,
+                                      Type Ty) {
+  Mod = IGM.getSwiftModule();
   OptimizeProtocolNames = false;
+
+  llvm::SaveAndRestore<std::function<bool (const DeclContext *)>>
+    SymbolicReferencesForLocalTypes(CanSymbolicReference);
+  
+  if (IGM.CurSourceFile
+      && !isa<ClangModuleUnit>(IGM.CurSourceFile)
+      && !IGM.getOptions().IntegratedREPL) {
+    CanSymbolicReference = [&](const DeclContext *dc) -> bool {
+      // Symbolically reference types that are defined in the same file unit
+      // as we're referencing from.
+      //
+      // We could eventually improve this to reference any type that ends
+      // up with its nominal type descriptor in the same linked binary as us,
+      // but IRGen doesn't know that with much certainty currently.
+      return dc->getModuleScopeContext() == IGM.CurSourceFile
+        && isa<NominalTypeDecl>(dc)
+        && !isa<ProtocolDecl>(dc);
+    };
+  }
+  
+  SymbolicReferences.clear();
+  
   appendType(Ty);
-  if (isSingleFieldOfBox)
-    appendOperator("Xb");
-  return finalize();
+  
+  return {finalize(), std::move(SymbolicReferences)};
 }
 
 std::string IRGenMangler::mangleTypeForLLVMTypeName(CanType Ty) {
@@ -90,7 +115,7 @@ std::string IRGenMangler::mangleTypeForLLVMTypeName(CanType Ty) {
   // don't start with a digit and don't need to be quoted.
   Buffer << 'T';
   if (auto P = dyn_cast<ProtocolType>(Ty)) {
-    appendProtocolName(P->getDecl());
+    appendProtocolName(P->getDecl(), /*allowStandardSubstitution=*/false);
     appendOperator("P");
   } else {
     appendType(Ty);
@@ -116,19 +141,17 @@ mangleProtocolForLLVMTypeName(ProtocolCompositionType *type) {
       if (i == 0)
         appendOperator("_");
     }
-    if (layout.superclass) {
-      auto superclassTy = layout.superclass;
-
+    if (auto superclass = layout.explicitSuperclass) {
       // We share type infos for different instantiations of a generic type
       // when the archetypes have the same exemplars.  We cannot mangle
       // archetypes, and the mangling does not have to be unique, so we just
       // mangle the unbound generic form of the type.
-      if (superclassTy->hasArchetype()) {
-        superclassTy = superclassTy->getClassOrBoundGenericClass()
+      if (superclass->hasArchetype()) {
+        superclass = superclass->getClassOrBoundGenericClass()
           ->getDeclaredType();
       }
 
-      appendType(CanType(superclassTy));
+      appendType(CanType(superclass));
       appendOperator("Xc");
     } else if (layout.getLayoutConstraint()) {
       appendOperator("Xl");
@@ -136,5 +159,25 @@ mangleProtocolForLLVMTypeName(ProtocolCompositionType *type) {
       appendOperator("p");
     }
   }
+  return finalize();
+}
+
+std::string IRGenMangler::
+mangleSymbolNameForSymbolicMangling(const SymbolicMangling &mangling) {
+  beginManglingWithoutPrefix();
+  static const char prefix[] = "symbolic ";
+  Buffer << prefix << mangling.String;
+  auto prefixLen = sizeof(prefix) - 1;
+
+  for (auto &symbol : mangling.SymbolicReferences) {
+    // Fill in the placeholder space with something printable.
+    auto dc = symbol.first;
+    auto offset = symbol.second;
+    Storage[prefixLen + offset] = Storage[prefixLen + offset+1] =
+      Storage[prefixLen + offset+2] = Storage[prefixLen + offset+3] = '_';
+    Buffer << ' ';
+    appendContext(dc);
+  }
+  
   return finalize();
 }

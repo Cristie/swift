@@ -1,4 +1,4 @@
-// RUN: %target-run-simple-swift
+// RUN: %target-run-simple-swift-swift3
 // REQUIRES: executable_test
 
 // REQUIRES: objc_interop
@@ -163,8 +163,8 @@ FoundationTestSuite.test("RangeConversion") {
   expectEqual("{0, 5}", NSStringFromRange(nsrFromPartial))
 
   let s = "Hello, 🌎!"
-  let b = s.index(of: ",")!
-  let e = s.index(of: "!")!
+  let b = s.firstIndex(of: ",")!
+  let e = s.firstIndex(of: "!")!
   let nsr = NSRange(b..<e, in: s)
   expectEqual(nsr.location, 5)
   expectEqual(nsr.length, 4)
@@ -177,6 +177,14 @@ FoundationTestSuite.test("RangeConversion") {
   let nsrFrom = NSRange(b..., in: s)
   expectEqual(nsrFrom.location,5)
   expectEqual(nsrFrom.length, 5)
+  
+  expectNil(Range(NSRange(location: 100, length: 0), in: s))
+  expectNil(Range(NSRange(location: 0, length: 100), in: s))
+  
+  let empty = ""
+  expectNil(Range(NSRange(location: 1, length: 0), in: empty))  
+  expectNil(Range(NSRange(location: 0, length: 1), in: empty))
+  expectNotNil(Range(NSRange(location: 0, length: 0), in: empty))
 
   // FIXME: enable once indices conform to RangeExpression
   // let nsrFull = NSRange(s.indices, in: s)
@@ -244,7 +252,7 @@ FoundationTestSuite.test("DarwinBoolean smoke test") {
   let _: CFArrayEqualCallBack = { DarwinBoolean($0 == $1) }
 }
 
-#if os(OSX)
+#if os(macOS)
 FoundationTestSuite.test("NSRectEdge/constants") {
   // Check that the following constants have the correct type and value.
   //

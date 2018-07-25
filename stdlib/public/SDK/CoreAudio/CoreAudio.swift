@@ -41,9 +41,10 @@ extension AudioBuffer {
     _ typedBuffer: UnsafeMutableBufferPointer<Element>,
     numberOfChannels: Int
   ) {
-    self.mNumberChannels = UInt32(numberOfChannels)
-    self.mData = UnsafeMutableRawPointer(typedBuffer.baseAddress)
-    self.mDataByteSize = UInt32(typedBuffer.count * MemoryLayout<Element>.stride)
+    let byteSize = typedBuffer.count * MemoryLayout<Element>.stride
+    self.init(mNumberChannels: UInt32(numberOfChannels),
+              mDataByteSize: UInt32(byteSize),
+              mData: UnsafeMutableRawPointer(typedBuffer.baseAddress))
   }
 }
 
@@ -51,7 +52,7 @@ extension AudioBufferList {
   /// - Returns: the size in bytes of an `AudioBufferList` that can hold up to
   ///   `maximumBuffers` `AudioBuffer`s.
   public static func sizeInBytes(maximumBuffers: Int) -> Int {
-    _precondition(maximumBuffers >= 1,
+    precondition(maximumBuffers >= 1,
       "AudioBufferList should contain at least one AudioBuffer")
     return MemoryLayout<AudioBufferList>.size +
       (maximumBuffers - 1) * MemoryLayout<AudioBuffer>.stride
@@ -68,7 +69,7 @@ extension AudioBufferList {
     -> UnsafeMutableAudioBufferListPointer {
     let byteSize = sizeInBytes(maximumBuffers: maximumBuffers)
     let ablMemory = calloc(byteSize, 1)
-    _precondition(ablMemory != nil,
+    precondition(ablMemory != nil,
       "failed to allocate memory for an AudioBufferList")
 
     let listPtr = ablMemory!.bindMemory(to: AudioBufferList.self, capacity: 1)
@@ -135,7 +136,9 @@ public struct UnsafeMutableAudioBufferListPointer {
 extension UnsafeMutableAudioBufferListPointer
   : MutableCollection, RandomAccessCollection {
 
+  public typealias Element = AudioBuffer
   public typealias Index = Int
+  public typealias Indices = Range<Int>
 
   /// Always zero, which is the index of the first `AudioBuffer`.
   public var startIndex: Int {
@@ -148,29 +151,17 @@ extension UnsafeMutableAudioBufferListPointer
   }
 
   /// Access an indexed `AudioBuffer` (`mBuffers[i]`).
-  public subscript(index: Int) -> AudioBuffer {
+  public subscript(index: Index) -> Element {
     get {
-      _precondition(index >= 0 && index < self.count,
+      precondition(index >= 0 && index < self.count,
         "subscript index out of range")
       return (_audioBuffersPointer + index).pointee
     }
     nonmutating set(newValue) {
-      _precondition(index >= 0 && index < self.count,
+      precondition(index >= 0 && index < self.count,
         "subscript index out of range")
       (_audioBuffersPointer + index).pointee = newValue
     }
   }
-
-  public subscript(bounds: Range<Int>)
-    -> MutableRandomAccessSlice<UnsafeMutableAudioBufferListPointer> {
-    get {
-      return MutableRandomAccessSlice(base: self, bounds: bounds)
-    }
-    set {
-      _writeBackMutableSlice(&self, bounds: bounds, slice: newValue)
-    }
-  }
-
-  public typealias Indices = CountableRange<Int>
 }
 

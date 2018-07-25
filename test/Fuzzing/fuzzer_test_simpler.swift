@@ -3,11 +3,12 @@
 // CHECK: Crash!
 // REQUIRES: CPU=x86_64
 // REQUIRES: executable_test
+// REQUIRES: fuzzer_runtime
 // XFAIL: OS=ios
 // XFAIL: OS=tvos
 // XFAIL: OS=watchos
 
-#if os(OSX) || os(iOS)
+#if os(macOS) || os(iOS)
 import Darwin
 #elseif os(Linux) || os(FreeBSD) || os(PS4) || os(Android) || os(Cygwin)
 import Glibc

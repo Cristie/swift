@@ -205,14 +205,21 @@ unsigned SourceManager::findBufferContainingLoc(SourceLoc Loc) const {
   llvm_unreachable("no buffer containing location found");
 }
 
-void SourceLoc::printLineAndColumn(raw_ostream &OS,
-                                   const SourceManager &SM) const {
+void SourceRange::widen(SourceRange Other) {
+  if (Other.Start.Value.getPointer() < Start.Value.getPointer())
+    Start = Other.Start;
+  if (Other.End.Value.getPointer() > End.Value.getPointer())
+    End = Other.End;
+}
+
+void SourceLoc::printLineAndColumn(raw_ostream &OS, const SourceManager &SM,
+                                   unsigned BufferID) const {
   if (isInvalid()) {
     OS << "<invalid loc>";
     return;
   }
 
-  auto LineAndCol = SM.getLineAndColumn(*this);
+  auto LineAndCol = SM.getLineAndColumn(*this, BufferID);
   OS << "line:" << LineAndCol.first << ':' << LineAndCol.second;
 }
 

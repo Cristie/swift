@@ -14,23 +14,28 @@
 // whether a given type conforms to a given protocol.
 //===----------------------------------------------------------------------===//
 
+#include "TypeCheckProtocol.h"
 #include "ConstraintSystem.h"
 #include "DerivedConformances.h"
 #include "MiscDiagnostics.h"
 #include "TypeChecker.h"
+#include "TypeCheckAvailability.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/Basic/StringExtras.h"
+#include "swift/Basic/Statistic.h"
 #include "swift/AST/AccessScope.h"
 #include "swift/AST/GenericSignatureBuilder.h"
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/ASTMangler.h"
 #include "swift/AST/ASTPrinter.h"
+#include "swift/AST/ClangModuleLoader.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/ExistentialLayout.h"
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/GenericSignature.h"
 #include "swift/AST/NameLookup.h"
 #include "swift/AST/ParameterList.h"
+#include "swift/AST/PrettyStackTrace.h"
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/ReferencedNameTracker.h"
 #include "swift/AST/TypeMatcher.h"
@@ -39,7 +44,6 @@
 #include "swift/ClangImporter/ClangModule.h"
 #include "swift/Sema/IDETypeChecking.h"
 #include "swift/Serialization/SerializedModuleLoader.h"
-#include "llvm/ADT/ScopedHashTable.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Support/Compiler.h"
@@ -49,357 +53,9 @@
 #define DEBUG_TYPE "Protocol conformance checking"
 #include "llvm/Support/Debug.h"
 
-STATISTIC(NumRequirementEnvironments, "# of requirement environments");
-
 using namespace swift;
 
 namespace {
-  struct RequirementMatch;
-  struct RequirementCheck;
-
-  /// Describes the environment of a requirement that will be used when
-  /// matching witnesses against the requirement and to form the resulting
-  /// \c Witness value.
-  ///
-  /// The produced generic environment will have a fresh set of archetypes that
-  /// describe the combined constraints of the requirement (because those
-  /// are available to all potential witnesses) as well as the constraints from
-  /// the context to which the protocol conformance is ascribed, which may
-  /// include additional constraints beyond those of the extended type if the
-  /// conformance is conditional. The type parameters for the generic
-  /// environment are the type parameters of the conformance context
-  /// (\c conformanceDC) with another (deeper) level of type parameters for
-  /// generic requirements. See the \c Witness class for more information about
-  /// this synthetic environment.
-  class RequirementEnvironment {
-    /// A generic signature that combines the generic parameters of the
-    /// concrete conforming type with the generic parameters of the
-    /// requirement.
-    ///
-    ///
-    /// For example, if you have:
-    ///
-    /// protocol P { func f<T>(_: T) }
-    /// struct S<A, B> : P { func f<T>(_: T) }
-    ///
-    /// The requirement and witness signatures are, respectively:
-    ///
-    /// <Self : P, T>
-    /// <A, B, T>
-    ///
-    /// The synthetic signature in this case is just the witness signature.
-    ///
-    /// It may be that the witness is more generic than the requirement,
-    /// for example:
-    ///
-    /// protocol P { func f(_: Int) }
-    /// struct S<A, B> : P { func f<T>(_: T) { } }
-    ///
-    /// Here, the requirement signature and witness signatures are:
-    ///
-    /// <Self : P>
-    /// <A, B, T>
-    ///
-    /// The synthetic signature is just:
-    ///
-    /// <A, B>
-    ///
-    /// The witness thunk emitted by SILGen uses the synthetic signature.
-    /// Therefore one invariant we preserve is that the witness thunk is
-    /// ABI compatible with the requirement's function type.
-    GenericSignature *syntheticSignature = nullptr;
-    GenericEnvironment *syntheticEnvironment = nullptr;
-
-    /// The generic signature of the protocol requirement member.
-    GenericSignature *reqSig = nullptr;
-
-    /// A substitution map mapping the requirement signature to the
-    /// generic parameters of the synthetic signature.
-    SubstitutionMap reqToSyntheticEnvMap;
-
-  public:
-    /// Create a new environment for matching the given requirement within a
-    /// particular conformance.
-    ///
-    /// \param conformanceDC The \c DeclContext to which the protocol
-    /// conformance is ascribed, which provides additional constraints.
-    ///
-    /// \param req The requirement for which we are creating a generic
-    /// environment.
-    ///
-    /// \param conformance The protocol conformance, or null if there is no
-    /// conformance (because we're finding default implementations).
-    RequirementEnvironment(TypeChecker &tc,
-                           DeclContext *conformanceDC,
-                           ValueDecl *req,
-                           ProtocolConformance *conformance);
-
-    /// Retrieve the synthetic generic environment.
-    GenericEnvironment *getSyntheticEnvironment() const {
-      return syntheticEnvironment;
-    }
-
-    /// Retrieve the generic signature of the requirement.
-    const GenericSignature *getRequirementSignature() const {
-      return reqSig;
-    }
-
-    /// Retrieve the substitution map that maps the interface types of the
-    /// requirement to the interface types of the synthetic environment.
-    const SubstitutionMap &getRequirementToSyntheticMap() const {
-      return reqToSyntheticEnvMap;
-    }
-  };
-
-  class WitnessChecker {
-  protected:
-    TypeChecker &TC;
-    ProtocolDecl *Proto;
-    Type Adoptee;
-    // The conforming context, either a nominal type or extension.
-    DeclContext *DC;
-
-    // An auxiliary lookup table to be used for witnesses remapped via
-    // @_implements(Protocol, DeclName)
-    llvm::DenseMap<DeclName, llvm::TinyPtrVector<ValueDecl *>> ImplementsTable;
-
-    WitnessChecker(TypeChecker &tc, ProtocolDecl *proto,
-                   Type adoptee, DeclContext *dc)
-      : TC(tc), Proto(proto), Adoptee(adoptee), DC(dc) {
-      if (auto N = DC->getAsNominalTypeOrNominalTypeExtensionContext()) {
-        for (auto D : N->getMembers()) {
-          if (auto V = dyn_cast<ValueDecl>(D)) {
-            if (!V->hasName())
-              continue;
-            if (auto A = V->getAttrs().getAttribute<ImplementsAttr>()) {
-              A->getMemberName().addToLookupTable(ImplementsTable, V);
-            }
-          }
-        }
-      }
-    }
-
-    /// Gather the value witnesses for the given requirement.
-    ///
-    /// \param ignoringNames If non-null and there are no value
-    /// witnesses with the correct full name, the results will reflect
-    /// lookup for just the base name and the pointee will be set to
-    /// \c true.
-    SmallVector<ValueDecl *, 4> lookupValueWitnesses(ValueDecl *req,
-                                                     bool *ignoringNames);
-
-    void lookupValueWitnessesViaImplementsAttr(ValueDecl *req,
-                                               SmallVector<ValueDecl *, 4>
-                                               &witnesses);
-
-    bool findBestWitness(ValueDecl *requirement,
-                         bool *ignoringNames,
-                         NormalProtocolConformance *conformance,
-                         const RequirementEnvironment &reqEnvironment,
-                         SmallVectorImpl<RequirementMatch> &matches,
-                         unsigned &numViable,
-                         unsigned &bestIdx,
-                         bool &doNotDiagnoseMatches);
-
-    bool checkWitnessAccess(AccessScope &requiredAccessScope,
-                            ValueDecl *requirement,
-                            ValueDecl *witness,
-                            bool *isSetter);
-
-    bool checkWitnessAvailability(ValueDecl *requirement,
-                                  ValueDecl *witness,
-                                  AvailabilityContext *requirementInfo);
-
-    RequirementCheck checkWitness(AccessScope requiredAccessScope,
-                                  ValueDecl *requirement,
-                                  RequirementMatch match);
-  };
-
-  /// \brief The result of matching a particular declaration to a given
-  /// requirement.
-  enum class MatchKind : unsigned char {
-    /// \brief The witness matched the requirement exactly.
-    ExactMatch,
-
-    /// \brief There is a difference in optionality.
-    OptionalityConflict,
-
-    /// \brief The witness matched the requirement with some renaming.
-    RenamedMatch,
-
-    /// \brief The witness is invalid or has an invalid type.
-    WitnessInvalid,
-
-    /// \brief The kind of the witness and requirement differ, e.g., one
-    /// is a function and the other is a variable.
-    KindConflict,
-
-    /// \brief The types conflict.
-    TypeConflict,
-
-    /// The witness throws, but the requirement does not.
-    ThrowsConflict,
-
-    /// \brief The witness did not match due to static/non-static differences.
-    StaticNonStaticConflict,
-    
-    /// \brief The witness is not settable, but the requirement is.
-    SettableConflict,
-
-    /// \brief The witness did not match due to prefix/non-prefix differences.
-    PrefixNonPrefixConflict,
-
-    /// \brief The witness did not match due to postfix/non-postfix differences.
-    PostfixNonPostfixConflict,
-    
-    /// \brief The witness did not match because of mutating conflicts.
-    MutatingConflict,
-    
-    /// \brief The witness did not match because of nonmutating conflicts.
-    NonMutatingConflict,
-    
-    /// \brief The witness did not match because of __consuming conflicts.
-    ConsumingConflict,
-
-    /// The witness is not rethrows, but the requirement is.
-    RethrowsConflict,
-
-    /// The witness is explicitly @nonobjc but the requirement is @objc.
-    NonObjC,
-  };
-
-  /// Describes the kind of optional adjustment performed when
-  /// comparing two types.
-  enum class OptionalAdjustmentKind {
-    // No adjustment required.
-    None,
-
-    /// The witness can produce a 'nil' that won't be handled by
-    /// callers of the requirement. This is a type-safety problem.
-    ProducesUnhandledNil,
-
-    /// Callers of the requirement can provide 'nil', but the witness
-    /// does not handle it. This is a type-safety problem.
-    ConsumesUnhandledNil,
-
-    /// The witness handles 'nil', but won't ever be given a 'nil'.
-    /// This is not a type-safety problem.
-    WillNeverConsumeNil,
-      
-    /// Callers of the requirement can expect to receive 'nil', but
-    /// the witness will never produce one. This is not a type-safety
-    /// problem.
-    WillNeverProduceNil,
-
-    /// The witness has an IUO that can be removed, because the
-    /// protocol doesn't need it. This is not a type-safety problem.
-    RemoveIUO,
-
-    /// The witness has an IUO that should be translated into a true
-    /// optional. This is not a type-safety problem.
-    IUOToOptional,
-  };
-
-  /// Once a witness has been found, there are several reasons it may
-  /// not be usable.
-  enum class CheckKind : unsigned {
-    /// The witness is OK.
-    Success,
-
-    /// The witness is less accessible than the requirement.
-    Access,
-
-    /// The witness is storage whose setter is less accessible than the
-    /// requirement.
-    AccessOfSetter,
-
-    /// The witness is less available than the requirement.
-    Availability,
-
-    /// The requirement was marked explicitly unavailable.
-    Unavailable,
-
-    /// The witness requires optional adjustments.
-    OptionalityConflict,
-
-    /// The witness is a constructor which is more failable than the
-    /// requirement.
-    ConstructorFailability,
-
-    /// The witness itself is inaccessible.
-    WitnessUnavailable,
-  };
-
-  /// Describes an optional adjustment made to a witness.
-  class OptionalAdjustment {
-    /// The kind of adjustment.
-    unsigned Kind : 16;
-
-    /// Whether this is a parameter adjustment (with an index) vs. a
-    /// result or value type adjustment (no index needed).
-    unsigned IsParameterAdjustment : 1;
-
-    /// The adjustment index, for parameter adjustments.
-    unsigned ParameterAdjustmentIndex : 15;
-
-  public:
-    /// Create a non-parameter optional adjustment.
-    explicit OptionalAdjustment(OptionalAdjustmentKind kind) 
-      : Kind(static_cast<unsigned>(kind)), IsParameterAdjustment(false),
-        ParameterAdjustmentIndex(0) { }
-
-    /// Create an optional adjustment to a parameter.
-    OptionalAdjustment(OptionalAdjustmentKind kind,
-                       unsigned parameterIndex)
-      : Kind(static_cast<unsigned>(kind)), IsParameterAdjustment(true),
-        ParameterAdjustmentIndex(parameterIndex) { }
-
-    /// Determine the kind of optional adjustment.
-    OptionalAdjustmentKind getKind() const { 
-      return static_cast<OptionalAdjustmentKind>(Kind);
-    }
-
-    /// Determine whether this is a parameter adjustment.
-    bool isParameterAdjustment() const {
-      return IsParameterAdjustment;
-    }
-
-    /// Return the index of a parameter adjustment.
-    unsigned getParameterIndex() const {
-      assert(isParameterAdjustment() && "Not a parameter adjustment");
-      return ParameterAdjustmentIndex;
-    }
-
-    /// Determines whether the optional adjustment is an error.
-    bool isError() const {
-      switch (getKind()) {
-      case OptionalAdjustmentKind::None:
-        return false;
-
-      case OptionalAdjustmentKind::ProducesUnhandledNil:
-      case OptionalAdjustmentKind::ConsumesUnhandledNil:
-        return true;
-
-      case OptionalAdjustmentKind::WillNeverConsumeNil:
-      case OptionalAdjustmentKind::WillNeverProduceNil:
-      case OptionalAdjustmentKind::RemoveIUO:
-      case OptionalAdjustmentKind::IUOToOptional:
-        // Warnings at most.
-        return false;
-      }
-
-      llvm_unreachable("Unhandled OptionalAdjustmentKind in switch.");
-    }
-
-    /// Retrieve the source location at which the optional is
-    /// specified or would be inserted.
-    SourceLoc getOptionalityLoc(ValueDecl *witness) const;
-
-    /// Retrieve the optionality location for the given type
-    /// representation.
-    SourceLoc getOptionalityLoc(TypeRepr *tyR) const;
-  };
-
   /// Whether any of the given optional adjustments is an error (vs. a
   /// warning).
   bool hasAnyError(ArrayRef<OptionalAdjustment> adjustments) {
@@ -409,171 +65,42 @@ namespace {
 
     return false;
   }
+}
 
-  /// \brief Describes a match between a requirement and a witness.
-  struct RequirementMatch {
-    RequirementMatch(ValueDecl *witness, MatchKind kind)
-      : Witness(witness), Kind(kind), WitnessType() {
-      assert(!hasWitnessType() && "Should have witness type");
-    }
+/// \brief Describes the suitability of the chosen witness for
+/// the requirement.
+struct swift::RequirementCheck {
+  CheckKind Kind;
 
-    RequirementMatch(ValueDecl *witness, MatchKind kind,
-                     Type witnessType,
-                     ArrayRef<OptionalAdjustment> optionalAdjustments = {})
-      : Witness(witness), Kind(kind), WitnessType(witnessType),
-        OptionalAdjustments(optionalAdjustments.begin(),
-                            optionalAdjustments.end())
-    {
-      assert(hasWitnessType() == !witnessType.isNull() &&
-             "Should (or should not) have witness type");
-    }
+  /// The required access scope, if the check failed due to the
+  /// witness being less accessible than the requirement.
+  AccessScope RequiredAccessScope;
 
-    /// \brief The witness that matches the (implied) requirement.
-    ValueDecl *Witness;
-    
-    /// \brief The kind of match.
-    MatchKind Kind;
+  /// The required availability, if the check failed due to the
+  /// witness being less available than the requirement.
+  AvailabilityContext RequiredAvailability;
 
-    /// \brief The type of the witness when it is referenced.
-    Type WitnessType;
+  RequirementCheck(CheckKind kind)
+    : Kind(kind), RequiredAccessScope(AccessScope::getPublic()),
+      RequiredAvailability(AvailabilityContext::alwaysAvailable()) { }
 
-    /// The set of optional adjustments performed on the witness.
-    SmallVector<OptionalAdjustment, 2> OptionalAdjustments;
+  RequirementCheck(CheckKind kind, AccessScope requiredAccessScope)
+    : Kind(kind), RequiredAccessScope(requiredAccessScope),
+      RequiredAvailability(AvailabilityContext::alwaysAvailable()) { }
 
-    /// \brief Determine whether this match is viable.
-    bool isViable() const {
-      switch(Kind) {
-      case MatchKind::ExactMatch:
-      case MatchKind::OptionalityConflict:
-      case MatchKind::RenamedMatch:
-        return true;
+  RequirementCheck(CheckKind kind, AvailabilityContext requiredAvailability)
+    : Kind(kind), RequiredAccessScope(AccessScope::getPublic()),
+      RequiredAvailability(requiredAvailability) { }
+};
 
-      case MatchKind::WitnessInvalid:
-      case MatchKind::KindConflict:
-      case MatchKind::TypeConflict:
-      case MatchKind::StaticNonStaticConflict:
-      case MatchKind::SettableConflict:
-      case MatchKind::PrefixNonPrefixConflict:
-      case MatchKind::PostfixNonPostfixConflict:
-      case MatchKind::MutatingConflict:
-      case MatchKind::NonMutatingConflict:
-      case MatchKind::ConsumingConflict:
-      case MatchKind::RethrowsConflict:
-      case MatchKind::ThrowsConflict:
-      case MatchKind::NonObjC:
-        return false;
-      }
+swift::Witness RequirementMatch::getWitness(ASTContext &ctx) const {
+  auto syntheticEnv = ReqEnv->getSyntheticEnvironment();
+  return swift::Witness(this->Witness, WitnessSubstitutions,
+                        syntheticEnv, ReqEnv->getRequirementToSyntheticMap());
+}
 
-      llvm_unreachable("Unhandled MatchKind in switch.");
-    }
-
-    /// \brief Determine whether this requirement match has a witness type.
-    bool hasWitnessType() const {
-      switch(Kind) {
-      case MatchKind::ExactMatch:
-      case MatchKind::RenamedMatch:
-      case MatchKind::TypeConflict:
-      case MatchKind::OptionalityConflict:
-        return true;
-
-      case MatchKind::WitnessInvalid:
-      case MatchKind::KindConflict:
-      case MatchKind::StaticNonStaticConflict:
-      case MatchKind::SettableConflict:
-      case MatchKind::PrefixNonPrefixConflict:
-      case MatchKind::PostfixNonPostfixConflict:
-      case MatchKind::MutatingConflict:
-      case MatchKind::NonMutatingConflict:
-      case MatchKind::ConsumingConflict:
-      case MatchKind::RethrowsConflict:
-      case MatchKind::ThrowsConflict:
-      case MatchKind::NonObjC:
-        return false;
-      }
-
-      llvm_unreachable("Unhandled MatchKind in switch.");
-    }
-
-    SmallVector<Substitution, 2> WitnessSubstitutions;
-
-    swift::Witness getWitness(ASTContext &ctx,
-                              RequirementEnvironment &&reqEnvironment) const {
-      SmallVector<Substitution, 2> syntheticSubs;
-      auto syntheticEnv = reqEnvironment.getSyntheticEnvironment();
-      reqEnvironment.getRequirementSignature()->getSubstitutions(
-          reqEnvironment.getRequirementToSyntheticMap(),
-          syntheticSubs);
-      return swift::Witness(this->Witness, WitnessSubstitutions,
-                            syntheticEnv, syntheticSubs);
-    }
-
-    /// Classify the provided optionality issues for use in diagnostics.
-    /// FIXME: Enumify this
-    unsigned classifyOptionalityIssues(ValueDecl *requirement) const {
-      unsigned numParameterAdjustments = 0;
-      bool hasNonParameterAdjustment = false;
-      for (const auto &adjustment : OptionalAdjustments) {
-        if (adjustment.isParameterAdjustment())
-          ++numParameterAdjustments;
-        else
-          hasNonParameterAdjustment = true;
-      }
-
-      if (hasNonParameterAdjustment) {
-        // Both return and parameter adjustments.
-        if (numParameterAdjustments > 0)
-          return 4;
-
-        // The type of a variable.
-        if (isa<VarDecl>(requirement))
-          return 0;
-
-        // The result type of something.
-        return 1;
-      }
-
-      // Only parameter adjustments.
-      assert(numParameterAdjustments > 0 && "No adjustments?");
-      return numParameterAdjustments == 1 ? 2 : 3;
-    }
-
-    /// Add Fix-Its that correct the optionality in the witness.
-    void addOptionalityFixIts(const ASTContext &ctx,
-                              ValueDecl *witness, 
-                              InFlightDiagnostic &diag) const;
-  };
-
-  /// \brief Describes the suitability of the chosen witness for
-  /// the requirement.
-  struct RequirementCheck {
-    CheckKind Kind;
-
-    /// The required access scope, if the check failed due to the
-    /// witness being less accessible than the requirement.
-    AccessScope RequiredAccessScope;
-
-    /// The required availability, if the check failed due to the
-    /// witness being less available than the requirement.
-    AvailabilityContext RequiredAvailability;
-
-    RequirementCheck(CheckKind kind)
-      : Kind(kind), RequiredAccessScope(AccessScope::getPublic()),
-        RequiredAvailability(AvailabilityContext::alwaysAvailable()) { }
-
-    RequirementCheck(CheckKind kind, AccessScope requiredAccessScope)
-      : Kind(kind), RequiredAccessScope(requiredAccessScope),
-        RequiredAvailability(AvailabilityContext::alwaysAvailable()) { }
-
-    RequirementCheck(CheckKind kind, AvailabilityContext requiredAvailability)
-      : Kind(kind), RequiredAccessScope(AccessScope::getPublic()),
-        RequiredAvailability(requiredAvailability) { }
-  };
-} // end anonymous namespace
-
-/// If the given type is a direct reference to an associated type of
-/// the given protocol, return the referenced associated type.
-static AssociatedTypeDecl *
-getReferencedAssocTypeOfProtocol(Type type, ProtocolDecl *proto) {
+AssociatedTypeDecl *
+swift::getReferencedAssocTypeOfProtocol(Type type, ProtocolDecl *proto) {
   if (auto dependentMember = type->getAs<DependentMemberType>()) {
     if (auto assocType = dependentMember->getAssocType()) {
       if (dependentMember->getBase()->isEqual(proto->getSelfInterfaceType())) {
@@ -605,118 +132,80 @@ namespace {
    };
 } // end anonymous namespace
 
-static std::tuple<Type,Type, OptionalAdjustmentKind> 
-getTypesToCompare(ValueDecl *reqt, 
-                  Type reqtType,
-                  Type witnessType,
-                  VarianceKind variance) {  
+static std::tuple<Type, Type, OptionalAdjustmentKind>
+getTypesToCompare(ValueDecl *reqt, Type reqtType, bool reqtTypeIsIUO,
+                  Type witnessType, bool witnessTypeIsIUO,
+                  VarianceKind variance) {
+  // If the witness type is noescape but the requirement type is not,
+  // adjust the witness type to be escaping. This permits a limited form of
+  // covariance.
+  bool reqNoescapeToEscaping = false;
+  (void)adjustInferredAssociatedType(reqtType, reqNoescapeToEscaping);
+  bool witnessNoescapeToEscaping = false;
+  Type adjustedWitnessType =
+    adjustInferredAssociatedType(witnessType, witnessNoescapeToEscaping);
+  if (witnessNoescapeToEscaping && !reqNoescapeToEscaping)
+    witnessType = adjustedWitnessType;
+
   // For @objc protocols, deal with differences in the optionality.
   // FIXME: It probably makes sense to extend this to non-@objc
   // protocols as well, but this requires more testing.
   OptionalAdjustmentKind optAdjustment = OptionalAdjustmentKind::None;
-  if (reqt->isObjC()) {
-    OptionalTypeKind reqtOptKind;
-    if (Type reqtValueType
-          = reqtType->getAnyOptionalObjectType(reqtOptKind))
-      reqtType = reqtValueType;
-    OptionalTypeKind witnessOptKind;
-    if (Type witnessValueType 
-          = witnessType->getAnyOptionalObjectType(witnessOptKind))
-      witnessType = witnessValueType;
 
-    switch (reqtOptKind) {
-    case OTK_None:
-      switch (witnessOptKind) {
-      case OTK_None:
-        // Exact match is always okay.
-        break;
+  if (!reqt->isObjC())
+    return std::make_tuple(reqtType, witnessType, optAdjustment);
 
-      case OTK_Optional:
-        switch (variance) {
-        case VarianceKind::None:
-        case VarianceKind::Covariant:
-          optAdjustment = OptionalAdjustmentKind::ProducesUnhandledNil;
-          break;
+  bool reqtIsOptional = false;
+  if (Type reqtValueType = reqtType->getOptionalObjectType()) {
+    reqtIsOptional = true;
+    reqtType = reqtValueType;
+  }
+  bool witnessIsOptional = false;
+  if (Type witnessValueType = witnessType->getOptionalObjectType()) {
+    witnessIsOptional = true;
+    witnessType = witnessValueType;
+  }
 
-        case VarianceKind::Contravariant:
-          optAdjustment = OptionalAdjustmentKind::WillNeverConsumeNil;
-          break;
-        }
-        break;
+  // When the requirement is an IUO, all is permitted, because we
+  // assume that the user knows more about the signature than we
+  // have information in the protocol.
+  if (reqtTypeIsIUO)
+    return std::make_tuple(reqtType, witnessType, optAdjustment);
 
-      case OTK_ImplicitlyUnwrappedOptional:
-        optAdjustment = OptionalAdjustmentKind::RemoveIUO;
-        break;
-      }
-      break;
-
-    case OTK_Optional:
-      switch (witnessOptKind) {
-      case OTK_None:
-        switch (variance) {
-        case VarianceKind::None:
-        case VarianceKind::Contravariant:
-          optAdjustment = OptionalAdjustmentKind::ConsumesUnhandledNil;
-          break;
-
-        case VarianceKind::Covariant:
-          optAdjustment = OptionalAdjustmentKind::WillNeverProduceNil;
-          break;
-        }
-        break;
-
-      case OTK_Optional:
-        // Exact match is always okay.
-        break;
-
-      case OTK_ImplicitlyUnwrappedOptional:
+  if (reqtIsOptional) {
+    if (witnessIsOptional) {
+      if (witnessTypeIsIUO)
         optAdjustment = OptionalAdjustmentKind::IUOToOptional;
+    } else {
+      switch (variance) {
+      case VarianceKind::None:
+      case VarianceKind::Contravariant:
+        optAdjustment = OptionalAdjustmentKind::ConsumesUnhandledNil;
+        break;
+
+      case VarianceKind::Covariant:
+        optAdjustment = OptionalAdjustmentKind::WillNeverProduceNil;
         break;
       }
-      break;
+    }
+  } else if (witnessIsOptional) {
+    if (witnessTypeIsIUO) {
+      optAdjustment = OptionalAdjustmentKind::RemoveIUO;
+    } else {
+      switch (variance) {
+      case VarianceKind::None:
+      case VarianceKind::Covariant:
+        optAdjustment = OptionalAdjustmentKind::ProducesUnhandledNil;
+        break;
 
-    case OTK_ImplicitlyUnwrappedOptional:
-      // When the requirement is an IUO, all is permitted, because we
-      // assume that the user knows more about the signature than we
-      // have information in the protocol.
-      break;
+      case VarianceKind::Contravariant:
+        optAdjustment = OptionalAdjustmentKind::WillNeverConsumeNil;
+        break;
+      }
     }
   }
 
   return std::make_tuple(reqtType, witnessType, optAdjustment);
-}
-
-// Given that we're looking at a stored property, should we use the
-// mutating rules for the setter or the getter when trying to match
-// the given requirement?
-static bool shouldUseSetterRequirements(AccessorKind reqtKind) {
-  // We have cases for addressors here because we might reasonably
-  // allow them as protocol requirements someday.
-
-  switch (reqtKind) {
-  case AccessorKind::IsGetter:
-  case AccessorKind::IsAddressor:
-    return false;
-
-  case AccessorKind::IsSetter:
-  case AccessorKind::IsMutableAddressor:
-  case AccessorKind::IsMaterializeForSet:
-    return true;
-
-  case AccessorKind::NotAccessor:
-  case AccessorKind::IsWillSet:
-  case AccessorKind::IsDidSet:
-    llvm_unreachable("willSet/didSet protocol requirement?");
-  }
-  llvm_unreachable("bad accessor kind");
-}
-
-static FuncDecl *getAddressorForRequirement(AbstractStorageDecl *witness,
-                                            AccessorKind reqtKind) {
-  assert(witness->hasAddressors());
-  if (shouldUseSetterRequirements(reqtKind))
-    return witness->getMutableAddressor();
-  return witness->getAddressor();
 }
 
 // Verify that the mutating bit is correct between a protocol requirement and a
@@ -736,33 +225,78 @@ static bool checkMutating(FuncDecl *requirement, FuncDecl *witness,
     witnessMutating = (requirement->isInstanceMember() &&
                        witness->isMutating());
   else {
-    assert(requirement->isAccessor());
+    auto reqtAsAccessor = cast<AccessorDecl>(requirement);
     auto storage = cast<AbstractStorageDecl>(witnessDecl);
-    switch (storage->getStorageKind()) {
 
-    // A stored property on a value type will have a mutating setter
-    // and a non-mutating getter.
-    case AbstractStorageDecl::Stored:
-      witnessMutating = requirement->isInstanceMember() &&
-        shouldUseSetterRequirements(requirement->getAccessorKind());
+    auto isReadMutating = [&] {
+      switch (storage->getReadImpl()) {
+      case ReadImplKind::Stored:
+        return false;
+      case ReadImplKind::Address:
+        return storage->getAddressor()->isMutating();
+      case ReadImplKind::Read:
+        return storage->getReadCoroutine()->isMutating();
+      case ReadImplKind::Inherited:
+      case ReadImplKind::Get:
+        llvm_unreachable("should have a getter");
+      }
+    };
+
+    auto isStoredSetterMutating = [&] {
+      // A stored property on a value type will have a mutating setter
+      // and a non-mutating getter.
+      return reqtAsAccessor->isInstanceMember();
+    };
+
+    auto isWriteMutating = [&] {
+      switch (storage->getWriteImpl()) {
+      case WriteImplKind::Stored:
+        return isStoredSetterMutating();
+      case WriteImplKind::MutableAddress:
+        return storage->getMutableAddressor()->isMutating();
+      case WriteImplKind::Modify:
+        return storage->getModifyCoroutine()->isMutating();
+      case WriteImplKind::Immutable:
+        llvm_unreachable("asking for setter for immutable storage");
+      case WriteImplKind::Set:
+      case WriteImplKind::StoredWithObservers:
+      case WriteImplKind::InheritedWithObservers:
+        llvm_unreachable("should have a setter");
+      }
+    };
+
+    auto isReadWriteMutating = [&] {
+      switch (storage->getReadWriteImpl()) {
+      case ReadWriteImplKind::Stored:
+        return isStoredSetterMutating();
+      case ReadWriteImplKind::MutableAddress:
+        return storage->getMutableAddressor()->isMutating();
+      case ReadWriteImplKind::Modify:
+        return storage->getModifyCoroutine()->isMutating();
+      case ReadWriteImplKind::MaterializeToTemporary:
+        return isReadMutating() || isWriteMutating();
+      case ReadWriteImplKind::Immutable:
+        llvm_unreachable("asking for setter for immutable storage");
+      case ReadWriteImplKind::MaterializeForSet:
+        llvm_unreachable("should have a materializeForSet");
+      }
+    };
+
+    switch (reqtAsAccessor->getAccessorKind()) {
+    case AccessorKind::Get:
+      witnessMutating = isReadMutating();
       break;
 
-    // For an addressed property, consider the appropriate addressor.
-    case AbstractStorageDecl::Addressed: {
-      FuncDecl *addressor =
-        getAddressorForRequirement(storage, requirement->getAccessorKind());
-      witnessMutating = addressor->isMutating();
+    case AccessorKind::Set:
+      witnessMutating = isWriteMutating();
       break;
-    }
 
-    case AbstractStorageDecl::StoredWithObservers:
-    case AbstractStorageDecl::StoredWithTrivialAccessors:
-    case AbstractStorageDecl::InheritedWithObservers:
-    case AbstractStorageDecl::AddressedWithTrivialAccessors:
-    case AbstractStorageDecl::AddressedWithObservers:
-    case AbstractStorageDecl::ComputedWithMutableAddress:
-    case AbstractStorageDecl::Computed:
-      llvm_unreachable("missing witness reference for kind with accessors");
+    case AccessorKind::MaterializeForSet:
+      witnessMutating = isReadWriteMutating();
+      break;
+
+    default:
+      llvm_unreachable("unexpected accessor requirement");
     }
   }
 
@@ -816,20 +350,68 @@ static bool checkObjCWitnessSelector(TypeChecker &tc, ValueDecl *req,
   return false;
 }
 
-/// \brief Match the given witness to the given requirement.
-///
-/// \returns the result of performing the match.
-static RequirementMatch
-matchWitness(TypeChecker &tc,
+static ParameterList *getParameterList(ValueDecl *value) {
+  if (auto func = dyn_cast<AbstractFunctionDecl>(value))
+    return func->getParameters();
+
+  auto subscript = cast<SubscriptDecl>(value);
+  return subscript->getIndices();
+}
+
+// Find a standin declaration to place the diagnostic at for the
+// given accessor kind.
+static ValueDecl *getStandinForAccessor(AbstractStorageDecl *witnessStorage,
+                                        AccessorKind requirementKind) {
+  auto getExplicitAccessor = [&](AccessorKind kind) -> AccessorDecl* {
+    if (auto accessor = witnessStorage->getAccessor(kind)) {
+      if (!accessor->isImplicit())
+        return accessor;
+    }
+    return nullptr;
+  };
+
+  // If the storage actually explicitly provides that accessor, great.
+  if (auto accessor = getExplicitAccessor(requirementKind))
+    return accessor;
+
+  // If it didn't, check to see if it provides something else that corresponds
+  // to the requirement.
+  switch (requirementKind) {
+  case AccessorKind::Get:
+    if (auto addressor = getExplicitAccessor(AccessorKind::Address))
+      return addressor;
+    break;
+
+  case AccessorKind::MaterializeForSet:
+    if (auto setter = getExplicitAccessor(AccessorKind::Set))
+      return setter;
+    LLVM_FALLTHROUGH;
+
+  case AccessorKind::Set:
+    if (auto addressor = getExplicitAccessor(AccessorKind::MutableAddress))
+      return addressor;
+    break;
+
+  default:
+    break;
+  }
+
+  // Otherwise, just diagnose starting at the storage declaration itself.
+  return witnessStorage;
+}
+
+RequirementMatch
+swift::matchWitness(
+             TypeChecker &tc,
              DeclContext *dc, ValueDecl *req, ValueDecl *witness,
-             const std::function<
+             llvm::function_ref<
                      std::tuple<Optional<RequirementMatch>, Type, Type>(void)> 
-               &setup,
-             const std::function<Optional<RequirementMatch>(Type, Type)> 
-               &matchTypes,
-             const std::function<
+               setup,
+             llvm::function_ref<Optional<RequirementMatch>(Type, Type)>
+               matchTypes,
+             llvm::function_ref<
                      RequirementMatch(bool, ArrayRef<OptionalAdjustment>)
-                   > &finalize) {
+                   > finalize) {
   assert(!req->isInvalid() && "Cannot have an invalid requirement here");
 
   /// Make sure the witness is of the same kind as the requirement.
@@ -871,10 +453,6 @@ matchWitness(TypeChecker &tc,
     // Check that the mutating bit is ok.
     if (checkMutating(funcReq, funcWitness, funcWitness))
       return RequirementMatch(witness, MatchKind::MutatingConflict);
-    if (funcWitness->isNonMutating() && funcReq->isConsuming())
-      return RequirementMatch(witness, MatchKind::NonMutatingConflict);
-    if (funcWitness->isConsuming() && !funcReq->isConsuming())
-      return RequirementMatch(witness, MatchKind::ConsumingConflict);
 
     // If the requirement is rethrows, the witness must either be
     // rethrows or be non-throwing.
@@ -899,34 +477,15 @@ matchWitness(TypeChecker &tc,
         !witness->isSettable(witness->getDeclContext()))
       return RequirementMatch(witness, MatchKind::SettableConflict);
 
-    // Find a standin declaration to place the diagnostic at for the
-    // given accessor kind.
-    auto getStandinForAccessor = [&](AccessorKind kind) -> ValueDecl* {
-      // If the witness actually explicitly provided that accessor,
-      // then great.
-      if (auto accessor = witnessASD->getAccessorFunction(kind))
-        if (!accessor->isImplicit())
-          return accessor;
-
-      // If it didn't, check to see if it provides something else.
-      if (witnessASD->hasAddressors()) {
-        return getAddressorForRequirement(witnessASD, kind);
-      }
-
-      // Otherwise, just diagnose starting at the storage declaration
-      // itself.
-      return witnessASD;
-    };
-    
     // Validate that the 'mutating' bit lines up for getters and setters.
     if (checkMutating(reqASD->getGetter(), witnessASD->getGetter(),
                       witnessASD))
-      return RequirementMatch(getStandinForAccessor(AccessorKind::IsGetter),
+      return RequirementMatch(getStandinForAccessor(witnessASD, AccessorKind::Get),
                               MatchKind::MutatingConflict);
     
     if (req->isSettable(req->getDeclContext()) &&
         checkMutating(reqASD->getSetter(), witnessASD->getSetter(), witnessASD))
-      return RequirementMatch(getStandinForAccessor(AccessorKind::IsSetter),
+      return RequirementMatch(getStandinForAccessor(witnessASD, AccessorKind::Set),
                               MatchKind::MutatingConflict);
 
     // Decompose the parameters for subscript declarations.
@@ -949,7 +508,7 @@ matchWitness(TypeChecker &tc,
     Optional<RequirementMatch> result;
     std::tie(result, reqType, witnessType) = setup();
     if (result) {
-      return *result;
+      return std::move(result.getValue());
     }
   }
 
@@ -965,9 +524,13 @@ matchWitness(TypeChecker &tc,
     // Result types must match.
     // FIXME: Could allow (trivial?) subtyping here.
     if (!ignoreReturnType) {
-      auto types = getTypesToCompare(req, reqResultType, 
-                                     witnessResultType,
-                                     VarianceKind::Covariant);
+      auto reqTypeIsIUO =
+          req->getAttrs().hasAttribute<ImplicitlyUnwrappedOptionalAttr>();
+      auto witnessTypeIsIUO =
+          witness->getAttrs().hasAttribute<ImplicitlyUnwrappedOptionalAttr>();
+      auto types =
+          getTypesToCompare(req, reqResultType, reqTypeIsIUO, witnessResultType,
+                            witnessTypeIsIUO, VarianceKind::Covariant);
 
       // Record optional adjustment, if any.
       if (std::get<2>(types) != OptionalAdjustmentKind::None) {
@@ -975,9 +538,11 @@ matchWitness(TypeChecker &tc,
           OptionalAdjustment(std::get<2>(types)));
       }
 
-      if (auto result = matchTypes(std::get<0>(types), 
-                                   std::get<1>(types))) {
-        return *result;
+      if (!req->isObjC() && reqTypeIsIUO != witnessTypeIsIUO)
+        return RequirementMatch(witness, MatchKind::TypeConflict, witnessType);
+
+      if (auto result = matchTypes(std::get<0>(types), std::get<1>(types))) {
+        return std::move(result.getValue());
       }
     }
 
@@ -992,6 +557,12 @@ matchWitness(TypeChecker &tc,
       return RequirementMatch(witness, MatchKind::TypeConflict, 
                               witnessType);
 
+    ParameterList *witnessParamList = getParameterList(witness);
+    assert(witnessParamList->size() == witnessParams.size());
+
+    ParameterList *reqParamList = getParameterList(req);
+    assert(reqParamList->size() == reqParams.size());
+
     // Match each of the parameters.
     for (unsigned i = 0, n = reqParams.size(); i != n; ++i) {
       // Variadic bits must match.
@@ -999,14 +570,25 @@ matchWitness(TypeChecker &tc,
       if (reqParams[i].isVariadic() != witnessParams[i].isVariadic())
         return RequirementMatch(witness, MatchKind::TypeConflict, witnessType);
 
-      if (reqParams[i].isShared() != witnessParams[i].isShared())
+      if (reqParams[i].isInOut() != witnessParams[i].isInOut())
         return RequirementMatch(witness, MatchKind::TypeConflict, witnessType);
-      
+
+      auto reqParamDecl = reqParamList->get(i);
+      auto witnessParamDecl = witnessParamList->get(i);
+
+      auto reqParamTypeIsIUO =
+          reqParamDecl->getAttrs()
+              .hasAttribute<ImplicitlyUnwrappedOptionalAttr>();
+      auto witnessParamTypeIsIUO =
+          witnessParamDecl->getAttrs()
+              .hasAttribute<ImplicitlyUnwrappedOptionalAttr>();
+
       // Gross hack: strip a level of unchecked-optionality off both
       // sides when matching against a protocol imported from Objective-C.
-      auto types = getTypesToCompare(req, reqParams[i].getType(),
-                                     witnessParams[i].getType(),
-                                     VarianceKind::Contravariant);
+      auto types =
+          getTypesToCompare(req, reqParams[i].getType(), reqParamTypeIsIUO,
+                            witnessParams[i].getType(), witnessParamTypeIsIUO,
+                            VarianceKind::Contravariant);
 
       // Record any optional adjustment that occurred.
       if (std::get<2>(types) != OptionalAdjustmentKind::None) {
@@ -1014,13 +596,12 @@ matchWitness(TypeChecker &tc,
           OptionalAdjustment(std::get<2>(types), i));
       }
 
-      // Check whether the parameter types match.
-      if (auto result = matchTypes(std::get<0>(types), 
-                                   std::get<1>(types))) {
-        return *result;
-      }
+      if (!req->isObjC() && reqParamTypeIsIUO != witnessParamTypeIsIUO)
+        return RequirementMatch(witness, MatchKind::TypeConflict, witnessType);
 
-      // FIXME: Consider default arguments here?
+      if (auto result = matchTypes(std::get<0>(types), std::get<1>(types))) {
+        return std::move(result.getValue());
+      }
     }
 
     // If the witness is 'throws', the requirement must be.
@@ -1030,9 +611,12 @@ matchWitness(TypeChecker &tc,
     }
 
   } else {
-    // Simple case: add the constraint.
-    auto types = getTypesToCompare(req, reqType, witnessType,
-                                   VarianceKind::None);
+    auto reqTypeIsIUO =
+        req->getAttrs().hasAttribute<ImplicitlyUnwrappedOptionalAttr>();
+    auto witnessTypeIsIUO =
+        witness->getAttrs().hasAttribute<ImplicitlyUnwrappedOptionalAttr>();
+    auto types = getTypesToCompare(req, reqType, reqTypeIsIUO, witnessType,
+                                   witnessTypeIsIUO, VarianceKind::None);
 
     // Record optional adjustment, if any.
     if (std::get<2>(types) != OptionalAdjustmentKind::None) {
@@ -1040,8 +624,11 @@ matchWitness(TypeChecker &tc,
         OptionalAdjustment(std::get<2>(types)));
     }
 
+    if (!req->isObjC() && reqTypeIsIUO != witnessTypeIsIUO)
+      return RequirementMatch(witness, MatchKind::TypeConflict, witnessType);
+
     if (auto result = matchTypes(std::get<0>(types), std::get<1>(types))) {
-      return *result;
+      return std::move(result.getValue());
     }
   }
 
@@ -1049,143 +636,12 @@ matchWitness(TypeChecker &tc,
   return finalize(anyRenaming, optionalAdjustments);
 }
 
-RequirementEnvironment::RequirementEnvironment(
-                                           TypeChecker &tc,
-                                           DeclContext *conformanceDC,
-                                           ValueDecl *req,
-                                           ProtocolConformance *conformance) {
-
-  auto reqDC = req->getInnermostDeclContext();
-  reqSig = reqDC->getGenericSignatureOfContext();
-
-  ASTContext &ctx = tc.Context;
-  auto proto = cast<ProtocolDecl>(req->getDeclContext());
-
-  // Build a substitution map to replace the protocol's \c Self and the type
-  // parameters of the requirement into a combined context that provides the
-  // type parameters of the conformance context and the parameters of the
-  // requirement.
-  auto selfType = cast<GenericTypeParamType>(
-                            proto->getSelfInterfaceType()->getCanonicalType());
-
-  // Add the generic signature of the context of the conformance. This includes
-  // the generic parameters from the conforming type as well as any additional
-  // constraints that might occur on the extension that declares the
-  // conformance (i.e., if the conformance is conditional).
-  GenericSignature *conformanceSig;
-  unsigned depth = 0;
-  if ((conformanceSig = conformanceDC->getGenericSignatureOfContext())) {
-    // Use the canonical signature here.
-    conformanceSig = conformanceSig->getCanonicalSignature();
-    depth = conformanceSig->getGenericParams().back()->getDepth() + 1;
-  }
-
-  // Add the generic signature of the requirement, substituting our concrete
-  // type for 'Self'. We don't need the 'Self' requirement or parameter.
-  auto concreteType = conformanceDC->getSelfInterfaceType();
-
-  reqToSyntheticEnvMap = reqSig->getSubstitutionMap(
-    [selfType, concreteType, depth, &ctx](SubstitutableType *type) -> Type {
-      if (type->isEqual(selfType))
-        return concreteType;
-      auto *genericParam = cast<GenericTypeParamType>(type);
-      if (genericParam->getDepth() != 1)
-        return Type();
-      auto substGenericParam =
-        GenericTypeParamType::get(depth, genericParam->getIndex(), ctx);
-      return substGenericParam;
-    },
-    [selfType, concreteType, conformance, conformanceDC, &ctx](
-        CanType type, Type replacement, ProtocolType *protoType)
-          -> Optional<ProtocolConformanceRef> {
-      auto proto = protoType->getDecl();
-      if (type->isEqual(selfType)) {
-        ProtocolConformance *specialized = conformance;
-        if (conformance && conformance->getGenericSignature()) {
-          auto concreteSubs =
-            concreteType->getContextSubstitutionMap(
-              conformanceDC->getParentModule(), conformanceDC);
-          specialized =
-            ctx.getSpecializedConformance(concreteType, conformance,
-                                          concreteSubs);
-        }
-
-        if (specialized)
-          return ProtocolConformanceRef(specialized);
-      }
-
-      return ProtocolConformanceRef(proto);
-    });
-
-  // If the requirement itself is non-generic, the synthetic signature
-  // is that of the conformance context.
-  if (reqSig->getGenericParams().size() == 1 &&
-      reqSig->getRequirements().size() == 1) {
-    syntheticSignature = conformanceDC->getGenericSignatureOfContext();
-    if (syntheticSignature) {
-      syntheticSignature = syntheticSignature->getCanonicalSignature();
-      syntheticEnvironment =
-        syntheticSignature->createGenericEnvironment(
-                                     *conformanceDC->getParentModule());
-    }
-
-    return;
-  }
-
-  // Construct a generic signature builder by collecting the constraints
-  // from the requirement and the context of the conformance together,
-  // because both define the capabilities of the requirement.
-  GenericSignatureBuilder builder(
-           ctx,
-           TypeChecker::LookUpConformance(tc, conformanceDC));
-
-  if (conformanceSig) {
-    builder.addGenericSignature(conformanceSig);
-  }
-
-  // First, add the generic parameters from the requirement.
-  for (auto genericParam : reqSig->getGenericParams().slice(1)) {
-    // The only depth that makes sense is depth == 1, the generic parameters
-    // of the requirement itself. Anything else is from invalid code.
-    if (genericParam->getDepth() != 1) {
-      return;
-    }
-
-    // Create an equivalent generic parameter at the next depth.
-    auto substGenericParam =
-      GenericTypeParamType::get(depth, genericParam->getIndex(), ctx);
-
-    builder.addGenericParameter(substGenericParam);
-  }
-
-  ++NumRequirementEnvironments;
-
-  // Next, add each of the requirements (mapped from the requirement's
-  // interface types into the abstract type parameters).
-  auto source =
-    GenericSignatureBuilder::FloatingRequirementSource::forAbstract();
-  for (auto &req : reqSig->getRequirements()) {
-    builder.addRequirement(req, source, conformanceDC->getParentModule(),
-                           &reqToSyntheticEnvMap);
-  }
-
-  // Produce the generic signature and environment.
-  // FIXME: Pass in a source location for the conformance, perhaps? It seems
-  // like this could fail.
-  syntheticSignature =
-    std::move(builder).computeGenericSignature(
-                                           *conformanceDC->getParentModule(),
-                                           SourceLoc());
-  syntheticEnvironment = syntheticSignature->createGenericEnvironment(
-                                             *conformanceDC->getParentModule());
-}
-
-static RequirementMatch
-matchWitness(TypeChecker &tc,
-             ProtocolDecl *proto,
-             ProtocolConformance *conformance,
-             DeclContext *dc, ValueDecl *req, ValueDecl *witness,
-             const RequirementEnvironment &reqEnvironment) {
+RequirementMatch swift::matchWitness(TypeChecker &tc,
+                                     ProtocolDecl *proto,
+                                     ProtocolConformance *conformance,
+                                     DeclContext *dc,
+                                     ValueDecl *req,
+                                     ValueDecl *witness) {
   using namespace constraints;
 
   // Initialized by the setup operation.
@@ -1197,20 +653,79 @@ matchWitness(TypeChecker &tc,
   Type openedFullWitnessType;
   Type reqType, openedFullReqType;
 
+  auto *reqSig = req->getInnermostDeclContext()->getGenericSignatureOfContext();
+
+  ClassDecl *covariantSelf = nullptr;
+  if (witness->getDeclContext()->getAsProtocolExtensionContext()) {
+    if (auto *classDecl = dc->getAsClassOrClassExtensionContext()) {
+      if (!classDecl->isFinal()) {
+        // If the requirement's type does not involve any associated types,
+        // we use a class-constrained generic parameter as the 'Self' type
+        // in the witness thunk.
+        //
+        // This allows the following code to type check:
+        //
+        // protocol P {
+        //   func f() -> Self
+        // }
+        //
+        // extension P {
+        //   func f() { return self }
+        // }
+        //
+        // class C : P {}
+        //
+        // When we call (C() as P).f(), we want to pass the 'Self' type
+        // from the call site, not the static 'Self' type of the conformance.
+        //
+        // On the other hand, if the requirement's type contains associated
+        // types, we use the static 'Self' type, to preserve backward
+        // compatibility with code that uses this pattern:
+        //
+        // protocol P {
+        //   associatedtype T = Self
+        //   func f() -> T
+        // }
+        //
+        // extension P where Self.T == Self {
+        //   func f() -> Self { return self }
+        // }
+        //
+        // class C : P {}
+        //
+        // It would have been much nicer to just ban this completely if
+        // the class 'C' is not final, but there is a great deal of existing
+        // code out there that relies on this behavior, most commonly by
+        // defining a non-final class conforming to 'Collection' which uses
+        // the default witness for 'Collection.Iterator', which is defined
+        // as 'IndexingIterator<Self>'.
+        auto selfKind = proto->findProtocolSelfReferences(req,
+                                             /*allowCovariantParameters=*/false,
+                                             /*skipAssocTypes=*/false);
+        if (!selfKind.other) {
+          covariantSelf = classDecl;
+        }
+      }
+    }
+  }
+
+  Optional<RequirementEnvironment> reqEnvironment(
+      RequirementEnvironment(dc, reqSig, proto, covariantSelf, conformance));
+
   // Set up the constraint system for matching.
   auto setup = [&]() -> std::tuple<Optional<RequirementMatch>, Type, Type> {
     // Construct a constraint system to use to solve the equality between
     // the required type and the witness type.
     cs.emplace(tc, dc, ConstraintSystemOptions());
 
-    auto reqGenericEnv = reqEnvironment.getSyntheticEnvironment();
-    auto &reqSubMap = reqEnvironment.getRequirementToSyntheticMap();
+    auto reqGenericEnv = reqEnvironment->getSyntheticEnvironment();
+    auto reqSubMap = reqEnvironment->getRequirementToSyntheticMap();
 
     Type selfTy = proto->getSelfInterfaceType().subst(reqSubMap);
     if (reqGenericEnv)
       selfTy = reqGenericEnv->mapTypeIntoContext(selfTy);
 
-        // Open up the type of the requirement.
+    // Open up the type of the requirement.
     reqLocator = cs->getConstraintLocator(
                      static_cast<Expr *>(nullptr),
                      LocatorPathElt(ConstraintLocator::Requirement, req));
@@ -1231,7 +746,7 @@ matchWitness(TypeChecker &tc,
 
       // If substitution failed, skip the requirement. This only occurs in
       // invalid code.
-      if (!replacedInReq)
+      if (!replacedInReq || replacedInReq->hasError())
         continue;
 
       if (reqGenericEnv) {
@@ -1269,8 +784,8 @@ matchWitness(TypeChecker &tc,
   };
 
   // Match a type in the requirement to a type in the witness.
-  auto matchTypes = [&](Type reqType, Type witnessType) 
-                      -> Optional<RequirementMatch> {
+  auto matchTypes = [&](Type reqType,
+                        Type witnessType) -> Optional<RequirementMatch> {
     cs->addConstraint(ConstraintKind::Equal, reqType, witnessType, locator);
     // FIXME: Check whether this has already failed.
     return None;
@@ -1295,13 +810,14 @@ matchWitness(TypeChecker &tc,
                               : anyRenaming ? MatchKind::RenamedMatch
                                             : MatchKind::ExactMatch,
                             witnessType,
+                            std::move(reqEnvironment),
                             optionalAdjustments);
 
     // Compute the set of substitutions we'll need for the witness.
-    solution->computeSubstitutions(
-      witness->getInnermostDeclContext()->getGenericSignatureOfContext(),
-      witnessLocator,
-      result.WitnessSubstitutions);
+    auto witnessSig =
+      witness->getInnermostDeclContext()->getGenericSignatureOfContext();
+    result.WitnessSubstitutions =
+      solution->computeSubstitutions(witnessSig, witnessLocator);
     
     return result;
   };
@@ -1332,6 +848,22 @@ static bool isBetterMatch(TypeChecker &tc, DeclContext *dc,
              < static_cast<unsigned>(match2.Kind);
 
   return false;
+}
+
+WitnessChecker::WitnessChecker(TypeChecker &tc, ProtocolDecl *proto,
+                               Type adoptee, DeclContext *dc)
+    : TC(tc), Proto(proto), Adoptee(adoptee), DC(dc) {
+  if (auto N = DC->getAsNominalTypeOrNominalTypeExtensionContext()) {
+    for (auto D : N->getMembers()) {
+      if (auto V = dyn_cast<ValueDecl>(D)) {
+        if (!V->hasName())
+          continue;
+        if (auto A = V->getAttrs().getAttribute<ImplementsAttr>()) {
+          A->getMemberName().addToLookupTable(ImplementsTable, V);
+        }
+      }
+    }
+  }
 }
 
 void
@@ -1409,7 +941,6 @@ bool WitnessChecker::findBestWitness(
                                ValueDecl *requirement,
                                bool *ignoringNames,
                                NormalProtocolConformance *conformance,
-                               const RequirementEnvironment &reqEnvironment,
                                SmallVectorImpl<RequirementMatch> &matches,
                                unsigned &numViable,
                                unsigned &bestIdx,
@@ -1470,11 +1001,17 @@ bool WitnessChecker::findBestWitness(
         continue;
       }
 
-      if (!witness->hasInterfaceType())
+      if (!witness->hasValidSignature()) {
         TC.validateDecl(witness);
 
+        if (!witness->hasValidSignature()) {
+          doNotDiagnoseMatches = true;
+          continue;
+        }
+      }
+
       auto match = matchWitness(TC, Proto, conformance, DC,
-                                requirement, witness, reqEnvironment);
+                                requirement, witness);
       if (match.isViable()) {
         ++numViable;
         bestIdx = matches.size();
@@ -1541,6 +1078,8 @@ bool WitnessChecker::checkWitnessAccess(AccessScope &requiredAccessScope,
                                         bool *isSetter) {
   *isSetter = false;
 
+  // Compute the intersection of the conforming type's access scope
+  // and the protocol's access scope.
   auto scopeIntersection =
     requiredAccessScope.intersectWith(Proto->getFormalAccessScope(DC));
   assert(scopeIntersection.hasValue());
@@ -1548,7 +1087,12 @@ bool WitnessChecker::checkWitnessAccess(AccessScope &requiredAccessScope,
   requiredAccessScope = *scopeIntersection;
 
   AccessScope actualScopeToCheck = requiredAccessScope;
-  if (!witness->isAccessibleFrom(actualScopeToCheck.getDeclContext())) {
+
+  // Setting the 'forConformance' flag means that we admit witnesses in
+  // protocol extensions that we can see, but are not necessarily as
+  // visible as the conforming type and protocol.
+  if (!witness->isAccessibleFrom(actualScopeToCheck.getDeclContext(),
+                                 /*forConformance=*/true)) {
     // Special case: if we have `@testable import` of the witness's module,
     // allow the witness to match if it would have matched for just this file.
     // That is, if '@testable' allows us to see the witness here, it should
@@ -1571,7 +1115,10 @@ bool WitnessChecker::checkWitnessAccess(AccessScope &requiredAccessScope,
     *isSetter = true;
 
     auto ASD = cast<AbstractStorageDecl>(witness);
-    if (!ASD->isSetterAccessibleFrom(actualScopeToCheck.getDeclContext()))
+
+    // See above about the forConformance flag.
+    if (!ASD->isSetterAccessibleFrom(actualScopeToCheck.getDeclContext(),
+                                     /*forConformance=*/true))
       return true;
   }
 
@@ -1590,7 +1137,7 @@ checkWitnessAvailability(ValueDecl *requirement,
 RequirementCheck WitnessChecker::
 checkWitness(AccessScope requiredAccessScope,
              ValueDecl *requirement,
-             RequirementMatch match) {
+             const RequirementMatch &match) {
   if (!match.OptionalAdjustments.empty())
     return CheckKind::OptionalityConflict;
 
@@ -1648,527 +1195,461 @@ checkWitness(AccessScope requiredAccessScope,
 
 # pragma mark Witness resolution
 
-namespace {
-  /// The result of attempting to resolve a witness.
-  enum class ResolveWitnessResult {
-    /// The resolution succeeded.
-    Success,
-    /// There was an explicit witness available, but it failed some
-    /// criteria.
-    ExplicitFailed,
-    /// There was no witness available.
-    Missing
-  };
+/// This is a wrapper of multiple instances of ConformanceChecker to allow us
+/// to diagnose and fix code from a more global perspective; for instance,
+/// having this wrapper can help issue a fixit that inserts protocol stubs from
+/// multiple protocols under checking.
+class swift::MultiConformanceChecker {
+  TypeChecker &TC;
+  llvm::SmallVector<ValueDecl*, 16> UnsatisfiedReqs;
+  llvm::SmallVector<ConformanceChecker, 4> AllUsedCheckers;
+  llvm::SmallVector<NormalProtocolConformance*, 4> AllConformances;
+  llvm::SetVector<ValueDecl*> MissingWitnesses;
+  llvm::SmallPtrSet<ValueDecl *, 8> CoveredMembers;
 
-  /// Describes the result of checking a type witness.
-  ///
-  /// This class evaluates true if an error occurred.
-  class CheckTypeWitnessResult {
-    NominalTypeDecl *Nominal = nullptr;
+  /// Check one conformance.
+  ProtocolConformance * checkIndividualConformance(
+    NormalProtocolConformance *conformance, bool issueFixit);
 
-  public:
-    CheckTypeWitnessResult() { }
+  /// Determine whether the given requirement was left unsatisfied.
+  bool isUnsatisfiedReq(NormalProtocolConformance *conformance, ValueDecl *req);
+public:
+  MultiConformanceChecker(TypeChecker &TC): TC(TC){}
 
-    CheckTypeWitnessResult(NominalTypeDecl *nominal) : Nominal(nominal) {
-      assert(isa<ProtocolDecl>(nominal) || isa<ClassDecl>(nominal));
-    }
+  TypeChecker &getTypeChecker() const { return TC; }
 
-    NominalTypeDecl *getProtocolOrClass() const { return Nominal; }
-    bool isProtocol() const { return isa<ProtocolDecl>(Nominal); }
-
-    explicit operator bool() const { return Nominal != nullptr; }
-  };
-
-  /// The set of associated types that have been inferred by matching
-  /// the given value witness to its corresponding requirement.
-  struct InferredAssociatedTypesByWitness {
-    /// The witness we matched.
-    ValueDecl *Witness = nullptr;
-
-    /// The associated types inferred from matching this witness.
-    SmallVector<std::pair<AssociatedTypeDecl *, Type>, 4> Inferred;
-
-    /// Inferred associated types that don't meet the associated type
-    /// requirements.
-    SmallVector<std::tuple<AssociatedTypeDecl *, Type, CheckTypeWitnessResult>,
-                2> NonViable;
-
-    void dump(llvm::raw_ostream &out, unsigned indent) const {
-      out << "\n";
-      out.indent(indent) << "(";
-      if (Witness) {
-        Witness->dumpRef(out);
-      }
-
-      for (const auto &inferred : Inferred) {
-        out << "\n";
-        out.indent(indent + 2);
-        out << inferred.first->getName() << " := "
-            << inferred.second.getString();
-      }
-
-      for (const auto &inferred : NonViable) {
-        out << "\n";
-        out.indent(indent + 2);
-        out << std::get<0>(inferred)->getName() << " := "
-            << std::get<1>(inferred).getString();
-        if (auto nominal = std::get<2>(inferred).getProtocolOrClass())
-          out << " [failed constraint " << nominal->getName() << "]";
-      }
-
-      out << ")";
-    }
-
-    LLVM_ATTRIBUTE_DEPRECATED(void dump() const,
-                              "only for use in the debugger");
-  };
-
-  void InferredAssociatedTypesByWitness::dump() const {
-    dump(llvm::errs(), 0);
+  /// Add a conformance into the batched checker.
+  void addConformance(NormalProtocolConformance *conformance) {
+    AllConformances.push_back(conformance);
   }
 
-  /// The set of witnesses that were considered when attempting to
-  /// infer associated types.
-  typedef SmallVector<InferredAssociatedTypesByWitness, 2>
-    InferredAssociatedTypesByWitnesses;
-
-  void dumpInferredAssociatedTypesByWitnesses(
-        const InferredAssociatedTypesByWitnesses &inferred,
-        llvm::raw_ostream &out,
-        unsigned indent) {
-    for (const auto &value : inferred) {
-      value.dump(out, indent);
-    }
+  /// Peek the unsatisfied requirements collected during conformance checking.
+  ArrayRef<ValueDecl*> getUnsatisfiedRequirements() {
+    return llvm::makeArrayRef(UnsatisfiedReqs);
   }
 
-  void dumpInferredAssociatedTypesByWitnesses(
-        const InferredAssociatedTypesByWitnesses &inferred) LLVM_ATTRIBUTE_USED;
-
-  void dumpInferredAssociatedTypesByWitnesses(
-                          const InferredAssociatedTypesByWitnesses &inferred) {
-    dumpInferredAssociatedTypesByWitnesses(inferred, llvm::errs(), 0);
+  /// Whether this member is "covered" by one of the conformances.
+  bool isCoveredMember(ValueDecl *member) const {
+    return CoveredMembers.count(member) > 0;
   }
 
-  /// A mapping from requirements to the set of matches with witnesses.
-  typedef SmallVector<std::pair<ValueDecl *,
-                                InferredAssociatedTypesByWitnesses>, 4>
-    InferredAssociatedTypes;
+  /// Check all conformances and emit diagnosis globally.
+  void checkAllConformances();
+};
 
-  void dumpInferredAssociatedTypes(const InferredAssociatedTypes &inferred,
-                                   llvm::raw_ostream &out,
-                                   unsigned indent) {
-    for (const auto &value : inferred) {
-      out << "\n";
-      out.indent(indent) << "(";
-      value.first->dumpRef(out);
-      dumpInferredAssociatedTypesByWitnesses(value.second, out, indent + 2);
-      out << ")";
-    }
-    out << "\n";
-  }
+bool MultiConformanceChecker::
+isUnsatisfiedReq(NormalProtocolConformance *conformance, ValueDecl *req) {
+  if (conformance->isInvalid()) return false;
+  if (isa<TypeDecl>(req)) return false;
 
-  void dumpInferredAssociatedTypes(
-         const InferredAssociatedTypes &inferred) LLVM_ATTRIBUTE_USED;
+  auto witness = conformance->hasWitness(req)
+    ? conformance->getWitness(req, nullptr).getDecl()
+    : nullptr;
 
-  void dumpInferredAssociatedTypes(const InferredAssociatedTypes &inferred) {
-    dumpInferredAssociatedTypes(inferred, llvm::errs(), 0);
-  }
+  // An optional requirement might not have a witness...
+  if (!witness)
+    return req->getAttrs().hasAttribute<OptionalAttr>();
 
-  enum class MissingWitnessDiagnosisKind {
-    FixItOnly,
-    ErrorOnly,
-    ErrorFixIt,
-  };
+  // If the witness lands within the declaration context of the conformance,
+  // record it as a "covered" member.
+  if (witness->getDeclContext() == conformance->getDeclContext())
+    CoveredMembers.insert(witness);
 
-  /// The protocol conformance checker.
-  ///
-  /// This helper class handles most of the details of checking whether a
-  /// given type (\c Adoptee) conforms to a protocol (\c Proto).
-  class ConformanceChecker : public WitnessChecker {
-    friend class MultiConformanceChecker;
-    NormalProtocolConformance *Conformance;
-    SourceLoc Loc;
-    
-    /// Witnesses that are currently being resolved.
-    llvm::SmallPtrSet<ValueDecl *, 4> ResolvingWitnesses;
+  // The witness might come from a protocol or protocol extension.
+  if (witness->getDeclContext()
+        ->getAsProtocolOrProtocolExtensionContext())
+    return true;
 
-    /// Caches the set of associated types that are referenced in each
-    /// requirement.
-    llvm::DenseMap<ValueDecl *, llvm::SmallVector<AssociatedTypeDecl *, 2>>
-      ReferencedAssociatedTypes;
+  return false;
+}
 
-    /// Keep track of missing witnesses, either type or value, for later
-    /// diagnosis emits. This may contain witnesses that are external to the
-    /// protocol under checking.
-    llvm::SetVector<ValueDecl*> &GlobalMissingWitnesses;
+void MultiConformanceChecker::checkAllConformances() {
+  bool anyInvalid = false;
+  for (unsigned I = 0, N = AllConformances.size(); I < N; I ++) {
+    auto *conformance = AllConformances[I];
+    // Check this conformance and emit fixits if this is the last one in the pool.
+    checkIndividualConformance(conformance, I == N - 1);
+    anyInvalid |= conformance->isInvalid();
+    if (anyInvalid)
+      continue;
+    // Check whether there are any unsatisfied requirements.
+    auto proto = conformance->getProtocol();
+    for (auto member : proto->getMembers()) {
+      auto req = dyn_cast<ValueDecl>(member);
+      if (!req || !req->isProtocolRequirement()) continue;
 
-    /// Keep track of the slice in GlobalMissingWitnesses that is local to
-    /// this protocol under checking.
-    unsigned LocalMissingWitnessesStartIndex;
-
-    /// True if we shouldn't complain about problems with this conformance
-    /// right now, i.e. if methods are being called outside
-    /// checkConformance().
-    bool SuppressDiagnostics;
-
-    /// Whether we've already complained about problems with this conformance.
-    bool AlreadyComplained = false;
-
-    /// Whether we checked the requirement signature already.
-    bool CheckedRequirementSignature = false;
-
-    /// Retrieve the associated types that are referenced by the given
-    /// requirement with a base of 'Self'.
-    ArrayRef<AssociatedTypeDecl *> getReferencedAssociatedTypes(ValueDecl *req);
-
-    /// Record a (non-type) witness for the given requirement.
-    void recordWitness(ValueDecl *requirement, const RequirementMatch &match,
-                       RequirementEnvironment &&reqEnvironment);
-
-    /// Record that the given optional requirement has no witness.
-    void recordOptionalWitness(ValueDecl *requirement);
-
-    /// Record that the given requirement has no valid witness.
-    void recordInvalidWitness(ValueDecl *requirement);
-
-    /// Record a type witness.
-    ///
-    /// \param assocType The associated type whose witness is being recorded.
-    ///
-    /// \param type The witness type.
-    ///
-    /// \param typeDecl The decl the witness type came from; can be null.
-    void recordTypeWitness(AssociatedTypeDecl *assocType, Type type,
-                           TypeDecl *typeDecl, bool performRedeclarationCheck);
-
-    /// Resolve a (non-type) witness via name lookup.
-    ResolveWitnessResult resolveWitnessViaLookup(ValueDecl *requirement);
-
-    /// Resolve a (non-type) witness via derivation.
-    ResolveWitnessResult resolveWitnessViaDerivation(ValueDecl *requirement);
-
-    /// Resolve a (non-type) witness via default definition or optional.
-    ResolveWitnessResult resolveWitnessViaDefault(ValueDecl *requirement);
-
-    /// Attempt to resolve a type witness via member name lookup.
-    ResolveWitnessResult resolveTypeWitnessViaLookup(
-                           AssociatedTypeDecl *assocType);
-
-    /// Infer associated type witnesses for the given tentative
-    /// requirement/witness match.
-    InferredAssociatedTypesByWitness inferTypeWitnessesViaValueWitness(
-                                       ValueDecl *req,
-                                       ValueDecl *witness);
-
-    /// Infer associated type witnesses for the given value requirement.
-    InferredAssociatedTypesByWitnesses inferTypeWitnessesViaValueWitnesses(
-                     const llvm::SetVector<AssociatedTypeDecl *> &allUnresolved,
-                     ValueDecl *req);
-
-    /// Infer associated type witnesses for all relevant value requirements.
-    ///
-    /// \param assocTypes The set of associated types we're interested in.
-    InferredAssociatedTypes
-    inferTypeWitnessesViaValueWitnesses(
-      const llvm::SetVector<AssociatedTypeDecl *> &assocTypes);
-
-    /// Diagnose or defer a diagnostic, as appropriate.
-    ///
-    /// \param requirement The requirement with which this diagnostic is
-    /// associated, if any.
-    ///
-    /// \param isError Whether this diagnostic is an error.
-    ///
-    /// \param fn A function to call to emit the actual diagnostic. If
-    /// diagnostics are being deferred,
-    void diagnoseOrDefer(
-           ValueDecl *requirement, bool isError,
-           std::function<void(NormalProtocolConformance *)> fn);
-
-    void
-    addUsedConformances(ProtocolConformance *conformance,
-                        llvm::SmallPtrSetImpl<ProtocolConformance *> &visited);
-    void addUsedConformances(ProtocolConformance *conformance);
-
-    ArrayRef<ValueDecl*> getLocalMissingWitness() {
-      return GlobalMissingWitnesses.getArrayRef().
-        slice(LocalMissingWitnessesStartIndex,
-              GlobalMissingWitnesses.size() - LocalMissingWitnessesStartIndex);
-    }
-
-    void clearGlobalMissingWitnesses() {
-      GlobalMissingWitnesses.clear();
-      LocalMissingWitnessesStartIndex = GlobalMissingWitnesses.size();
-    }
-
-  public:
-    /// Call this to diagnose currently known missing witnesses.
-    void diagnoseMissingWitnesses(MissingWitnessDiagnosisKind Kind);
-    /// Emit any diagnostics that have been delayed.
-    void emitDelayedDiags();
-
-    ConformanceChecker(TypeChecker &tc, NormalProtocolConformance *conformance,
-                       llvm::SetVector<ValueDecl*> &GlobalMissingWitnesses,
-                       bool suppressDiagnostics = true)
-        : WitnessChecker(tc, conformance->getProtocol(), conformance->getType(),
-                         conformance->getDeclContext()),
-          Conformance(conformance), Loc(conformance->getLoc()),
-          GlobalMissingWitnesses(GlobalMissingWitnesses),
-          LocalMissingWitnessesStartIndex(GlobalMissingWitnesses.size()),
-          SuppressDiagnostics(suppressDiagnostics) {
-      // The protocol may have only been validatedDeclForNameLookup'd until
-      // here, so fill in any information that's missing.
-      tc.validateDecl(conformance->getProtocol());
-    }
-
-    /// Resolve all of the type witnesses.
-    void resolveTypeWitnesses();
-
-    /// Resolve the witness for the given non-type requirement as
-    /// directly as possible, only resolving other witnesses if
-    /// needed, e.g., to determine type witnesses used within the
-    /// requirement.
-    ///
-    /// This entry point is designed to be used when the witness for a
-    /// particular requirement and adoptee is required, before the
-    /// conformance has been completed checked.
-    void resolveSingleWitness(ValueDecl *requirement);
-
-    /// Resolve the type witness for the given associated type as
-    /// directly as possible.
-    void resolveSingleTypeWitness(AssociatedTypeDecl *assocType);
-
-    /// Check all of the protocols requirements are actually satisfied by a
-    /// the chosen type witnesses.
-    void ensureRequirementsAreSatisfied();
-
-    /// Check the entire protocol conformance, ensuring that all
-    /// witnesses are resolved and emitting any diagnostics.
-    void checkConformance(MissingWitnessDiagnosisKind Kind);
-  };
-
-  /// This is a wrapper of multiple instances of ConformanceChecker to allow us
-  /// to diagnose and fix code from a more global perspective; for instance,
-  /// having this wrapper can help issue a fixit that inserts protocol stubs from
-  /// multiple protocols under checking.
-  class MultiConformanceChecker {
-    TypeChecker &TC;
-    llvm::SmallVector<ValueDecl*, 16> UnsatisfiedReqs;
-    llvm::SmallVector<ConformanceChecker, 4> AllUsedCheckers;
-    llvm::SmallVector<NormalProtocolConformance*, 4> AllConformances;
-    llvm::SetVector<ValueDecl*> MissingWitnesses;
-
-    /// Check one conformance.
-    ProtocolConformance * checkIndividualConformance(
-      NormalProtocolConformance *conformance, bool issueFixit);
-
-    /// Determine whether the given requirement was left unsatisfied.
-    bool isUnsatisfiedReq(NormalProtocolConformance *conformance, ValueDecl *req);
-  public:
-    MultiConformanceChecker(TypeChecker &TC): TC(TC){}
-
-    /// Add a conformance into the batched checker.
-    void addConformance(NormalProtocolConformance *conformance) {
-      AllConformances.push_back(conformance);
-    }
-
-    /// Peek the unsatisfied requirements collected during conformance checking.
-    ArrayRef<ValueDecl*> getUnsatisfiedRequirements() {
-      return llvm::makeArrayRef(UnsatisfiedReqs);
-    }
-
-    /// Check all conformances and emit diagnosis globally.
-    void checkAllConformances();
-  };
-
-  bool MultiConformanceChecker::
-  isUnsatisfiedReq(NormalProtocolConformance *conformance, ValueDecl *req) {
-    if (conformance->isInvalid()) return false;
-    if (isa<TypeDecl>(req)) return false;
-
-    // An optional requirement might not have a witness...
-    if (!conformance->hasWitness(req) ||
-        !conformance->getWitness(req, nullptr).getDecl())
-      return req->getAttrs().hasAttribute<OptionalAttr>();
-
-    return false;
-  }
-
-  void MultiConformanceChecker::checkAllConformances() {
-    bool anyInvalid = false;
-    for (unsigned I = 0, N = AllConformances.size(); I < N; I ++) {
-      auto *conformance = AllConformances[I];
-      // Check this conformance and emit fixits if this is the last one in the pool.
-      checkIndividualConformance(conformance, I == N - 1);
-      anyInvalid |= conformance->isInvalid();
-      if (anyInvalid)
+      // If the requirement is unsatisfied, we might want to warn
+      // about near misses; record it.
+      if (isUnsatisfiedReq(conformance, req)) {
+        UnsatisfiedReqs.push_back(req);
         continue;
-      // Check whether there are any unsatisfied requirements.
-      auto proto = conformance->getProtocol();
-      for (auto member : proto->getMembers()) {
-        auto req = dyn_cast<ValueDecl>(member);
-        if (!req || !req->isProtocolRequirement()) continue;
-
-        // If the requirement is unsatisfied, we might want to warn
-        // about near misses; record it.
-        if (isUnsatisfiedReq(conformance, req)) {
-          UnsatisfiedReqs.push_back(req);
-          continue;
-        }
-      }
-    }
-    // If all missing witnesses are issued with fixits, we are done.
-    if (MissingWitnesses.empty())
-      return;
-
-    // Otherwise, backtrack to the last checker that has missing witnesses
-    // and diagnose missing witnesses from there.
-    for (auto It = AllUsedCheckers.rbegin(); It != AllUsedCheckers.rend();
-         It ++) {
-      if (!It->getLocalMissingWitness().empty()) {
-        It->diagnoseMissingWitnesses(MissingWitnessDiagnosisKind::FixItOnly);
       }
     }
   }
+  // If all missing witnesses are issued with fixits, we are done.
+  if (MissingWitnesses.empty())
+    return;
 
-  /// \brief Determine whether the type \c T conforms to the protocol \c Proto,
-  /// recording the complete witness table if it does.
-  ProtocolConformance *MultiConformanceChecker::
-  checkIndividualConformance(NormalProtocolConformance *conformance,
-                             bool issueFixit) {
-    std::vector<ValueDecl*> revivedMissingWitnesses;
-    switch (conformance->getState()) {
-      case ProtocolConformanceState::Incomplete:
-        if (conformance->isInvalid()) {
-          // Revive registered missing witnesses to handle it below.
-          revivedMissingWitnesses = TC.Context.
-            takeDelayedMissingWitnesses(conformance);
+  // Otherwise, backtrack to the last checker that has missing witnesses
+  // and diagnose missing witnesses from there.
+  for (auto It = AllUsedCheckers.rbegin(); It != AllUsedCheckers.rend();
+       It ++) {
+    if (!It->getLocalMissingWitness().empty()) {
+      It->diagnoseMissingWitnesses(MissingWitnessDiagnosisKind::FixItOnly);
+    }
+  }
+}
 
-          // If we have no missing witnesses for this invalid conformance, the
-          // conformance is invalid for other reasons, so emit diagnosis now.
-          if (revivedMissingWitnesses.empty()) {
-            // Emit any delayed diagnostics.
-            ConformanceChecker(TC, conformance, MissingWitnesses, false).
-              emitDelayedDiags();
-          }
+static void diagnoseConformanceImpliedByConditionalConformance(
+    DiagnosticEngine &Diags, NormalProtocolConformance *conformance,
+    NormalProtocolConformance *implyingConf, bool issueFixit) {
+  Type T = conformance->getType();
+  auto proto = conformance->getProtocol();
+  Type protoType = proto->getDeclaredType();
+  auto implyingProto = implyingConf->getProtocol()->getDeclaredType();
+  auto loc = implyingConf->getLoc();
+  Diags.diagnose(loc, diag::conditional_conformances_cannot_imply_conformances,
+                 T, implyingProto, protoType);
+
+  if (!issueFixit)
+    return;
+
+  // Now we get down to business: constructing a few options for new
+  // extensions. They all look like:
+  //
+  // extension T: ProtoType where ... {
+  //     <# witnesses #>
+  // }
+  //
+  // The options are:
+  //
+  // - if possible, the original bounds relaxed, when the requirements match the
+  //   conforming protocol, e.g. 'X: Hashable where T: Hashable' often
+  //   corresponds to 'X: Equatable where T: Equatable'. This fixit is included
+  //   if all the requirements are conformance constraints to the protocol
+  //   that implies the conformance.
+  // - the same bounds: ... is copied from the implying extension
+  // - new bounds: ... becomes a placeholder
+  //
+  // We could also suggest adding ", ProtoType" to the existing extension,
+  // but we don't think having multiple conformances in a single extension
+  // (especially conditional ones) is good Swift style, and so we don't
+  // want to encourage it.
+
+  auto ext = cast<ExtensionDecl>(implyingConf->getDeclContext());
+  auto &ctxt = ext->getASTContext();
+
+  auto &SM = ctxt.SourceMgr;
+  StringRef extraIndent;
+  StringRef indent = Lexer::getIndentationForLine(SM, loc, &extraIndent);
+
+  // First, the bits that aren't the requirements are the same for all the
+  // types.
+  llvm::SmallString<128> prefix;
+  llvm::SmallString<128> suffix;
+  {
+    llvm::raw_svector_ostream prefixStream(prefix);
+    llvm::raw_svector_ostream suffixStream(suffix);
+
+    ValueDecl *decl = T->getAnyNominal();
+    if (!decl)
+      decl = T->getAnyGeneric();
+
+    prefixStream << "extension " << decl->getFullName() << ": " << protoType << " ";
+    suffixStream << " {\n"
+                 << indent << extraIndent << "<#witnesses#>\n"
+                 << indent << "}\n\n"
+                 << indent;
+  }
+
+  if (!ctxt.LangOpts.DiagnosticsEditorMode) {
+    // The fixits below are too complicated for the command line: the suggested
+    // code ends up not being displayed, and the text by itself doesn't help. So
+    // instead we skip all that and just have some text.
+    Diags.diagnose(loc,
+                   diag::note_explicitly_state_conditional_conformance_noneditor,
+                   prefix.str());
+    return;
+  }
+
+  // First, we do the fixit for "matching" requirements (i.e. X: P where T: P).
+  bool matchingIsValid = true;
+  llvm::SmallString<128> matchingFixit = prefix;
+  {
+    llvm::raw_svector_ostream matchingStream(matchingFixit);
+    matchingStream << "where ";
+    bool first = true;
+    for (const auto &req : implyingConf->getConditionalRequirements()) {
+      auto firstType = req.getFirstType();
+      // T: ImplyingProto => T: Proto
+      if (req.getKind() == RequirementKind::Conformance &&
+          req.getSecondType()->isEqual(implyingProto)) {
+        auto comma = first ? "" : ", ";
+        matchingStream << comma << firstType << ": " << protoType;
+        first = false;
+        continue;
+      }
+      // something didn't work out, so give up on this fixit.
+      matchingIsValid = false;
+      break;
+    }
+  }
+
+  if (matchingIsValid) {
+    matchingFixit += suffix;
+    Diags
+        .diagnose(loc,
+                  diag::note_explicitly_state_conditional_conformance_relaxed)
+        .fixItInsert(loc, matchingFixit);
+  }
+
+  // Next, do the fixit for using the same requirements, but be resilient to a
+  // missing `where` clause: this is one of a few fixits that get emitted here,
+  // and so is a very low priority diagnostic, and so shouldn't crash.
+  if (auto TWC = ext->getTrailingWhereClause()) {
+    llvm::SmallString<128> sameFixit = prefix;
+    auto CSR =
+        Lexer::getCharSourceRangeFromSourceRange(SM, TWC->getSourceRange());
+    sameFixit += SM.extractText(CSR);
+    sameFixit += suffix;
+    Diags
+        .diagnose(loc, diag::note_explicitly_state_conditional_conformance_same)
+        .fixItInsert(loc, sameFixit);
+  }
+
+  // And finally, just the generic new-requirements one:
+  llvm::SmallString<128> differentFixit = prefix;
+  differentFixit += "where <#requirements#>";
+  differentFixit += suffix;
+  Diags
+      .diagnose(loc,
+                diag::note_explicitly_state_conditional_conformance_different)
+      .fixItInsert(loc, differentFixit);
+}
+
+/// \brief Determine whether the type \c T conforms to the protocol \c Proto,
+/// recording the complete witness table if it does.
+ProtocolConformance *MultiConformanceChecker::
+checkIndividualConformance(NormalProtocolConformance *conformance,
+                           bool issueFixit) {
+  std::vector<ValueDecl*> revivedMissingWitnesses;
+  switch (conformance->getState()) {
+    case ProtocolConformanceState::Incomplete:
+      if (conformance->isInvalid()) {
+        // Revive registered missing witnesses to handle it below.
+        revivedMissingWitnesses = TC.Context.
+          takeDelayedMissingWitnesses(conformance);
+
+        // If we have no missing witnesses for this invalid conformance, the
+        // conformance is invalid for other reasons, so emit diagnosis now.
+        if (revivedMissingWitnesses.empty()) {
+          // Emit any delayed diagnostics.
+          ConformanceChecker(TC, conformance, MissingWitnesses, false).
+            emitDelayedDiags();
         }
+      }
 
-        // Check the rest of the conformance below.
-        break;
+      // Check the rest of the conformance below.
+      break;
 
-      case ProtocolConformanceState::CheckingTypeWitnesses:
-      case ProtocolConformanceState::Checking:
-      case ProtocolConformanceState::Complete:
-        // Nothing to do.
-        return conformance;
-    }
-
-    // Dig out some of the fields from the conformance.
-    Type T = conformance->getType();
-    auto canT = T->getCanonicalType();
-    DeclContext *DC = conformance->getDeclContext();
-    auto Proto = conformance->getProtocol();
-    SourceLoc ComplainLoc = conformance->getLoc();
-
-    // Note that we are checking this conformance now.
-    conformance->setState(ProtocolConformanceState::Checking);
-    SWIFT_DEFER { conformance->setState(ProtocolConformanceState::Complete); };
-
-    // If the protocol itself is invalid, there's nothing we can do.
-    if (Proto->isInvalid()) {
-      conformance->setInvalid();
+    case ProtocolConformanceState::CheckingTypeWitnesses:
+    case ProtocolConformanceState::Checking:
+    case ProtocolConformanceState::Complete:
+      // Nothing to do.
       return conformance;
-    }
+  }
 
-    // If the protocol requires a class, non-classes are a non-starter.
-    if (Proto->requiresClass() && !canT->getClassOrBoundGenericClass()) {
-      TC.diagnose(ComplainLoc, diag::non_class_cannot_conform_to_class_protocol,
-                  T, Proto->getDeclaredType());
-      conformance->setInvalid();
-      return conformance;
-    }
+  // Dig out some of the fields from the conformance.
+  Type T = conformance->getType();
+  auto canT = T->getCanonicalType();
+  DeclContext *DC = conformance->getDeclContext();
+  auto Proto = conformance->getProtocol();
+  auto ProtoType = Proto->getDeclaredType();
+  SourceLoc ComplainLoc = conformance->getLoc();
 
+  // Note that we are checking this conformance now.
+  conformance->setState(ProtocolConformanceState::Checking);
+  SWIFT_DEFER { conformance->setState(ProtocolConformanceState::Complete); };
+
+  TC.validateDecl(Proto);
+
+  // If the protocol itself is invalid, there's nothing we can do.
+  if (Proto->isInvalid()) {
+    conformance->setInvalid();
+    return conformance;
+  }
+
+  // If the protocol requires a class, non-classes are a non-starter.
+  if (Proto->requiresClass() && !canT->getClassOrBoundGenericClass()) {
+    TC.diagnose(ComplainLoc, diag::non_class_cannot_conform_to_class_protocol,
+                T, ProtoType);
+    conformance->setInvalid();
+    return conformance;
+  }
+
+  if (Proto->isObjC()) {
     // Foreign classes cannot conform to objc protocols.
-    if (Proto->isObjC()) {
-      if (auto clas = canT->getClassOrBoundGenericClass()) {
-        Optional<decltype(diag::cf_class_cannot_conform_to_objc_protocol)>
-        diagKind;
-        switch (clas->getForeignClassKind()) {
-          case ClassDecl::ForeignKind::Normal:
-            break;
-          case ClassDecl::ForeignKind::CFType:
-            diagKind = diag::cf_class_cannot_conform_to_objc_protocol;
-            break;
-          case ClassDecl::ForeignKind::RuntimeOnly:
-            diagKind = diag::objc_runtime_visible_cannot_conform_to_objc_protocol;
-            break;
-        }
-        if (diagKind) {
-          TC.diagnose(ComplainLoc, diagKind.getValue(),
-                      T, Proto->getDeclaredType());
-          conformance->setInvalid();
-          return conformance;
-        }
+    if (auto clas = canT->getClassOrBoundGenericClass()) {
+      Optional<decltype(diag::cf_class_cannot_conform_to_objc_protocol)>
+      diagKind;
+      switch (clas->getForeignClassKind()) {
+        case ClassDecl::ForeignKind::Normal:
+          break;
+        case ClassDecl::ForeignKind::CFType:
+          diagKind = diag::cf_class_cannot_conform_to_objc_protocol;
+          break;
+        case ClassDecl::ForeignKind::RuntimeOnly:
+          diagKind = diag::objc_runtime_visible_cannot_conform_to_objc_protocol;
+          break;
       }
-    }
-
-    // If the protocol contains missing requirements, it can't be conformed to
-    // at all.
-    if (Proto->hasMissingRequirements()) {
-      bool hasDiagnosed = false;
-      auto *protoFile = Proto->getModuleScopeContext();
-      if (auto *serialized = dyn_cast<SerializedASTFile>(protoFile)) {
-        if (serialized->getLanguageVersionBuiltWith() !=
-            TC.getLangOpts().EffectiveLanguageVersion) {
-          TC.diagnose(ComplainLoc,
-                      diag::protocol_has_missing_requirements_versioned,
-                      T, Proto->getDeclaredType(),
-                      serialized->getLanguageVersionBuiltWith(),
-                      TC.getLangOpts().EffectiveLanguageVersion);
-          hasDiagnosed = true;
-        }
-      }
-      if (!hasDiagnosed) {
-        TC.diagnose(ComplainLoc, diag::protocol_has_missing_requirements,
-                    T, Proto->getDeclaredType());
-      }
-      conformance->setInvalid();
-      return conformance;
-    }
-
-    // Check that T conforms to all inherited protocols.
-    for (auto InheritedProto : Proto->getInheritedProtocols()) {
-      auto InheritedConformance =
-      TC.conformsToProtocol(T, InheritedProto, DC,
-                            ConformanceCheckFlags::Used,
-                            ComplainLoc);
-      if (!InheritedConformance || !InheritedConformance->isConcrete()) {
-        // Recursive call already diagnosed this problem, but tack on a note
-        // to establish the relationship.
-        if (ComplainLoc.isValid()) {
-          TC.diagnose(Proto,
-                      diag::inherited_protocol_does_not_conform, T,
-                      InheritedProto->getDeclaredType());
-        }
-
+      if (diagKind) {
+        TC.diagnose(ComplainLoc, diagKind.getValue(), T, ProtoType);
         conformance->setInvalid();
         return conformance;
       }
     }
 
-    if (conformance->isComplete())
+    // @objc protocols can't be conditionally-conformed to. We could, in theory,
+    // front-load the requirement checking to generic-instantiation time (rather
+    // than conformance-lookup/construction time) and register the conformance
+    // with the Obj-C runtime when they're satisfied, but we'd still have solve
+    // the problem with extensions that we check for below.
+    if (!conformance->getConditionalRequirements().empty()) {
+      TC.diagnose(ComplainLoc,
+                  diag::objc_protocol_cannot_have_conditional_conformance,
+                  T, ProtoType);
+      conformance->setInvalid();
       return conformance;
+    }
+    // And... even if it isn't conditional, we still don't currently support
+    // @objc protocols in extensions of Swift generic classes, because there's
+    // no stable Objective-C class object to install the protocol conformance
+    // category onto.
+    if (isa<ExtensionDecl>(DC)) {
+      if (auto genericT = T->getGenericAncestor()) {
+        if (!cast<ClassDecl>(genericT->getAnyNominal())
+               ->usesObjCGenericsModel()) {
+          auto isSubclass = !genericT->isEqual(T);
+          auto genericTIsGeneric = (bool)genericT->getAnyGeneric()
+                                                 ->getGenericParams();
+          TC.diagnose(ComplainLoc, diag::objc_protocol_in_generic_extension, T,
+                      ProtoType, isSubclass, genericTIsGeneric);
+          conformance->setInvalid();
+          return conformance;
+        }
+      }
+    }
+  }
 
-    // The conformance checker we're using.
-    AllUsedCheckers.emplace_back(TC, conformance, MissingWitnesses);
-    MissingWitnesses.insert(revivedMissingWitnesses.begin(),
-                            revivedMissingWitnesses.end());
-    AllUsedCheckers.back().checkConformance(issueFixit ?
-                                      MissingWitnessDiagnosisKind::ErrorFixIt :
-                                      MissingWitnessDiagnosisKind::ErrorOnly);
+  // Not every protocol/type is compatible with conditional conformances.
+  if (!conformance->getConditionalRequirements().empty()) {
+    auto nestedType = canT;
+    // Obj-C generics cannot be looked up at runtime, so we don't support
+    // conditional conformances involving them. Check the full stack of nested
+    // types for any obj-c ones.
+    while (nestedType) {
+      if (auto clas = nestedType->getClassOrBoundGenericClass()) {
+        if (clas->usesObjCGenericsModel()) {
+          TC.diagnose(ComplainLoc,
+                      diag::objc_generics_cannot_conditionally_conform, T,
+                      ProtoType);
+          conformance->setInvalid();
+          return conformance;
+        }
+      }
+
+      nestedType = nestedType.getNominalParent();
+    }
+  }
+
+  // If the protocol contains missing requirements, it can't be conformed to
+  // at all.
+  if (Proto->hasMissingRequirements()) {
+    bool hasDiagnosed = false;
+    auto *protoFile = Proto->getModuleScopeContext();
+    if (auto *serialized = dyn_cast<SerializedASTFile>(protoFile)) {
+      if (serialized->getLanguageVersionBuiltWith() !=
+          TC.getLangOpts().EffectiveLanguageVersion) {
+        TC.diagnose(ComplainLoc,
+                    diag::protocol_has_missing_requirements_versioned, T,
+                    ProtoType, serialized->getLanguageVersionBuiltWith(),
+                    TC.getLangOpts().EffectiveLanguageVersion);
+        hasDiagnosed = true;
+      }
+    }
+    if (!hasDiagnosed) {
+      TC.diagnose(ComplainLoc, diag::protocol_has_missing_requirements, T,
+                  ProtoType);
+    }
+    conformance->setInvalid();
     return conformance;
   }
-} // end anonymous namespace
+
+  bool impliedDisablesMissingWitnessFixits = false;
+  if (conformance->getSourceKind() == ConformanceEntryKind::Implied) {
+    // We've got something like:
+    //
+    //   protocol Foo : Proto {}
+    //   extension SomeType : Foo {}
+    //
+    // We don't want to allow this when the SomeType : Foo conformance is
+    // conditional
+    auto implyingConf = conformance->getImplyingConformance();
+    // There might be a long chain of implications, e.g. protocol Foo: Proto {}
+    // protocol Bar: Foo {} extension SomeType: Bar {}, so keep looking all the
+    // way up.
+    while (implyingConf->getSourceKind() == ConformanceEntryKind::Implied) {
+      implyingConf = implyingConf->getImplyingConformance();
+    }
+    if (!implyingConf->getConditionalRequirements().empty()) {
+      // We shouldn't suggest including witnesses for the conformance, because
+      // those suggestions will go in the current DeclContext, but really they
+      // should go into the new extension we (might) suggest here.
+      impliedDisablesMissingWitnessFixits = true;
+
+      diagnoseConformanceImpliedByConditionalConformance(
+          TC.Diags, conformance, implyingConf, issueFixit);
+
+      conformance->setInvalid();
+    }
+  }
+
+  // Check that T conforms to all inherited protocols.
+  for (auto InheritedProto : Proto->getInheritedProtocols()) {
+    auto InheritedConformance =
+    TC.conformsToProtocol(
+                        T, InheritedProto, DC,
+                        (ConformanceCheckFlags::Used|
+                         ConformanceCheckFlags::SkipConditionalRequirements),
+                        ComplainLoc);
+    if (!InheritedConformance || !InheritedConformance->isConcrete()) {
+      // Recursive call already diagnosed this problem, but tack on a note
+      // to establish the relationship.
+      if (ComplainLoc.isValid()) {
+        TC.diagnose(Proto,
+                    diag::inherited_protocol_does_not_conform, T,
+                    InheritedProto->getDeclaredType());
+      }
+
+      conformance->setInvalid();
+      return conformance;
+    }
+  }
+
+  if (conformance->isComplete())
+    return conformance;
+
+  // The conformance checker we're using.
+  AllUsedCheckers.emplace_back(TC, conformance, MissingWitnesses);
+  MissingWitnesses.insert(revivedMissingWitnesses.begin(),
+                          revivedMissingWitnesses.end());
+
+  auto missingWitnessFixits = issueFixit && !impliedDisablesMissingWitnessFixits;
+  AllUsedCheckers.back().checkConformance(
+      missingWitnessFixits ? MissingWitnessDiagnosisKind::ErrorFixIt
+                           : MissingWitnessDiagnosisKind::ErrorOnly);
+  return conformance;
+}
 
 /// \brief Add the next associated type deduction to the string representation
 /// of the deductions, used in diagnostics.
@@ -2206,10 +1687,21 @@ static Type getTypeForDisplay(ModuleDecl *module, ValueDecl *decl) {
       auto sigWithoutReqts
         = GenericSignature::get(genericFn->getGenericParams(), {});
       return GenericFunctionType::get(sigWithoutReqts,
-                                      resultFn->getInput(),
+                                      resultFn->getParams(),
                                       resultFn->getResult(),
                                       resultFn->getExtInfo());
     }
+  }
+
+  // Redeclaration checking might mark a candidate as `invalid` and
+  // reset it's type to ErrorType, let's dig out original type to
+  // make the diagnostic better.
+  if (auto errorType = type->getAs<ErrorType>()) {
+    auto originalType = errorType->getOriginalType();
+    if (!originalType || !originalType->is<AnyFunctionType>())
+      return type;
+
+    type = originalType;
   }
 
   return type->castTo<AnyFunctionType>()->getResult();
@@ -2224,25 +1716,14 @@ static Type getRequirementTypeForDisplay(ModuleDecl *module,
   // Replace generic type parameters and associated types with their
   // witnesses, when we have them.
   auto selfTy = conformance->getProtocol()->getSelfInterfaceType();
-  type = type.transform([&](Type type) -> Type {
-    // If a dependent member refers to an associated type, replace it.
-    if (auto member = type->getAs<DependentMemberType>()) {
-      if (member->getBase()->isEqual(selfTy)) {
-        // FIXME: Could handle inherited conformances here.
-        if (conformance->hasTypeWitness(member->getAssocType()))
-          return conformance->getTypeWitness(member->getAssocType(), nullptr);
-      }
-    }
+  return type.subst([&](SubstitutableType *dependentType) {
+                      if (dependentType->isEqual(selfTy))
+                        return conformance->getType();
 
-    // Replace 'Self' with the conforming type.
-    if (type->isEqual(selfTy))
-      return conformance->getType();
-
-    return type;
-  });
-
-  //
-  return type;
+                      return Type(dependentType);
+                    },
+                    LookUpConformanceInModule(module),
+                    SubstFlags::UseErrorType);
 }
 
 /// \brief Retrieve the kind of requirement described by the given declaration,
@@ -2285,10 +1766,7 @@ SourceLoc OptionalAdjustment::getOptionalityLoc(ValueDecl *witness) const {
   // For parameter adjustments, dig out the pattern.
   ParameterList *params = nullptr;
   if (auto func = dyn_cast<AbstractFunctionDecl>(witness)) {
-    auto bodyParamLists = func->getParameterLists();
-    if (func->getDeclContext()->isTypeContext())
-      bodyParamLists = bodyParamLists.slice(1);
-    params = bodyParamLists[0];
+    params = func->getParameters();
   } else if (auto subscript = dyn_cast<SubscriptDecl>(witness)) {
     params = subscript->getIndices();
   } else {
@@ -2329,11 +1807,44 @@ SourceLoc OptionalAdjustment::getOptionalityLoc(TypeRepr *tyR) const {
   return SourceLoc();
 }
 
-void RequirementMatch::addOptionalityFixIts(
-      const ASTContext &ctx,
-       ValueDecl *witness, 
-       InFlightDiagnostic &diag) const {
-  for (const auto &adjustment : OptionalAdjustments) {
+/// Classify the provided optionality issues for use in diagnostics.
+/// FIXME: Enumify this
+static unsigned classifyOptionalityIssues(
+    const SmallVectorImpl<OptionalAdjustment> &adjustments,
+    ValueDecl *requirement) {
+  unsigned numParameterAdjustments = 0;
+  bool hasNonParameterAdjustment = false;
+  for (const auto &adjustment : adjustments) {
+    if (adjustment.isParameterAdjustment())
+      ++numParameterAdjustments;
+    else
+      hasNonParameterAdjustment = true;
+  }
+
+  if (hasNonParameterAdjustment) {
+    // Both return and parameter adjustments.
+    if (numParameterAdjustments > 0)
+      return 4;
+
+    // The type of a variable.
+    if (isa<VarDecl>(requirement))
+      return 0;
+
+    // The result type of something.
+    return 1;
+  }
+
+  // Only parameter adjustments.
+  assert(numParameterAdjustments > 0 && "No adjustments?");
+  return numParameterAdjustments == 1 ? 2 : 3;
+}
+
+static void addOptionalityFixIts(
+    const SmallVectorImpl<OptionalAdjustment> &adjustments,
+    const ASTContext &ctx,
+    ValueDecl *witness, 
+    InFlightDiagnostic &diag) {
+  for (const auto &adjustment : adjustments) {
     SourceLoc adjustmentLoc = adjustment.getOptionalityLoc(witness);
     if (adjustmentLoc.isInvalid())
       continue;
@@ -2368,12 +1879,10 @@ diagnoseMatch(ModuleDecl *module, NormalProtocolConformance *conformance,
   // Form a string describing the associated type deductions.
   // FIXME: Determine which associated types matter, and only print those.
   llvm::SmallString<128> withAssocTypes;
-  for (auto member : conformance->getProtocol()->getMembers()) {
-    if (auto assocType = dyn_cast<AssociatedTypeDecl>(member)) {
-      if (conformance->usesDefaultDefinition(assocType)) {
-        Type witness = conformance->getTypeWitness(assocType, nullptr);
-        addAssocTypeDeductionString(withAssocTypes, assocType, witness);
-      }
+  for (auto assocType : conformance->getProtocol()->getAssociatedTypeMembers()) {
+    if (conformance->usesDefaultDefinition(assocType)) {
+      Type witness = conformance->getTypeWitness(assocType, nullptr);
+      addAssocTypeDeductionString(withAssocTypes, assocType, witness);
     }
   }
   if (!withAssocTypes.empty())
@@ -2424,12 +1933,15 @@ diagnoseMatch(ModuleDecl *module, NormalProtocolConformance *conformance,
     break;
 
   case MatchKind::OptionalityConflict: {
+    auto &adjustments = match.OptionalAdjustments;
     auto diag = diags.diagnose(match.Witness, 
                                diag::protocol_witness_optionality_conflict,
-                               match.classifyOptionalityIssues(req),
+                               classifyOptionalityIssues(adjustments, req),
                                withAssocTypes);
-    match.addOptionalityFixIts(match.Witness->getASTContext(), match.Witness,
-                               diag);
+    addOptionalityFixIts(adjustments,
+                         match.Witness->getASTContext(),
+                         match.Witness,
+                         diag);
     break;
   }
 
@@ -2486,6 +1998,22 @@ diagnoseMatch(ModuleDecl *module, NormalProtocolConformance *conformance,
   }
 }
 
+ConformanceChecker::ConformanceChecker(
+                   TypeChecker &tc, NormalProtocolConformance *conformance,
+                   llvm::SetVector<ValueDecl*> &GlobalMissingWitnesses,
+                   bool suppressDiagnostics)
+    : WitnessChecker(tc, conformance->getProtocol(),
+                     conformance->getType(),
+                     conformance->getDeclContext()),
+      Conformance(conformance), Loc(conformance->getLoc()),
+      GlobalMissingWitnesses(GlobalMissingWitnesses),
+      LocalMissingWitnessesStartIndex(GlobalMissingWitnesses.size()),
+      SuppressDiagnostics(suppressDiagnostics) {
+  // The protocol may have only been validatedDeclForNameLookup'd until
+  // here, so fill in any information that's missing.
+  tc.validateDecl(conformance->getProtocol());
+}
+
 ArrayRef<AssociatedTypeDecl *>
 ConformanceChecker::getReferencedAssociatedTypes(ValueDecl *req) {
   // Check whether we've already cached this information.
@@ -2509,8 +2037,7 @@ ConformanceChecker::getReferencedAssociatedTypes(ValueDecl *req) {
 }
 
 void ConformanceChecker::recordWitness(ValueDecl *requirement,
-                                       const RequirementMatch &match,
-                                       RequirementEnvironment &&reqEnvironment){
+                                       const RequirementMatch &match) {
   // If we already recorded this witness, don't do so again.
   if (Conformance->hasWitness(requirement)) {
     assert(Conformance->getWitness(requirement, nullptr).getDecl() ==
@@ -2519,7 +2046,7 @@ void ConformanceChecker::recordWitness(ValueDecl *requirement,
   }
 
   // Record this witness in the conformance.
-  auto witness = match.getWitness(TC.Context, std::move(reqEnvironment));
+  auto witness = match.getWitness(TC.Context);
   Conformance->setWitness(requirement, witness);
 
   // Synthesize accessors for the protocol witness table to use.
@@ -2555,6 +2082,80 @@ void ConformanceChecker::recordInvalidWitness(ValueDecl *requirement) {
   Conformance->setWitness(requirement, Witness());
 }
 
+/// Returns the location we should use for a primary diagnostic (an error or
+/// warning) that concerns \p witness but arose as part of checking
+/// \p conformance.
+///
+/// Ideally we'd like to use the location of \p witness for this, but that
+/// could be confusing if the conformance is declared somewhere else. Moreover,
+/// if the witness and the conformance declaration are in different files, we
+/// could be issuing diagnostics in one file that wouldn't be present if we
+/// recompiled just that file. Therefore, we only use the witness's location if
+/// it's in the same type or extension that declares the conformance.
+static SourceLoc
+getLocForDiagnosingWitness(const NormalProtocolConformance *conformance,
+                           const ValueDecl *witness) {
+  if (witness && witness->getDeclContext() == conformance->getDeclContext()) {
+    SourceLoc witnessLoc = witness->getLoc();
+    if (witnessLoc.isValid())
+      return witnessLoc;
+  }
+  return conformance->getLoc();
+}
+
+/// Emits a "'foo' declared here" note unless \p mainDiagLoc is already the
+/// location of \p value.
+static void emitDeclaredHereIfNeeded(DiagnosticEngine &diags,
+                                     SourceLoc mainDiagLoc,
+                                     const ValueDecl *value) {
+  if (!value)
+    return;
+  if (mainDiagLoc == value->getLoc())
+    return;
+  diags.diagnose(value, diag::decl_declared_here, value->getFullName());
+}
+
+bool ConformanceChecker::checkObjCTypeErasedGenerics(
+                                                 AssociatedTypeDecl *assocType,
+                                                 Type type,
+                                                 TypeDecl *typeDecl) {
+  // Objective-C's type-erased generics don't allow the type arguments
+  // to be extracted from an instance (or a metatype), so we cannot refer to
+  // the type parameters from an associated type. Check that here.
+  auto &ctx = assocType->getASTContext();
+  if (!ctx.LangOpts.EnableObjCInterop && type->hasError())
+    return false;
+
+  auto classDecl = Adoptee->getClassOrBoundGenericClass();
+  if (!classDecl) return false;
+
+  if (!classDecl->usesObjCGenericsModel()) return false;
+
+  // Concrete types are okay.
+  if (!type->hasTypeParameter()) return false;
+
+  // Find one of the generic parameters named. It doesn't matter
+  // which one.
+  Type genericParam;
+  (void)type.findIf([&](Type type) {
+    if (auto gp = type->getAs<GenericTypeParamType>()) {
+      genericParam = gp;
+      return true;
+    }
+
+    return false;
+  });
+
+  // Diagnose the problem.
+  SourceLoc diagLoc = getLocForDiagnosingWitness(Conformance, typeDecl);
+  ctx.Diags.diagnose(diagLoc, diag::type_witness_objc_generic_parameter,
+                     type, genericParam, !genericParam.isNull(),
+                     assocType->getFullName(), Proto->getFullName());
+  emitDeclaredHereIfNeeded(ctx.Diags, diagLoc, typeDecl);
+
+  return true;
+}
+
 void ConformanceChecker::recordTypeWitness(AssociatedTypeDecl *assocType,
                                            Type type,
                                            TypeDecl *typeDecl,
@@ -2562,10 +2163,14 @@ void ConformanceChecker::recordTypeWitness(AssociatedTypeDecl *assocType,
 
   // If we already recoded this type witness, there's nothing to do.
   if (Conformance->hasTypeWitness(assocType)) {
-    assert(Conformance->getTypeWitness(assocType, nullptr)
-             ->isEqual(type) && "Conflicting type witness deductions");
+    assert(Conformance->getTypeWitness(assocType, nullptr)->isEqual(type) &&
+           "Conflicting type witness deductions");
     return;
   }
+
+  assert(!type->hasArchetype() && "Got a contextual type here?");
+
+  checkObjCTypeErasedGenerics(assocType, type, typeDecl);
 
   if (typeDecl) {
     // Check access.
@@ -2591,12 +2196,16 @@ void ConformanceChecker::recordTypeWitness(AssociatedTypeDecl *assocType,
                           ? diag::type_witness_not_accessible_proto
                           : diag::type_witness_not_accessible_type;
         auto &diags = DC->getASTContext().Diags;
-        auto diag = diags.diagnose(typeDecl, diagKind,
-                                   typeDecl->getDescriptiveKind(),
-                                   typeDecl->getFullName(),
-                                   requiredAccess,
-                                   proto->getName());
-        fixItAccess(diag, typeDecl, requiredAccess);
+        diags.diagnose(getLocForDiagnosingWitness(conformance, typeDecl),
+                       diagKind,
+                       typeDecl->getDescriptiveKind(),
+                       typeDecl->getFullName(),
+                       requiredAccess,
+                       proto->getName());
+        auto fixItDiag = diags.diagnose(typeDecl, diag::witness_fix_access,
+                                        typeDecl->getDescriptiveKind(),
+                                        requiredAccess);
+        fixItAccess(fixItDiag, typeDecl, requiredAccess);
       });
     }
   } else {
@@ -2636,14 +2245,11 @@ void ConformanceChecker::recordTypeWitness(AssociatedTypeDecl *assocType,
 
     // Inject the typealias into the nominal decl that conforms to the protocol.
     if (auto nominal = DC->getAsNominalTypeOrNominalTypeExtensionContext()) {
-      TC.computeAccessLevel(nominal);
       // FIXME: Ideally this would use the protocol's access too---that is,
       // a typealias added for an internal protocol shouldn't need to be
       // public---but that can be problematic if the same type conforms to two
       // protocols with different access levels.
-      AccessLevel aliasAccess = nominal->getFormalAccess();
-      aliasAccess = std::max(aliasAccess, AccessLevel::Internal);
-      aliasDecl->setAccess(aliasAccess);
+      aliasDecl->copyFormalAccessFrom(nominal, /*sourceIsParentContext*/true);
 
       if (nominal == DC) {
         nominal->addMember(aliasDecl);
@@ -2664,6 +2270,33 @@ void ConformanceChecker::recordTypeWitness(AssociatedTypeDecl *assocType,
 
   // Record the type witness.
   Conformance->setTypeWitness(assocType, type, typeDecl);
+
+  // Record type witnesses for any "overridden" associated types.
+  llvm::SetVector<AssociatedTypeDecl *> overriddenAssocTypes;
+  auto assocOverriddenDecls = assocType->getOverriddenDecls();
+  overriddenAssocTypes.insert(assocOverriddenDecls.begin(),
+                              assocOverriddenDecls.end());
+  for (unsigned idx = 0; idx < overriddenAssocTypes.size(); ++idx) {
+    auto overridden = overriddenAssocTypes[idx];
+
+    // Note all of the newly-discovered overridden associated types.
+    auto overriddenDecls = overridden->getOverriddenDecls();
+    overriddenAssocTypes.insert(overriddenDecls.begin(), overriddenDecls.end());
+
+    // Find the conformance for this overridden protocol.
+    auto overriddenConformance =
+      DC->getParentModule()->lookupConformance(Adoptee,
+                                               overridden->getProtocol());
+    if (!overriddenConformance ||
+        !overriddenConformance->isConcrete())
+      continue;
+
+    auto overriddenRootConformance =
+      overriddenConformance->getConcrete()->getRootNormalConformance();
+    ConformanceChecker(TC, overriddenRootConformance, GlobalMissingWitnesses)
+      .recordTypeWitness(overridden, type, typeDecl,
+                         /*performRedeclarationCheck=*/true);
+  }
 }
 
 bool swift::
@@ -2687,10 +2320,10 @@ printRequirementStub(ValueDecl *Requirement, DeclContext *Adopter,
   // FIXME: Infer body indentation from the source rather than hard-coding
   // 4 spaces.
   ASTContext &Ctx = Requirement->getASTContext();
-  std::string ExtraIndent = "    ";
-  StringRef CurrentIndent = Lexer::getIndentationForLine(Ctx.SourceMgr,
-                                                         TypeLoc);
-  std::string StubIndent = CurrentIndent.str() + ExtraIndent;
+  StringRef ExtraIndent;
+  StringRef CurrentIndent =
+      Lexer::getIndentationForLine(Ctx.SourceMgr, TypeLoc, &ExtraIndent);
+  std::string StubIndent = (CurrentIndent + ExtraIndent).str();
 
   ExtraIndentStreamPrinter Printer(OS, StubIndent);
   Printer.printNewline();
@@ -2902,9 +2535,165 @@ getAdopteeSelfSameTypeConstraint(ClassDecl *selfClass, ValueDecl *witness) {
   return None;
 }
 
+void ConformanceChecker::checkNonFinalClassWitness(ValueDecl *requirement,
+                                                   ValueDecl *witness) {
+  auto *classDecl = Adoptee->getClassOrBoundGenericClass();
+
+  // If we have an initializer requirement and the conforming type
+  // is a non-final class, the witness must be 'required'.
+  // We exempt Objective-C initializers from this requirement
+  // because there is no equivalent to 'required' in Objective-C.
+  if (auto ctor = dyn_cast<ConstructorDecl>(witness)) {
+    if (!ctor->isRequired() &&
+        !ctor->getDeclContext()->getAsProtocolOrProtocolExtensionContext() &&
+        !ctor->hasClangNode()) {
+      // FIXME: We're not recovering (in the AST), so the Fix-It
+      // should move.
+      diagnoseOrDefer(requirement, false,
+        [ctor, requirement](NormalProtocolConformance *conformance) {
+          bool inExtension = isa<ExtensionDecl>(ctor->getDeclContext());
+          auto &diags = ctor->getASTContext().Diags;
+          SourceLoc diagLoc = getLocForDiagnosingWitness(conformance, ctor);
+          Optional<InFlightDiagnostic> fixItDiag =
+              diags.diagnose(diagLoc, diag::witness_initializer_not_required,
+                             requirement->getFullName(), inExtension,
+                             conformance->getType());
+          if (diagLoc != ctor->getLoc() && !ctor->isImplicit()) {
+            // If the main diagnostic is emitted on the conformance, we want to
+            // attach the fix-it to the note that shows where the initializer is
+            // defined.
+            fixItDiag.getValue().flush();
+            fixItDiag.emplace(diags.diagnose(ctor, diag::decl_declared_here,
+                                             ctor->getFullName()));
+          }
+          if (!inExtension) {
+            fixItDiag->fixItInsert(ctor->getAttributeInsertionLoc(true),
+                                   "required ");
+          }
+        });
+    }
+  }
+
+  // Check whether this requirement uses Self in a way that might
+  // prevent conformance from succeeding.
+  auto selfKind = Proto->findProtocolSelfReferences(requirement,
+                                       /*allowCovariantParameters=*/false,
+                                       /*skipAssocTypes=*/true);
+
+  if (selfKind.other) {
+    // References to Self in a position where subclasses cannot do
+    // the right thing. Complain if the adoptee is a non-final
+    // class.
+    diagnoseOrDefer(requirement, false,
+      [witness, requirement](NormalProtocolConformance *conformance) {
+        auto proto = conformance->getProtocol();
+        auto &diags = proto->getASTContext().Diags;
+        SourceLoc diagLoc = getLocForDiagnosingWitness(conformance, witness);
+        diags.diagnose(diagLoc, diag::witness_self_non_subtype,
+                       proto->getDeclaredType(), requirement->getFullName(),
+                       conformance->getType());
+        emitDeclaredHereIfNeeded(diags, diagLoc, witness);
+      });
+  } else if (selfKind.result) {
+    // The reference to Self occurs in the result type. A non-final class
+    // can satisfy this requirement with a method that returns Self.
+
+    // If the function has a dynamic Self, it's okay.
+    if (auto func = dyn_cast<FuncDecl>(witness)) {
+      if (func->getDeclContext()->getAsClassOrClassExtensionContext() &&
+          !func->hasDynamicSelf()) {
+        diagnoseOrDefer(requirement, false,
+          [witness, requirement](NormalProtocolConformance *conformance) {
+            auto proto = conformance->getProtocol();
+            auto &diags = proto->getASTContext().Diags;
+            SourceLoc diagLoc = getLocForDiagnosingWitness(conformance,witness);
+            diags.diagnose(diagLoc,
+                           diag::witness_requires_dynamic_self,
+                           requirement->getFullName(),
+                           conformance->getType(),
+                           proto->getDeclaredType());
+            emitDeclaredHereIfNeeded(diags, diagLoc, witness);
+          });
+      }
+
+    // Constructors conceptually also have a dynamic Self
+    // return type, so they're okay.
+    } else if (!isa<ConstructorDecl>(witness)) {
+      diagnoseOrDefer(requirement, false,
+        [witness, requirement](NormalProtocolConformance *conformance) {
+          auto proto = conformance->getProtocol();
+          auto &diags = proto->getASTContext().Diags;
+          SourceLoc diagLoc = getLocForDiagnosingWitness(conformance, witness);
+          diags.diagnose(diagLoc, diag::witness_self_non_subtype,
+                         proto->getDeclaredType(),
+                         requirement->getFullName(),
+                         conformance->getType());
+          emitDeclaredHereIfNeeded(diags, diagLoc, witness);
+        });
+    }
+  } else if (selfKind.requirement) {
+    if (auto constraint = getAdopteeSelfSameTypeConstraint(classDecl,
+                                                           witness)) {
+      // A "Self ==" constraint works incorrectly with subclasses. Complain.
+      auto proto = Conformance->getProtocol();
+      auto &diags = proto->getASTContext().Diags;
+      SourceLoc diagLoc = getLocForDiagnosingWitness(Conformance, witness);
+      diags.diagnose(diagLoc, diag::witness_self_same_type,
+                     witness->getDescriptiveKind(),
+                     witness->getFullName(),
+                     Conformance->getType(),
+                     requirement->getDescriptiveKind(),
+                     requirement->getFullName(),
+                     proto->getDeclaredType());
+      emitDeclaredHereIfNeeded(diags, diagLoc, witness);
+
+      if (auto requirementRepr = *constraint) {
+        diags.diagnose(requirementRepr->getEqualLoc(),
+                       diag::witness_self_weaken_same_type,
+                       requirementRepr->getFirstType(),
+                       requirementRepr->getSecondType())
+          .fixItReplace(requirementRepr->getEqualLoc(), ":");
+      }
+    }
+  }
+
+  // A non-final class can model a protocol requirement with a
+  // contravariant Self, because here the witness will always have
+  // a more general type than the requirement.
+
+  // If the witness is in a protocol extension, there's an additional
+  // constraint that either the requirement not produce 'Self' in a
+  // covariant position, or the type of the requirement does not involve
+  // associated types.
+  if (auto func = dyn_cast<FuncDecl>(witness)) {
+    if (func->getDeclContext()->getAsProtocolExtensionContext()) {
+      auto selfKindWithAssocTypes = Proto->findProtocolSelfReferences(
+          requirement,
+          /*allowCovariantParameters=*/false,
+          /*skipAssocTypes=*/false);
+      if (selfKindWithAssocTypes.other &&
+          selfKindWithAssocTypes.result) {
+        diagnoseOrDefer(requirement, false,
+          [witness, requirement](NormalProtocolConformance *conformance) {
+            auto proto = conformance->getProtocol();
+            auto &diags = proto->getASTContext().Diags;
+            diags.diagnose(conformance->getLoc(),
+                           diag::witness_requires_class_implementation,
+                           requirement->getFullName(),
+                           conformance->getType());
+            diags.diagnose(witness, diag::decl_declared_here,
+                           witness->getFullName());
+          });
+      }
+    }
+  }
+}
+
 ResolveWitnessResult
 ConformanceChecker::resolveWitnessViaLookup(ValueDecl *requirement) {
   assert(!isa<AssociatedTypeDecl>(requirement) && "Use resolveTypeWitnessVia*");
+
+  auto *nominal = Adoptee->getAnyNominal();
 
   // Resolve all associated types before trying to resolve this witness.
   resolveTypeWitnesses();
@@ -2919,23 +2708,23 @@ ConformanceChecker::resolveWitnessViaLookup(ValueDecl *requirement) {
 
   // Determine whether we can derive a witness for this requirement.
   bool canDerive = false;
-  if (auto *nominal = Adoptee->getAnyNominal()) {
-    // Can a witness for this requirement be derived for this nominal type?
-    if (auto derivable = DerivedConformance::getDerivableRequirement(
-                           nominal,
-                           requirement)) {
-      if (derivable == requirement) {
-        // If it's the same requirement, we can derive it here.
-        canDerive = true;
-      } else {
-        // Otherwise, go satisfy the derivable requirement, which can introduce
-        // a member that could in turn satisfy *this* requirement.
-        auto derivableProto = cast<ProtocolDecl>(derivable->getDeclContext());
-        if (auto conformance =
-              TC.conformsToProtocol(Adoptee, derivableProto, DC, None)) {
-          if (conformance->isConcrete())
-            (void)conformance->getConcrete()->getWitnessDecl(derivable, &TC);
-        }
+
+  // Can a witness for this requirement be derived for this nominal type?
+  if (auto derivable = DerivedConformance::getDerivableRequirement(
+                         TC,
+                         nominal,
+                         requirement)) {
+    if (derivable == requirement) {
+      // If it's the same requirement, we can derive it here.
+      canDerive = true;
+    } else {
+      // Otherwise, go satisfy the derivable requirement, which can introduce
+      // a member that could in turn satisfy *this* requirement.
+      auto derivableProto = cast<ProtocolDecl>(derivable->getDeclContext());
+      if (auto conformance =
+            TC.conformsToProtocol(Adoptee, derivableProto, DC, None)) {
+        if (conformance->isConcrete())
+          (void)conformance->getConcrete()->getWitnessDecl(derivable, &TC);
       }
     }
   }
@@ -2949,14 +2738,12 @@ ConformanceChecker::resolveWitnessViaLookup(ValueDecl *requirement) {
   bool considerRenames =
     !canDerive && !requirement->getAttrs().hasAttribute<OptionalAttr>() &&
     !requirement->getAttrs().isUnavailable(TC.Context);
-  RequirementEnvironment reqEnvironment(TC, DC, requirement, Conformance);
   if (findBestWitness(requirement,
                       considerRenames ? &ignoringNames : nullptr,
                       Conformance,
-                      reqEnvironment,
                       /* out parameters: */
                       matches, numViable, bestIdx, doNotDiagnoseMatches)) {
-    auto &best = matches[bestIdx];
+    const auto &best = matches[bestIdx];
     auto witness = best.Witness;
 
     // If the name didn't actually line up, complain.
@@ -2969,23 +2756,29 @@ ConformanceChecker::resolveWitnessViaLookup(ValueDecl *requirement) {
           auto proto = conformance->getProtocol();
           auto &diags = proto->getASTContext().Diags;
           {
-            auto diag = diags.diagnose(witness,
+            SourceLoc diagLoc = getLocForDiagnosingWitness(conformance,witness);
+            auto diag = diags.diagnose(diagLoc,
                                        diag::witness_argument_name_mismatch,
                                        isa<ConstructorDecl>(witness),
                                        witness->getFullName(),
                                        proto->getDeclaredType(),
                                        requirement->getFullName());
-            fixDeclarationName(diag, witness, requirement->getFullName());
+            if (diagLoc == witness->getLoc()) {
+              fixDeclarationName(diag, witness, requirement->getFullName());
+            } else {
+              diag.flush();
+              diags.diagnose(witness, diag::decl_declared_here,
+                             witness->getFullName());
+            }
           }
 
-          diags.diagnose(requirement, diag::protocol_requirement_here,
+          diags.diagnose(requirement, diag::kind_declname_declared_here,
+                         DescriptiveDeclKind::Requirement,
                          requirement->getFullName());
-
         });
     }
 
-    AccessScope nominalAccessScope =
-        Adoptee->getAnyNominal()->getFormalAccessScope(DC);
+    auto nominalAccessScope = nominal->getFormalAccessScope(DC);
     auto check = checkWitness(nominalAccessScope, requirement, best);
 
     switch (check.Kind) {
@@ -2994,6 +2787,21 @@ ConformanceChecker::resolveWitnessViaLookup(ValueDecl *requirement) {
 
     case CheckKind::Access:
     case CheckKind::AccessOfSetter: {
+      // Swift 4.2 relaxed some rules for protocol witness matching.
+      //
+      // This meant that it was possible for an optional protocol requirement
+      // to have a witness where previously in Swift 4.1 it did not.
+      //
+      // Since witnesses must be as visible as the protocol, this caused a
+      // source compatibility break if the witness was not sufficiently
+      // visible.
+      //
+      // Work around this by discarding the witness if its not sufficiently
+      // visible.
+      if (!TC.Context.isSwiftVersionAtLeast(5))
+        if (requirement->getAttrs().hasAttribute<OptionalAttr>())
+          return ResolveWitnessResult::Missing;
+
       // Avoid relying on the lifetime of 'this'.
       const DeclContext *DC = this->DC;
       diagnoseOrDefer(requirement, false,
@@ -3012,15 +2820,26 @@ ConformanceChecker::resolveWitnessViaLookup(ValueDecl *requirement) {
         bool isSetter = (check.Kind == CheckKind::AccessOfSetter);
 
         auto &diags = DC->getASTContext().Diags;
-        auto diag = diags.diagnose(
-                             witness, diagKind,
-                             getRequirementKind(requirement),
-                             witness->getFullName(),
-                             isSetter,
-                             requiredAccess,
-                             protoAccessScope.accessLevelForDiagnostics(),
-                             proto->getName());
-        fixItAccess(diag, witness, requiredAccess, isSetter);
+        diags.diagnose(getLocForDiagnosingWitness(conformance, witness),
+                       diagKind,
+                       getRequirementKind(requirement),
+                       witness->getFullName(),
+                       isSetter,
+                       requiredAccess,
+                       protoAccessScope.accessLevelForDiagnostics(),
+                       proto->getName());
+        if (auto *decl = dyn_cast<AbstractFunctionDecl>(witness)) {
+          auto isMemberwiseInitializer =
+              decl->getBodyKind() ==
+              AbstractFunctionDecl::BodyKind::MemberwiseInitializer;
+          if (isMemberwiseInitializer) {
+            return;
+          }
+        }
+        auto fixItDiag = diags.diagnose(witness, diag::witness_fix_access,
+                                        witness->getDescriptiveKind(),
+                                        requiredAccess);
+        fixItAccess(fixItDiag, witness, requiredAccess, isSetter);
       });
       break;
     }
@@ -3032,49 +2851,59 @@ ConformanceChecker::resolveWitnessViaLookup(ValueDecl *requirement) {
           // FIXME: The problem may not be the OS version.
           ASTContext &ctx = witness->getASTContext();
           auto &diags = ctx.Diags;
+          SourceLoc diagLoc = getLocForDiagnosingWitness(conformance, witness);
           diags.diagnose(
-                  witness,
-                  diag::availability_protocol_requires_version,
-                  conformance->getProtocol()->getFullName(),
-                  witness->getFullName(),
-                  prettyPlatformString(targetPlatform(ctx.LangOpts)),
-                  check.RequiredAvailability.getOSVersion().getLowerEndpoint());
-          diags.diagnose(requirement, 
+              diagLoc, diag::availability_protocol_requires_version,
+              conformance->getProtocol()->getFullName(),
+              witness->getFullName(),
+              prettyPlatformString(targetPlatform(ctx.LangOpts)),
+              check.RequiredAvailability.getOSVersion().getLowerEndpoint());
+          emitDeclaredHereIfNeeded(diags, diagLoc, witness);
+          diags.diagnose(requirement,
                          diag::availability_protocol_requirement_here);
-          diags.diagnose(conformance->getLoc(),
-                         diag::availability_conformance_introduced_here);
         });
       break;
     }
 
     case CheckKind::Unavailable: {
       auto *attr = requirement->getAttrs().getUnavailable(TC.Context);
-      TC.diagnoseUnavailableOverride(witness, requirement, attr);
+      diagnoseUnavailableOverride(witness, requirement, attr);
       break;
     }
 
-    case CheckKind::OptionalityConflict:
+    case CheckKind::OptionalityConflict: {
+      auto adjustments = best.OptionalAdjustments;
+
       diagnoseOrDefer(requirement, false,
-        [witness, best, requirement](NormalProtocolConformance *conformance) {
+        [witness, adjustments, requirement](NormalProtocolConformance *conformance) {
           auto proto = conformance->getProtocol();
           auto &ctx = witness->getASTContext();
           auto &diags = ctx.Diags;
           {
+            SourceLoc diagLoc = getLocForDiagnosingWitness(conformance,witness);
             auto diag = diags.diagnose(
-                          witness,
-                          hasAnyError(best.OptionalAdjustments)
-                            ? diag::err_protocol_witness_optionality
-                            : diag::warn_protocol_witness_optionality,
-                          best.classifyOptionalityIssues(requirement),
-                          witness->getFullName(),
-                          proto->getFullName());
-            best.addOptionalityFixIts(ctx, witness, diag);
+                diagLoc,
+                hasAnyError(adjustments)
+                  ? diag::err_protocol_witness_optionality
+                  : diag::warn_protocol_witness_optionality,
+                classifyOptionalityIssues(adjustments, requirement),
+                witness->getFullName(),
+                proto->getFullName());
+            if (diagLoc == witness->getLoc()) {
+              addOptionalityFixIts(adjustments, ctx, witness, diag);
+            } else {
+              diag.flush();
+              diags.diagnose(witness, diag::decl_declared_here,
+                             witness->getFullName());
+            }
           }
 
-          diags.diagnose(requirement, diag::protocol_requirement_here,
+          diags.diagnose(requirement, diag::kind_declname_declared_here,
+                         DescriptiveDeclKind::Requirement,
                          requirement->getFullName());
       });
       break;
+    }
 
     case CheckKind::ConstructorFailability:
       diagnoseOrDefer(requirement, false,
@@ -3082,12 +2911,14 @@ ConformanceChecker::resolveWitnessViaLookup(ValueDecl *requirement) {
           auto ctor = cast<ConstructorDecl>(requirement);
           auto witnessCtor = cast<ConstructorDecl>(witness);
           auto &diags = witness->getASTContext().Diags;
-          diags.diagnose(witness,
+          SourceLoc diagLoc = getLocForDiagnosingWitness(conformance, witness);
+          diags.diagnose(diagLoc,
                          diag::witness_initializer_failability,
                          ctor->getFullName(),
                          witnessCtor->getFailability()
                            == OTK_ImplicitlyUnwrappedOptional)
             .highlight(witnessCtor->getFailabilityLoc());
+          emitDeclaredHereIfNeeded(diags, diagLoc, witness);
         });
 
       break;
@@ -3098,129 +2929,30 @@ ConformanceChecker::resolveWitnessViaLookup(ValueDecl *requirement) {
         [witness, requirement, emitError](
                                     NormalProtocolConformance *conformance) {
           auto &diags = witness->getASTContext().Diags;
-          diags.diagnose(witness,
+          SourceLoc diagLoc = getLocForDiagnosingWitness(conformance, witness);
+          diags.diagnose(diagLoc,
                          emitError ? diag::witness_unavailable
                                    : diag::witness_unavailable_warn,
                          witness->getDescriptiveKind(),
                          witness->getFullName(),
                          conformance->getProtocol()->getFullName());
-          diags.diagnose(requirement, diag::protocol_requirement_here,
+          emitDeclaredHereIfNeeded(diags, diagLoc, witness);
+          diags.diagnose(requirement, diag::kind_declname_declared_here,
+                         DescriptiveDeclKind::Requirement,
                          requirement->getFullName());
         });
       break;
     }
     }
 
-    ClassDecl *classDecl = Adoptee->getClassOrBoundGenericClass();
-
-    if (classDecl && !classDecl->isFinal()) {
-      // If we have an initializer requirement and the conforming type
-      // is a non-final class, the witness must be 'required'.
-      // We exempt Objective-C initializers from this requirement
-      // because there is no equivalent to 'required' in Objective-C.
-      if (auto ctor = dyn_cast<ConstructorDecl>(best.Witness)) {
-        if (!ctor->isRequired() &&
-            !ctor->getDeclContext()->getAsProtocolOrProtocolExtensionContext() &&
-            !ctor->hasClangNode()) {
-          // FIXME: We're not recovering (in the AST), so the Fix-It
-          // should move.
-          diagnoseOrDefer(requirement, false,
-            [ctor, requirement](NormalProtocolConformance *conformance) {
-              bool inExtension = isa<ExtensionDecl>(ctor->getDeclContext());
-              auto &diags = ctor->getASTContext().Diags;
-              auto diag = diags.diagnose(ctor->getLoc(),
-                                         diag::witness_initializer_not_required,
-                                         requirement->getFullName(), 
-                                         inExtension,
-                                         conformance->getType());
-              if (!ctor->isImplicit() && !inExtension)
-                diag.fixItInsert(ctor->getStartLoc(), "required ");
-            });
-        }
+    if (auto *classDecl = Adoptee->getClassOrBoundGenericClass()) {
+      if (!classDecl->isFinal()) {
+        checkNonFinalClassWitness(requirement, witness);
       }
-
-      // Check whether this requirement uses Self in a way that might
-      // prevent conformance from succeeding.
-      auto selfKind = Proto->findProtocolSelfReferences(requirement,
-                                           /*allowCovariantParameters=*/false,
-                                           /*skipAssocTypes=*/true);
-
-      if (selfKind.other) {
-        // References to Self in a position where subclasses cannot do
-        // the right thing. Complain if the adoptee is a non-final
-        // class.
-        diagnoseOrDefer(requirement, false,
-          [witness, requirement](NormalProtocolConformance *conformance) {
-            auto proto = conformance->getProtocol();
-            auto &diags = proto->getASTContext().Diags;
-            diags.diagnose(witness->getLoc(), diag::witness_self_non_subtype,
-                           proto->getDeclaredType(), requirement->getFullName(),
-                           conformance->getType());
-          });
-      } else if (selfKind.result) {
-        // The reference to Self occurs in the result type. A non-final class 
-        // can satisfy this requirement with a method that returns Self.
-
-        // If the function has a dynamic Self, it's okay.
-        if (auto func = dyn_cast<FuncDecl>(best.Witness)) {
-          if (!func->hasDynamicSelf()) {
-            diagnoseOrDefer(requirement, false,
-              [witness, requirement](NormalProtocolConformance *conformance) {
-                auto proto = conformance->getProtocol();
-                auto &diags = proto->getASTContext().Diags;
-                diags.diagnose(witness->getLoc(),
-                               diag::witness_requires_dynamic_self,
-                               requirement->getFullName(),
-                               conformance->getType(),
-                               proto->getDeclaredType());
-              });
-          }
-
-        // Constructors conceptually also have a dynamic Self
-        // return type, so they're okay.
-        } else if (!isa<ConstructorDecl>(best.Witness)) {
-          diagnoseOrDefer(requirement, false,
-            [witness, requirement](NormalProtocolConformance *conformance) {
-              auto proto = conformance->getProtocol();
-              auto &diags = proto->getASTContext().Diags;
-              diags.diagnose(witness->getLoc(), diag::witness_self_non_subtype,
-                             proto->getDeclaredType(),
-                             requirement->getFullName(),
-                             conformance->getType());
-            });
-        }
-      } else if (selfKind.requirement) {
-        if (auto constraint = getAdopteeSelfSameTypeConstraint(classDecl,
-                                                               witness)) {
-          // A "Self ==" constraint works incorrectly with subclasses. Complain.
-          auto proto = Conformance->getProtocol();
-          auto &diags = proto->getASTContext().Diags;
-          diags.diagnose(witness->getLoc(),
-                         diag::witness_self_same_type,
-                         witness->getDescriptiveKind(),
-                         witness->getFullName(),
-                         Conformance->getType(),
-                         requirement->getDescriptiveKind(),
-                         requirement->getFullName(),
-                         proto->getDeclaredType());
-
-          if (auto requirementRepr = *constraint) {
-            diags.diagnose(requirementRepr->getEqualLoc(),
-                           diag::witness_self_weaken_same_type,
-                           requirementRepr->getFirstType(),
-                           requirementRepr->getSecondType())
-              .fixItReplace(requirementRepr->getEqualLoc(), ":");
-          }
-        }
-      }
-
-      // A non-final class can model a protocol requirement with a
-      // contravariant Self, because here the witness will always have
-      // a more general type than the requirement.
     }
 
     // Record the match.
-    recordWitness(requirement, best, std::move(reqEnvironment));
+    recordWitness(requirement, best);
     return ResolveWitnessResult::Success;
 
     // We have an ambiguity; diagnose it below.
@@ -3300,10 +3032,9 @@ ResolveWitnessResult ConformanceChecker::resolveWitnessViaDerivation(
 
   // Find the declaration that derives the protocol conformance.
   NominalTypeDecl *derivingTypeDecl = nullptr;
-  if (auto *nominal = Adoptee->getAnyNominal()) {
-    if (nominal->derivesProtocolConformance(Proto))
-      derivingTypeDecl = nominal;
-  }
+  auto *nominal = Adoptee->getAnyNominal();
+  if (DerivedConformance::derivesProtocolConformance(TC, DC, nominal, Proto))
+    derivingTypeDecl = nominal;
 
   if (!derivingTypeDecl) {
     return ResolveWitnessResult::Missing;
@@ -3315,11 +3046,9 @@ ResolveWitnessResult ConformanceChecker::resolveWitnessViaDerivation(
     return ResolveWitnessResult::ExplicitFailed;
 
   // Try to match the derived requirement.
-  RequirementEnvironment reqEnvironment(TC, DC, requirement, Conformance);
-  auto match = matchWitness(TC, Proto, Conformance, DC, requirement, derived,
-                            reqEnvironment);
+  auto match = matchWitness(TC, Proto, Conformance, DC, requirement, derived);
   if (match.isViable()) {
-    recordWitness(requirement, match, std::move(reqEnvironment));
+    recordWitness(requirement, match);
     return ResolveWitnessResult::Success;
   }
 
@@ -3354,46 +3083,51 @@ ResolveWitnessResult ConformanceChecker::resolveWitnessViaDefault(
 
 # pragma mark Type witness resolution
 
-/// Check whether the given type witness can be used for the given
-/// associated type.
-///
-/// \returns an empty result on success, or a description of the error.
-static CheckTypeWitnessResult checkTypeWitness(TypeChecker &tc, DeclContext *dc,
+CheckTypeWitnessResult swift::checkTypeWitness(TypeChecker &tc, DeclContext *dc,
                                                ProtocolDecl *proto,
                                                AssociatedTypeDecl *assocType, 
                                                Type type) {
-  auto *moduleDecl = dc->getParentModule();
   auto *genericSig = proto->getGenericSignature();
   auto *depTy = DependentMemberType::get(proto->getSelfInterfaceType(),
                                          assocType);
 
-  if (auto superclass = genericSig->getSuperclassBound(depTy, *moduleDecl)) {
-    if (!superclass->isExactSuperclassOf(type))
-      return superclass->getAnyNominal();
+  if (type->hasError())
+    return ErrorType::get(tc.Context);
+
+  Type contextType = type->hasTypeParameter() ? dc->mapTypeIntoContext(type)
+                                              : type;
+
+  if (auto superclass = genericSig->getSuperclassBound(depTy)) {
+    if (!superclass->isExactSuperclassOf(contextType))
+      return superclass;
   }
 
   // Check protocol conformances.
-  for (auto reqProto : genericSig->getConformsTo(depTy, *moduleDecl)) {
-    if (!tc.conformsToProtocol(type, reqProto, dc, None))
-      return reqProto;
+  for (auto reqProto : genericSig->getConformsTo(depTy)) {
+    if (!tc.conformsToProtocol(
+                          contextType, reqProto, dc,
+                          ConformanceCheckFlags::SkipConditionalRequirements))
+      return CheckTypeWitnessResult(reqProto->getDeclaredType());
 
     // FIXME: Why is conformsToProtocol() not enough? The stdlib doesn't
     // build unless we fail here while inferring an associated type
     // somewhere.
-    if (type->isSpecialized()) {
-      auto *decl = type->getAnyNominal();
-      auto subMap = type->getContextSubstitutionMap(
+    if (contextType->isSpecialized()) {
+      auto *decl = contextType->getAnyNominal();
+      auto subMap = contextType->getContextSubstitutionMap(
           dc->getParentModule(),
           decl,
           decl->getGenericEnvironmentOfContext());
-      auto result = decl->getGenericSignature()->enumeratePairedRequirements(
-        [&](Type t, ArrayRef<Requirement> reqt) -> bool {
-          return t.subst(subMap, SubstFlags::UseErrorType)->hasError();
-        });
-      if (result)
-        return reqProto;
+      for (auto replacement : subMap.getReplacementTypes()) {
+        if (replacement->hasError())
+          return CheckTypeWitnessResult(reqProto->getDeclaredType());
+      }
     }
   }
+
+  if (genericSig->requiresClass(depTy) &&
+      !contextType->satisfiesClassConstraint())
+    return CheckTypeWitnessResult(tc.Context.getAnyObjectType());
 
   // Success!
   return CheckTypeWitnessResult();
@@ -3426,27 +3160,44 @@ ResolveWitnessResult ConformanceChecker::resolveTypeWitnessViaLookup(
   }
 
   // Determine which of the candidates is viable.
-  SmallVector<std::pair<TypeDecl *, Type>, 2> viable;
-  SmallVector<std::pair<TypeDecl *, NominalTypeDecl *>, 2> nonViable;
+  SmallVector<LookupTypeResultEntry, 2> viable;
+  SmallVector<std::pair<TypeDecl *, CheckTypeWitnessResult>, 2> nonViable;
   for (auto candidate : candidates) {
     // Skip nested generic types.
-    if (auto *genericDecl = dyn_cast<GenericTypeDecl>(candidate.first))
-      if (genericDecl->getGenericParams())
+    if (auto *genericDecl = dyn_cast<GenericTypeDecl>(candidate.Member))
+      if (genericDecl->isGeneric())
+        continue;
+
+    // Skip typealiases with an unbound generic type as their underlying type.
+    if (auto *typeAliasDecl = dyn_cast<TypeAliasDecl>(candidate.Member))
+      if (typeAliasDecl->getDeclaredInterfaceType()->is<UnboundGenericType>())
         continue;
 
     // Check this type against the protocol requirements.
-    if (auto checkResult = checkTypeWitness(TC, DC, Proto, assocType,
-                                            candidate.second)) {
-      auto reqProto = checkResult.getProtocolOrClass();
-      nonViable.push_back({candidate.first, reqProto});
+    if (auto checkResult =
+            checkTypeWitness(TC, DC, Proto, assocType, candidate.MemberType)) {
+      nonViable.push_back({candidate.Member, checkResult});
     } else {
       viable.push_back(candidate);
     }
   }
 
+  // If there are no viable witnesses, and all nonviable candidates came from
+  // protocol extensions, treat this as "missing".
+  if (viable.empty() &&
+      std::find_if(nonViable.begin(), nonViable.end(),
+                   [](const std::pair<TypeDecl *, CheckTypeWitnessResult> &x) {
+                     return x.first->getDeclContext()
+                        ->getAsProtocolOrProtocolExtensionContext() == nullptr;
+                   }) == nonViable.end())
+    return ResolveWitnessResult::Missing;
+
   // If there is a single viable candidate, form a substitution for it.
   if (viable.size() == 1) {
-    recordTypeWitness(assocType, viable.front().second, viable.front().first, true);
+    auto interfaceType = viable.front().MemberType;
+    if (interfaceType->hasArchetype())
+      interfaceType = interfaceType->mapTypeOutOfContext();
+    recordTypeWitness(assocType, interfaceType, viable.front().Member, true);
     return ResolveWitnessResult::Success;
   }
 
@@ -3462,7 +3213,7 @@ ResolveWitnessResult ConformanceChecker::resolveTypeWitnessViaLookup(
                        assocType->getName());
 
         for (auto candidate : viable)
-          diags.diagnose(candidate.first, diag::protocol_witness_type);
+          diags.diagnose(candidate.Member, diag::protocol_witness_type);
       });
 
     return ResolveWitnessResult::ExplicitFailed;
@@ -3475,1661 +3226,20 @@ ResolveWitnessResult ConformanceChecker::resolveTypeWitnessViaLookup(
     [nonViable](NormalProtocolConformance *conformance) {
       auto &diags = conformance->getDeclContext()->getASTContext().Diags;
       for (auto candidate : nonViable) {
-        if (candidate.first->getDeclaredInterfaceType()->hasError())
+        if (candidate.first->getDeclaredInterfaceType()->hasError() ||
+            candidate.second.isError())
           continue;
 
         diags.diagnose(
            candidate.first,
            diag::protocol_witness_nonconform_type,
            candidate.first->getDeclaredInterfaceType(),
-           candidate.second->getDeclaredInterfaceType(),
-           candidate.second->getDeclaredInterfaceType()->is<ProtocolType>());
+           candidate.second.getRequirement(),
+           candidate.second.isConformanceRequirement());
       }
     });
 
   return ResolveWitnessResult::ExplicitFailed;
-}
-
-static bool associatedTypesAreSameEquivalenceClass(AssociatedTypeDecl *a,
-                                                   AssociatedTypeDecl *b) {
-  if (a == b)
-    return true;
-  
-  // TODO: Do a proper equivalence check here by looking for some relationship
-  // between a and b's protocols. In practice today, it's unlikely that
-  // two same-named associated types can currently be independent, since we
-  // don't have anything like `@implements(P.foo)` to rename witnesses (and
-  // we still fall back to name lookup for witnesses in more cases than we
-  // should).
-  if (a->getName() == b->getName())
-    return true;
-
-  return false;
-}
-
-InferredAssociatedTypesByWitnesses
-ConformanceChecker::inferTypeWitnessesViaValueWitnesses(
-                    const llvm::SetVector<AssociatedTypeDecl *> &allUnresolved,
-                    ValueDecl *req) {
-  // Conformances constructed by the ClangImporter should have explicit type
-  // witnesses already.
-  if (isa<ClangModuleUnit>(Conformance->getDeclContext()->getModuleScopeContext())) {
-    llvm::errs() << "Cannot infer associated types for imported conformance:\n";
-    Conformance->getType().dump(llvm::errs());
-    for (auto assocTypeDecl : allUnresolved)
-      assocTypeDecl->dump(llvm::errs());
-    abort();
-  }
-
-  InferredAssociatedTypesByWitnesses result;
-
-  auto isExtensionUsableForInference = [&](ExtensionDecl *extension) -> bool {
-    // Assume unconstrained concrete extensions we found witnesses in are
-    // always viable.
-    if (!extension->getExtendedType()->isAnyExistentialType()) {
-      // TODO: When constrained extensions are a thing, we'll need an "is
-      // as specialized as" kind of check here.
-      return !extension->isConstrainedExtension();
-    }
-    
-    // The extension may not have a generic signature set up yet, as a
-    // recursion breaker, in which case we can't yet confidently reject its
-    // witnesses.
-    if (!extension->getGenericSignature())
-      return true;
-    
-    // The condition here is a bit more fickle than
-    // `isProtocolExtensionUsable`. That check would prematurely reject
-    // extensions like `P where AssocType == T` if we're relying on a
-    // default implementation inside the extension to infer `AssocType == T`
-    // in the first place. Only check conformances on the `Self` type,
-    // because those have to be explicitly declared on the type somewhere
-    // so won't be affected by whatever answer inference comes up with.
-    auto selfTy = GenericTypeParamType::get(0, 0, TC.Context);
-    for (const Requirement &reqt
-         : extension->getGenericSignature()->getRequirements()) {
-      switch (reqt.getKind()) {
-      case RequirementKind::Conformance:
-      case RequirementKind::Superclass:
-        // FIXME: This is the wrong check
-        if (selfTy->isEqual(reqt.getFirstType())
-            && !TC.isSubtypeOf(Conformance->getType(),reqt.getSecondType(), DC))
-          return false;
-        break;
-      
-      case RequirementKind::Layout:
-      case RequirementKind::SameType:
-        break;
-      }
-    }
-    
-    return true;
-  };
-
-  for (auto witness : lookupValueWitnesses(req, /*ignoringNames=*/nullptr)) {
-    DEBUG(llvm::dbgs() << "Inferring associated types from decl:\n";
-          witness->dump(llvm::dbgs()));
-  
-    // If the potential witness came from an extension, and our `Self`
-    // type can't use it regardless of what associated types we end up
-    // inferring, skip the witness.
-    if (auto extension = dyn_cast<ExtensionDecl>(witness->getDeclContext()))
-      if (!isExtensionUsableForInference(extension))
-        continue;
-  
-    // Try to resolve the type witness via this value witness.
-    auto witnessResult = inferTypeWitnessesViaValueWitness(req, witness);
-
-    // Filter out duplicated inferred types as well as inferred types
-    // that don't meet the requirements placed on the associated type.
-    llvm::DenseSet<std::pair<AssociatedTypeDecl *, CanType>> known;
-    for (unsigned i = 0; i < witnessResult.Inferred.size(); /*nothing*/) {
-#define REJECT {\
-  witnessResult.Inferred.erase(witnessResult.Inferred.begin() + i); \
-  continue; \
-}
-      auto &result = witnessResult.Inferred[i];
-
-      DEBUG(llvm::dbgs() << "Considering whether " << result.first->getName()
-                         << " can infer to:\n";
-            result.second->dump(llvm::dbgs()));
-
-      // Filter out errors.
-      if (result.second->hasError()) {
-        DEBUG(llvm::dbgs() << "-- has error type\n");
-        REJECT;
-      }
-
-      // Filter out duplicates.
-      if (!known.insert({result.first, result.second->getCanonicalType()})
-                .second) {
-        DEBUG(llvm::dbgs() << "-- duplicate\n");
-        REJECT;
-      }
-     
-      // Filter out circular possibilities, e.g. that
-      // AssocType == S.AssocType or
-      // AssocType == Foo<S.AssocType>.
-      bool canInferFromOtherAssociatedType = false;
-      bool containsTautologicalType =
-        result.second.findIf([&](Type t) -> bool {
-          auto dmt = t->getAs<DependentMemberType>();
-          if (!dmt)
-            return false;
-          if (!associatedTypesAreSameEquivalenceClass(dmt->getAssocType(),
-                                                      result.first))
-            return false;
-          if (!dmt->getBase()->isEqual(Conformance->getType()))
-            return false;
-          
-          // If this associated type is same-typed to another associated type
-          // on `Self`, then it may still be an interesting candidate if we find
-          // an answer for that other type.
-          auto witnessContext = witness->getDeclContext();
-          if (witnessContext->getAsProtocolExtensionContext()
-              && witnessContext->getGenericSignatureOfContext()) {
-            auto selfTy = witnessContext->getSelfInterfaceType();
-            auto selfAssocTy = DependentMemberType::get(selfTy,
-                                                        dmt->getAssocType());
-            for (auto &reqt : witnessContext->getGenericSignatureOfContext()
-                                            ->getRequirements()) {
-              switch (reqt.getKind()) {
-              case RequirementKind::Conformance:
-              case RequirementKind::Superclass:
-              case RequirementKind::Layout:
-                break;
-              
-              case RequirementKind::SameType:
-                Type other;
-                if (reqt.getFirstType()->isEqual(selfAssocTy)) {
-                  other = reqt.getSecondType();
-                } else if (reqt.getSecondType()->isEqual(selfAssocTy)) {
-                  other = reqt.getFirstType();
-                } else {
-                  break;
-                }
-                
-                if (auto otherAssoc = other->getAs<DependentMemberType>()) {
-                  if (otherAssoc->getBase()->isEqual(selfTy)) {
-                    auto otherDMT = DependentMemberType::get(dmt->getBase(),
-                                                    otherAssoc->getAssocType());
-                    
-                    // We may be able to infer one associated type from the
-                    // other.
-                    result.second = result.second.transform([&](Type t) -> Type{
-                      if (t->isEqual(dmt))
-                        return otherDMT;
-                      return t;
-                    });
-                    canInferFromOtherAssociatedType = true;
-                    DEBUG(llvm::dbgs() << "++ we can same-type to:\n";
-                          result.second->dump(llvm::dbgs()));
-                    return false;
-                  }
-                }
-                break;
-              }
-            }
-          }
-          
-          return true;
-        });
-      
-      if (containsTautologicalType) {
-        DEBUG(llvm::dbgs() << "-- tautological\n");
-        REJECT;
-      }
-      
-      // Check that the type witness doesn't contradict an
-      // explicitly-given type witness. If it does contradict, throw out the
-      // witness completely.
-      if (!allUnresolved.count(result.first)) {
-        auto existingWitness =
-          Conformance->getTypeWitness(result.first, nullptr);
-
-        // If the deduced type contains an irreducible
-        // DependentMemberType, that indicates a dependency
-        // on another associated type we haven't deduced,
-        // so we can't tell whether there's a contradiction
-        // yet.
-        auto newWitness = result.second->getCanonicalType();
-        if (!newWitness->hasTypeParameter() &&
-            !newWitness->hasDependentMember() &&
-            !existingWitness->isEqual(newWitness)) {
-          DEBUG(llvm::dbgs() << "** contradicts explicit type witness, "
-                                "rejecting inference from this decl\n");
-          goto next_witness;
-        }
-      }
-      
-      // If we same-typed to another unresolved associated type, we won't
-      // be able to check conformances yet.
-      if (!canInferFromOtherAssociatedType) {
-        // Check that the type witness meets the
-        // requirements on the associated type.
-        if (auto failed = checkTypeWitness(TC, DC, Proto, result.first,
-                                           result.second)) {
-          witnessResult.NonViable.push_back(
-                              std::make_tuple(result.first,result.second,failed));
-          DEBUG(llvm::dbgs() << "-- doesn't fulfill requirements\n");
-          REJECT;
-        }
-      }
-      
-      DEBUG(llvm::dbgs() << "++ seems legit\n");
-      ++i;
-    }
-#undef REJECT
-
-    // If no inferred types remain, skip this witness.
-    if (witnessResult.Inferred.empty() && witnessResult.NonViable.empty())
-      continue;
-
-    // If there were any non-viable inferred associated types, don't
-    // infer anything from this witness.
-    if (!witnessResult.NonViable.empty())
-      witnessResult.Inferred.clear();
-
-    result.push_back(std::move(witnessResult));
-next_witness:;
-  }
-
-  return result;
-}
-
-InferredAssociatedTypes
-ConformanceChecker::inferTypeWitnessesViaValueWitnesses(
-  const llvm::SetVector<AssociatedTypeDecl *> &assocTypes)
-{
-  InferredAssociatedTypes result;
-  for (auto member : Proto->getMembers()) {
-    auto req = dyn_cast<ValueDecl>(member);
-    if (!req)
-      continue;
-
-    // We only look at value witnesses.
-    if (isa<AssociatedTypeDecl>(req))
-      continue;
-
-    // Skip operator requirements, because they match globally and 
-    // therefore tend to cause deduction mismatches.
-    // FIXME: If we had some basic sanity checking of Self, we might be able to
-    // use these.
-    if (auto func = dyn_cast<FuncDecl>(req)) {
-      if (func->isOperator() || func->isAccessor())
-        continue;
-    }
-
-    // Validate the requirement.
-    TC.validateDecl(req);
-    if (req->isInvalid() || !req->hasValidSignature())
-      continue;
-      
-    // Check whether any of the associated types we care about are
-    // referenced in this value requirement.
-    bool anyAssocTypeMatches = false;
-    for (auto assocType : getReferencedAssociatedTypes(req)) {
-      if (assocTypes.count(assocType) > 0) {
-        anyAssocTypeMatches = true;
-        break;
-      }
-    }
-
-    // We cannot deduce anything from the witnesses of this
-    // requirement; skip it.
-    if (!anyAssocTypeMatches)
-      continue;
-
-    // Infer associated types from the potential value witnesses for
-    // this requirement.
-    auto reqInferred = inferTypeWitnessesViaValueWitnesses(assocTypes, req);
-    if (reqInferred.empty())
-      continue;
-
-    result.push_back({req, std::move(reqInferred)});
-  }
-
-  return result;
-}
-
-/// Map error types back to their original types.
-static Type mapErrorTypeToOriginal(Type type) {
-  if (auto errorType = type->getAs<ErrorType>()) {
-    if (auto originalType = errorType->getOriginalType())
-      return originalType.transform(mapErrorTypeToOriginal);
-  }
-
-  return type;
-}
-
-/// Produce the type when matching a witness.
-static Type getWitnessTypeForMatching(TypeChecker &tc,
-                                      NormalProtocolConformance *conformance,
-                                      ValueDecl *witness) {
-  if (!witness->hasInterfaceType())
-    tc.validateDecl(witness);
-
-  if (witness->isInvalid() || !witness->hasValidSignature())
-    return Type();
-
-  if (!witness->getDeclContext()->isTypeContext()) {
-    // FIXME: Could we infer from 'Self' to make these work?
-    return witness->getInterfaceType();
-  }
-
-  // Retrieve the set of substitutions to be applied to the witness.
-  Type model = conformance->getType();
-  TypeSubstitutionMap substitutions = model->getMemberSubstitutions(witness);
-  if (substitutions.empty())
-    return witness->getInterfaceType();
-
-  Type type = witness->getInterfaceType();
-  
-  // Strip off the requirements of a generic function type.
-  // FIXME: This doesn't actually break recursion when substitution
-  // looks for an inferred type witness, but it makes it far less
-  // common, because most of the recursion involves the requirements
-  // of the generic type.
-  if (auto genericFn = type->getAs<GenericFunctionType>()) {
-    type = FunctionType::get(genericFn->getInput(),
-                             genericFn->getResult(),
-                             genericFn->getExtInfo());
-  }
-
-  // Remap associated types that reference other protocols into this
-  // protocol.
-  auto proto = conformance->getProtocol();
-  type = type.transformRec([proto](TypeBase *type) -> Optional<Type> {
-    if (auto depMemTy = dyn_cast<DependentMemberType>(type)) {
-      if (depMemTy->getAssocType() &&
-          depMemTy->getAssocType()->getProtocol() != proto) {
-        for (auto member : proto->lookupDirect(depMemTy->getName())) {
-          if (auto assocType = dyn_cast<AssociatedTypeDecl>(member)) {
-            auto origProto = depMemTy->getAssocType()->getProtocol();
-            if (proto->inheritsFrom(origProto))
-              return Type(DependentMemberType::get(depMemTy->getBase(),
-                                                   assocType));
-          }
-        }
-      }
-    }
-
-    return None;
-  });
-
-  ModuleDecl *module = conformance->getDeclContext()->getParentModule();
-  auto resultType = type.subst(QueryTypeSubstitutionMap{substitutions},
-                               LookUpConformanceInModule(module),
-                               SubstFlags::UseErrorType);
-  if (!resultType->hasError()) return resultType;
-
-  // Map error types with original types *back* to the original, dependent type.
-  return resultType.transform(mapErrorTypeToOriginal);
-}
-
-/// Remove the 'self' type from the given type, if it's a method type.
-static Type removeSelfParam(ValueDecl *value, Type type) {
-  if (auto func = dyn_cast<AbstractFunctionDecl>(value)) {
-    if (func->getDeclContext()->isTypeContext())
-      return type->castTo<AnyFunctionType>()->getResult();
-  }
-
-  return type;
-}
-
-/// Attempt to resolve a type witness via a specific value witness.
-InferredAssociatedTypesByWitness
-ConformanceChecker::inferTypeWitnessesViaValueWitness(ValueDecl *req,
-                                                      ValueDecl *witness) {
-  InferredAssociatedTypesByWitness inferred;
-  inferred.Witness = witness;
-
-  // Compute the requirement and witness types we'll use for matching.
-  Type fullWitnessType = getWitnessTypeForMatching(TC, Conformance, witness);
-  if (!fullWitnessType) {
-    return inferred;
-  }
-
-  auto setup = [&]() -> std::tuple<Optional<RequirementMatch>, Type, Type> {
-    fullWitnessType = removeSelfParam(witness, fullWitnessType);
-    return std::make_tuple(
-        None,
-        removeSelfParam(req, req->getInterfaceType()),
-        fullWitnessType);
-  };
-
-  /// Visits a requirement type to match it to a potential witness for
-  /// the purpose of deducing associated types.
-  ///
-  /// The visitor argument is the witness type. If there are any
-  /// obvious conflicts between the structure of the two types,
-  /// returns true. The conflict checking is fairly conservative, only
-  /// considering rough structure.
-  class MatchVisitor : public TypeMatcher<MatchVisitor> {
-    NormalProtocolConformance *Conformance;
-    InferredAssociatedTypesByWitness &Inferred;
-
-  public:
-    MatchVisitor(NormalProtocolConformance *conformance,
-                 InferredAssociatedTypesByWitness &inferred)
-      : Conformance(conformance), Inferred(inferred) { }
-
-    /// Structural mismatches imply that the witness cannot match.
-    bool mismatch(TypeBase *firstType, TypeBase *secondType,
-                  Type sugaredFirstType) {
-      // If either type hit an error, don't stop yet.
-      if (firstType->hasError() || secondType->hasError())
-        return true;
-
-      // FIXME: Check whether one of the types is dependent?
-      return false;
-    }
-
-    /// Deduce associated types from dependent member types in the witness.
-    bool mismatch(DependentMemberType *firstDepMember,
-                  TypeBase *secondType, Type sugaredFirstType) {
-      // If the second type is an error, don't look at it further.
-      if (secondType->hasError())
-        return true;
-
-      auto proto = Conformance->getProtocol();
-      if (auto assocType = getReferencedAssocTypeOfProtocol(firstDepMember,
-                                                            proto)) {
-        Inferred.Inferred.push_back({assocType, secondType});
-      }
-
-      // Always allow mismatches here.
-      return true;
-    }
-
-    /// FIXME: Recheck the type of Self against the second type?
-    bool mismatch(GenericTypeParamType *selfParamType,
-                  TypeBase *secondType, Type sugaredFirstType) {
-      return true;
-    }
-  };
-
-  // Match a requirement and witness type.
-  MatchVisitor matchVisitor(Conformance, inferred);
-  auto matchTypes = [&](Type reqType, Type witnessType)
-                      -> Optional<RequirementMatch> {
-    if (!matchVisitor.match(reqType, witnessType)) {
-      return RequirementMatch(witness, MatchKind::TypeConflict,
-                              fullWitnessType);
-    }
-
-    return None;
-  };
-
-  // Finalization of the checking is pretty trivial; just bundle up a
-  // result we can look at.
-  auto finalize = [&](bool anyRenaming, ArrayRef<OptionalAdjustment>)
-                    -> RequirementMatch {
-    return RequirementMatch(witness, 
-                            anyRenaming ? MatchKind::RenamedMatch
-                                        : MatchKind::ExactMatch,
-                            fullWitnessType);
-
-  };
-
-  // Match the witness. If we don't succeed, throw away the inference
-  // information.
-  // FIXME: A renamed match might be useful to retain for the failure case.
-  if (matchWitness(TC, DC, req, witness, setup, matchTypes, finalize)
-          .Kind != MatchKind::ExactMatch) {
-    inferred.Inferred.clear();
-  }
-
-  return inferred;
-}
-
-namespace {
-  /// A potential solution to the set of inferred type witnesses.
-  struct InferredTypeWitnessesSolution {
-    /// The set of type witnesses inferred by this solution, along
-    /// with the index into the value witnesses where the type was
-    /// inferred.
-    llvm::SmallDenseMap<AssociatedTypeDecl *, std::pair<Type, unsigned>, 4>
-      TypeWitnesses;
-
-    /// The value witnesses selected by this step of the solution.
-    SmallVector<std::pair<ValueDecl *, ValueDecl *>, 4> ValueWitnesses;
-
-    /// The number of value witnesses that occur in protocol
-    /// extensions.
-    unsigned NumValueWitnessesInProtocolExtensions;
-    
-#ifndef NDEBUG
-    LLVM_ATTRIBUTE_USED
-#endif
-    void dump() {
-      llvm::errs() << "Type Witnesses:\n";
-      for (auto &typeWitness : TypeWitnesses) {
-        llvm::errs() << "  " << typeWitness.first->getName() << " := ";
-        typeWitness.second.first->print(llvm::errs());
-        llvm::errs() << " value " << typeWitness.second.second << '\n';
-      }
-      llvm::errs() << "Value Witnesses:\n";
-      for (unsigned i : indices(ValueWitnesses)) {
-        auto &valueWitness = ValueWitnesses[i];
-        llvm::errs() << i << ":  " << (Decl*)valueWitness.first
-                     << ' ' << valueWitness.first->getBaseName() << '\n';
-        valueWitness.first->getDeclContext()->dumpContext();
-        llvm::errs() << "    for " << (Decl*)valueWitness.second
-                     << ' ' << valueWitness.second->getBaseName() << '\n';
-        valueWitness.second->getDeclContext()->dumpContext();
-      }
-    }
-  };
-
-  /// A failed type witness binding.
-  struct FailedTypeWitness {
-    /// The value requirement that triggered inference.
-    ValueDecl *Requirement;
-
-    /// The corresponding value witness from which the type witness
-    /// was inferred.
-    ValueDecl *Witness;
-
-    /// The actual type witness that was inferred.
-    Type TypeWitness;
-
-    /// The failed type witness result.
-    CheckTypeWitnessResult Result;
-  };
-
-  /// A conflict between two inferred type witnesses for the same
-  /// associated type.
-  struct TypeWitnessConflict {
-    /// The associated type.
-    AssociatedTypeDecl *AssocType;
-
-    /// The first type.
-    Type FirstType;
-
-    /// The requirement to which the first witness was matched.
-    ValueDecl *FirstRequirement;
-
-    /// The witness from which the first type witness was inferred.
-    ValueDecl *FirstWitness;
-
-    /// The second type.
-    Type SecondType;
-
-    /// The requirement to which the second witness was matched.
-    ValueDecl *SecondRequirement;
-
-    /// The witness from which the second type witness was inferred.
-    ValueDecl *SecondWitness;
-  };
-} // end anonymous namespace
-
-static Comparison
-compareDeclsForInference(TypeChecker &TC, DeclContext *DC,
-                         ValueDecl *decl1, ValueDecl *decl2) {
-  // TC.compareDeclarations assumes that it's comparing two decls that
-  // apply equally well to a call site. We haven't yet inferred the
-  // associated types for a type, so the ranking algorithm used by
-  // compareDeclarations to score protocol extensions is inappropriate,
-  // since we may have potential witnesses from extensions with mutually
-  // exclusive associated type constraints, and compareDeclarations will
-  // consider these unordered since neither extension's generic signature
-  // is a superset of the other.
-  
-  // If the witnesses come from the same decl context, score normally.
-  auto dc1 = decl1->getDeclContext();
-  auto dc2 = decl2->getDeclContext();
-  
-  if (dc1 == dc2)
-    return TC.compareDeclarations(DC, decl1, decl2);
-  
-  auto isProtocolExt1 =
-    (bool)dc1->getAsProtocolExtensionContext();
-  auto isProtocolExt2 =
-    (bool)dc2->getAsProtocolExtensionContext();
-  
-  // If one witness comes from a protocol extension, favor the one
-  // from a concrete context.
-  if (isProtocolExt1 != isProtocolExt2) {
-    return isProtocolExt1 ? Comparison::Worse : Comparison::Better;
-  }
-  
-  // If both witnesses came from concrete contexts, score normally.
-  // Associated type inference shouldn't impact the result.
-  // FIXME: It could, if someone constrained to ConcreteType.AssocType...
-  if (!isProtocolExt1)
-    return TC.compareDeclarations(DC, decl1, decl2);
-  
-  // Compare protocol extensions by which protocols they require Self to
-  // conform to. If one extension requires a superset of the other's
-  // constraints, it wins.
-  auto sig1 = dc1->getGenericSignatureOfContext();
-  auto sig2 = dc2->getGenericSignatureOfContext();
-
-  // FIXME: Extensions sometimes have null generic signatures while
-  // checking the standard library...
-  if (!sig1 || !sig2)
-    return TC.compareDeclarations(DC, decl1, decl2);
-  
-  auto selfParam = GenericTypeParamType::get(0, 0, TC.Context);
-  
-  // Collect the protocols required by extension 1.
-  Type class1;
-  SmallPtrSet<ProtocolDecl*, 4> protos1;
-  
-  std::function<void (ProtocolDecl*)> insertProtocol;
-  insertProtocol = [&](ProtocolDecl *p) {
-    if (!protos1.insert(p).second)
-      return;
-
-    for (auto parent : p->getInheritedProtocols())
-      insertProtocol(parent);
-  };
-  
-  for (auto &reqt : sig1->getRequirements()) {
-    if (!reqt.getFirstType()->isEqual(selfParam))
-      continue;
-    switch (reqt.getKind()) {
-    case RequirementKind::Conformance: {
-      auto *proto = reqt.getSecondType()->castTo<ProtocolType>()->getDecl();
-      insertProtocol(proto);
-      break;
-    }
-    case RequirementKind::Superclass:
-      class1 = reqt.getSecondType();
-      break;
-    
-    case RequirementKind::SameType:
-    case RequirementKind::Layout:
-      break;
-    }
-  }
-
-  // Compare with the protocols required by extension 2.
-  Type class2;
-  SmallPtrSet<ProtocolDecl*, 4> protos2;
-  bool protos2AreSubsetOf1 = true;
-  std::function<void (ProtocolDecl*)> removeProtocol;
-  removeProtocol = [&](ProtocolDecl *p) {
-    if (!protos2.insert(p).second)
-      return;
-
-    protos2AreSubsetOf1 &= protos1.erase(p);
-    for (auto parent : p->getInheritedProtocols())
-      removeProtocol(parent);
-  };
-
-  for (auto &reqt : sig2->getRequirements()) {
-    if (!reqt.getFirstType()->isEqual(selfParam))
-      continue;
-    switch (reqt.getKind()) {
-    case RequirementKind::Conformance: {
-      auto *proto = reqt.getSecondType()->castTo<ProtocolType>()->getDecl();
-      removeProtocol(proto);
-      break;
-    }
-    case RequirementKind::Superclass:
-      class2 = reqt.getSecondType();
-      break;
-    
-    case RequirementKind::SameType:
-    case RequirementKind::Layout:
-      break;
-    }
-  }
-  
-  auto isClassConstraintAsStrict = [&](Type t1, Type t2) -> bool {
-    if (!t1)
-      return !t2;
-    
-    if (!t2)
-      return true;
-    
-    return TC.isSubclassOf(t1, t2, DC);
-  };
-  
-  bool protos1AreSubsetOf2 = protos1.empty();
-  // If the second extension requires strictly more protocols than the
-  // first, it's better.
-  if (protos1AreSubsetOf2 > protos2AreSubsetOf1
-      && isClassConstraintAsStrict(class2, class1)) {
-    return Comparison::Worse;
-  // If the first extension requires strictly more protocols than the
-  // second, it's better.
-  } else if (protos2AreSubsetOf1 > protos1AreSubsetOf2
-             && isClassConstraintAsStrict(class1, class2)) {
-    return Comparison::Better;
-  }
-  
-  // If they require the same set of protocols, or non-overlapping
-  // sets, judge them normally.
-  return TC.compareDeclarations(DC, decl1, decl2);
-}
-
-/// "Sanitize" requirements for conformance checking, removing any requirements
-/// that unnecessarily refer to associated types of other protocols.
-static void sanitizeProtocolRequirements(
-                                     ProtocolDecl *proto,
-                                     ArrayRef<Requirement> requirements,
-                                     SmallVectorImpl<Requirement> &sanitized) {
-  std::function<Type(Type)> sanitizeType;
-  sanitizeType = [&](Type outerType) {
-    return outerType.transformRec([&] (TypeBase *type) -> Optional<Type> {
-      if (auto depMemTy = dyn_cast<DependentMemberType>(type)) {
-        if (!depMemTy->getAssocType() ||
-            depMemTy->getAssocType()->getProtocol() != proto) {
-          for (auto member : proto->lookupDirect(depMemTy->getName())) {
-            if (auto assocType = dyn_cast<AssociatedTypeDecl>(member)) {
-              return Type(DependentMemberType::get(
-                                           sanitizeType(depMemTy->getBase()),
-                                           assocType));
-            }
-          }
-
-          if (depMemTy->getBase()->is<GenericTypeParamType>())
-            return Type();
-        }
-      }
-
-      return None;
-    });
-  };
-
-  for (const auto &req : requirements) {
-    switch (req.getKind()) {
-    case RequirementKind::Conformance:
-    case RequirementKind::SameType:
-    case RequirementKind::Superclass: {
-      Type firstType = sanitizeType(req.getFirstType());
-      Type secondType = sanitizeType(req.getSecondType());
-      if (firstType && secondType) {
-        sanitized.push_back({req.getKind(), firstType, secondType});
-      }
-      break;
-    }
-
-    case RequirementKind::Layout: {
-      Type firstType = sanitizeType(req.getFirstType());
-      if (firstType) {
-        sanitized.push_back({req.getKind(), firstType,
-                             req.getLayoutConstraint()});
-      }
-      break;
-    }
-    }
-  }
-}
-
-void ConformanceChecker::resolveTypeWitnesses() {
-  llvm::SetVector<AssociatedTypeDecl *> unresolvedAssocTypes;
-
-  SWIFT_DEFER {
-    // Resolution attempts to have the witnesses be correct by construction, but
-    // this isn't guaranteed, so let's double check.
-    ensureRequirementsAreSatisfied();
-  };
-
-  // Track when we are checking type witnesses.
-  ProtocolConformanceState initialState = Conformance->getState();
-  Conformance->setState(ProtocolConformanceState::CheckingTypeWitnesses);
-  SWIFT_DEFER { Conformance->setState(initialState); };
-
-  for (auto member : Proto->getMembers()) {
-    auto assocType = dyn_cast<AssociatedTypeDecl>(member);
-    if (!assocType)
-      continue;
-
-    // If we already have a type witness, do nothing.
-    if (Conformance->hasTypeWitness(assocType))
-      continue;
-    
-    // Try to resolve this type witness via name lookup, which is the
-    // most direct mechanism, overriding all others.
-    switch (resolveTypeWitnessViaLookup(assocType)) {
-    case ResolveWitnessResult::Success:
-      // Success. Move on to the next.
-      continue;
-
-    case ResolveWitnessResult::ExplicitFailed:
-      continue;
-
-    case ResolveWitnessResult::Missing:
-      // Note that we haven't resolved this associated type yet.
-      unresolvedAssocTypes.insert(assocType);
-      break;
-    }
-  }
-
-  // If we resolved everything, we're done.
-  if (unresolvedAssocTypes.empty())
-    return;
-
-  // Infer type witnesses from value witnesses.
-  auto inferred = inferTypeWitnessesViaValueWitnesses(unresolvedAssocTypes);
-  DEBUG(llvm::dbgs() << "Candidates for inference:\n";
-        dumpInferredAssociatedTypes(inferred));
-
-  // Compute the set of solutions.
-  SmallVector<std::pair<ValueDecl *, ValueDecl *>, 4> valueWitnesses;
-  unsigned numValueWitnessesInProtocolExtensions = 0;
-  llvm::ScopedHashTable<AssociatedTypeDecl *, std::pair<Type, unsigned>>
-    typeWitnesses;
-  typedef decltype(typeWitnesses)::ScopeTy TypeWitnessesScope;
-  unsigned numTypeWitnesses = 0;
-  SmallVector<InferredTypeWitnessesSolution, 4> solutions;
-  SmallVector<InferredTypeWitnessesSolution, 4> nonViableSolutions;
-
-  // Information to use for diagnosing failures when we don't have
-  // something more specific.
-
-  // Which type witness was missing?
-  AssociatedTypeDecl *missingTypeWitness = nullptr;
-
-  // Was there a conflict in type witness deduction?
-  Optional<TypeWitnessConflict> typeWitnessConflict;
-  unsigned numTypeWitnessesBeforeConflict;
-
-  // Did an associated type default fail?
-  AssociatedTypeDecl *failedDefaultedAssocType = nullptr;
-  Type failedDefaultedWitness;
-  CheckTypeWitnessResult failedDefaultedResult;
-
-  // Local function to compute the default type of an associated type.
-  auto computeDefaultTypeWitness = [&](AssociatedTypeDecl *assocType) -> Type {
-    // If we don't have a default definition, we're done.
-    if (assocType->getDefaultDefinitionLoc().isNull())
-      return Type();
-
-    auto selfType = Proto->getSelfInterfaceType();
-
-    // Create a set of type substitutions for all known associated type.
-    // FIXME: Base this on dependent types rather than archetypes?
-    TypeSubstitutionMap substitutions;
-    substitutions[Proto->mapTypeIntoContext(selfType)
-        ->castTo<ArchetypeType>()] = Adoptee;
-    for (auto member : Proto->getMembers()) {
-      if (auto assocType = dyn_cast<AssociatedTypeDecl>(member)) {
-        auto archetype = Proto->mapTypeIntoContext(
-            assocType->getDeclaredInterfaceType())
-                ->getAs<ArchetypeType>();
-        if (!archetype)
-          continue;
-        if (Conformance->hasTypeWitness(assocType)) {
-          substitutions[archetype] =
-            Conformance->getTypeWitness(assocType, nullptr);
-        } else {
-          auto known = typeWitnesses.begin(assocType);
-          if (known != typeWitnesses.end())
-            substitutions[archetype] = known->first;
-          else
-            substitutions[archetype] = ErrorType::get(archetype);
-        }
-      }
-    }
-
-    TC.validateDecl(assocType);
-    Type defaultType = assocType->getDefaultDefinitionLoc().getType();
-
-    // FIXME: Circularity
-    if (!defaultType)
-      return Type();
-
-    defaultType = defaultType.subst(
-        QueryTypeSubstitutionMap{substitutions},
-        LookUpConformanceInModule(DC->getParentModule()));
-
-    if (!defaultType)
-      return Type();
-
-    if (auto failed = checkTypeWitness(TC, DC, Proto, assocType, defaultType)) {
-      // Record the failure, if we haven't seen one already.
-      if (!failedDefaultedAssocType) {
-        failedDefaultedAssocType = assocType;
-        failedDefaultedWitness = defaultType;
-        failedDefaultedResult = failed;
-      }
-
-      return Type();
-    }
-
-    return defaultType;
-  };
-
-  // Local function to compute the derived type of an associated type,
-  // for protocols known to the compiler.
-  auto computeDerivedTypeWitness = [&](AssociatedTypeDecl *assocType) -> Type {
-    if (Adoptee->hasError())
-      return Type();
-
-    // UnresolvedTypes propagated their unresolvedness to any witnesses.
-    if (Adoptee->is<UnresolvedType>())
-      return Adoptee;
-
-    // Can we derive conformances for this protocol and adoptee?
-    NominalTypeDecl *derivingTypeDecl = Adoptee->getAnyNominal();
-    if (!derivingTypeDecl->derivesProtocolConformance(Proto))
-      return Type();
-
-    // Try to derive the type witness.
-    Type derivedType = TC.deriveTypeWitness(DC, derivingTypeDecl, assocType);
-    if (!derivedType)
-      return Type();
-
-    // Make sure that the derived type is sane.
-    if (checkTypeWitness(TC, DC, Proto, assocType, derivedType)) {
-      diagnoseOrDefer(assocType, true,
-        [derivedType](NormalProtocolConformance *conformance) {
-          // FIXME: give more detail here?
-          auto &diags = derivedType->getASTContext().Diags;
-          diags.diagnose(conformance->getLoc(),
-                         diag::protocol_derivation_is_broken,
-                         conformance->getProtocol()->getDeclaredType(),
-                         derivedType);
-      });
-
-      return Type();
-    }
-
-    return derivedType;
-  };
-
-  // Local function that folds dependent member types with non-dependent
-  // bases into actual member references.
-  std::function<Type(Type)> foldDependentMemberTypes;
-  llvm::DenseSet<AssociatedTypeDecl *> recursionCheck;
-  foldDependentMemberTypes = [&](Type type) -> Type {
-    if (auto depMemTy = type->getAs<DependentMemberType>()) {
-      auto baseTy = depMemTy->getBase().transform(foldDependentMemberTypes);
-      if (baseTy.isNull() || baseTy->hasTypeParameter())
-        return nullptr;
-
-      auto assocType = depMemTy->getAssocType();
-      if (!assocType)
-        return nullptr;
-
-      if (!recursionCheck.insert(assocType).second)
-        return nullptr;
-
-      SWIFT_DEFER { recursionCheck.erase(assocType); };
-
-      // Try to substitute into the base type.
-      if (Type result = depMemTy->substBaseType(DC->getParentModule(), baseTy)){
-        return result;
-      }
-
-      // If that failed, check whether it's because of the conformance we're
-      // evaluating.
-      auto localConformance
-        = TC.conformsToProtocol(baseTy, assocType->getProtocol(), DC, None);
-      if (!localConformance || localConformance->isAbstract() ||
-          (localConformance->getConcrete()->getRootNormalConformance()
-             != Conformance)) {
-        return nullptr;
-      }
-
-      // Find the tentative type witness for this associated type.
-      auto known = typeWitnesses.begin(assocType);
-      if (known == typeWitnesses.end())
-        return nullptr;
-
-      return known->first.transform(foldDependentMemberTypes);
-    }
-
-    // The presence of a generic type parameter indicates that we
-    // cannot use this type binding.
-    if (type->is<GenericTypeParamType>()) {
-      return nullptr;
-    }
-
-    return type;
-
-  };
-
-  // Local function that checks the current (complete) set of type witnesses
-  // to determine whether they meet all of the requirements and to deal with
-  // substitution of type witness bindings into other type witness bindings.
-  auto checkCurrentTypeWitnesses = [&]() -> bool {
-    // Fold the dependent member types within this type.
-    for (auto member : Proto->getMembers()) {
-      if (auto assocType = dyn_cast<AssociatedTypeDecl>(member)) {
-        if (Conformance->hasTypeWitness(assocType))
-          continue;
-
-        // If the type binding does not have a type parameter, there's nothing
-        // to do.
-        auto known = typeWitnesses.begin(assocType);
-        assert(known != typeWitnesses.end());
-        if (!known->first->hasTypeParameter() &&
-            !known->first->hasDependentMember())
-          continue;
-
-        Type replaced = known->first.transform(foldDependentMemberTypes);
-        if (replaced.isNull())
-          return true;
-        
-        known->first = replaced;
-      }
-    }
-
-    // Check any same-type requirements in the protocol's requirement signature.
-    if (Proto->isRequirementSignatureComputed()) {
-      SubstOptions options(None);
-      options.getTentativeTypeWitness =
-        [&](const NormalProtocolConformance *conformance,
-            AssociatedTypeDecl *assocType) -> TypeBase * {
-          if (conformance != Conformance) return nullptr;
-
-          return typeWitnesses.begin(assocType)->first.getPointer();
-        };
-
-      auto substitutions =
-        SubstitutionMap::getProtocolSubstitutions(
-                                          Proto, Conformance->getType(),
-                                          ProtocolConformanceRef(Conformance));
-
-      SmallVector<Requirement, 4> sanitizedRequirements;
-      sanitizeProtocolRequirements(Proto, Proto->getRequirementSignature(),
-                                   sanitizedRequirements);
-      auto requirementSig =
-        GenericSignature::get({Proto->getProtocolSelfType()},
-                               sanitizedRequirements);
-      auto result =
-        TC.checkGenericArguments(DC, SourceLoc(), SourceLoc(),
-                                 Conformance->getType(), requirementSig,
-                                 QuerySubstitutionMap{substitutions},
-                                 TypeChecker::LookUpConformance(
-                                   TC, Conformance->getDeclContext()),
-                                 nullptr, None, nullptr, options);
-      switch (result) {
-      case RequirementCheckResult::Failure:
-      case RequirementCheckResult::UnsatisfiedDependency:
-        return true;
-
-      case RequirementCheckResult::Success:
-      case RequirementCheckResult::SubstitutionFailure:
-        return false;
-      }
-    }
-    return false;
-  };
-
-  // Local function to perform the depth-first search of the solution
-  // space.
-  std::function<void(unsigned)> findSolutions;
-  findSolutions = [&](unsigned reqDepth) {
-    // If we hit the last requirement, record and check this solution.
-    if (reqDepth == inferred.size()) {
-      // Introduce a hash table scope; we may add type witnesses here.
-      TypeWitnessesScope typeWitnessesScope(typeWitnesses);
-
-      // Check for completeness of the solution
-      for (auto assocType : unresolvedAssocTypes) {
-        // Local function to record a missing associated type.
-        auto recordMissing = [&] {
-          if (!missingTypeWitness)
-            missingTypeWitness = assocType;
-        };
-
-        auto typeWitness = typeWitnesses.begin(assocType);
-        if (typeWitness != typeWitnesses.end()) {
-          // The solution contains an error.
-          if (typeWitness->first->hasError()) {
-            recordMissing();
-            return;
-          }
-
-          continue;
-        }
-
-        // We don't have a type witness for this associated type.
-
-        // If we can form a default type, do so.
-        if (Type defaultType = computeDefaultTypeWitness(assocType)) {
-          if (defaultType->hasError()) {
-            recordMissing();
-            return;
-          }
-
-          typeWitnesses.insert(assocType, {defaultType, reqDepth});
-          continue;
-        }
-
-        // If we can derive a type witness, do so.
-        if (Type derivedType = computeDerivedTypeWitness(assocType)) {
-          if (derivedType->hasError()) {
-            recordMissing();
-            return;
-          }
-
-          typeWitnesses.insert(assocType, {derivedType, reqDepth});
-          continue;
-        }
-
-        // The solution is incomplete.
-        recordMissing();
-        return;
-      }
-
-      /// Check the current set of type witnesses.
-      bool invalid = checkCurrentTypeWitnesses();
-
-      // Determine whether there is already a solution with the same
-      // bindings.
-      for (const auto &solution : solutions) {
-        bool sameSolution = true;
-        for (const auto &existingTypeWitness : solution.TypeWitnesses) {
-          auto typeWitness = typeWitnesses.begin(existingTypeWitness.first);
-          if (!typeWitness->first->isEqual(existingTypeWitness.second.first)) {
-            sameSolution = false;
-            break;
-          }
-        }
-
-        // We found the same solution. There is no point in recording
-        // a new one.
-        if (sameSolution)
-          return;
-      }
-
-      auto &solutionList = invalid ? nonViableSolutions : solutions;
-      solutionList.push_back(InferredTypeWitnessesSolution());
-      auto &solution = solutionList.back();
-
-      // Copy the type witnesses.
-      for (auto assocType : unresolvedAssocTypes) {
-        auto typeWitness = typeWitnesses.begin(assocType);
-        solution.TypeWitnesses.insert({assocType, *typeWitness});
-      }
-
-      // Copy the value witnesses.
-      solution.ValueWitnesses = valueWitnesses;
-      solution.NumValueWitnessesInProtocolExtensions
-        = numValueWitnessesInProtocolExtensions;
-
-      // We're done recording the solution.
-      return;
-    }
-
-    // Iterate over the potential witnesses for this requirement,
-    // looking for solutions involving each one.
-    const auto &inferredReq = inferred[reqDepth];
-    for (const auto &witnessReq : inferredReq.second) {
-      // Enter a new scope for the type witnesses hash table.
-      TypeWitnessesScope typeWitnessesScope(typeWitnesses);
-      llvm::SaveAndRestore<unsigned> savedNumTypeWitnesses(numTypeWitnesses);
-
-      // Record this value witness, popping it when we exit the current scope.
-      valueWitnesses.push_back({inferredReq.first, witnessReq.Witness});
-      if (witnessReq.Witness->getDeclContext()->getAsProtocolExtensionContext())
-        ++numValueWitnessesInProtocolExtensions;
-      SWIFT_DEFER {
-        if (witnessReq.Witness->getDeclContext()->getAsProtocolExtensionContext())
-          --numValueWitnessesInProtocolExtensions;
-        valueWitnesses.pop_back();
-      };
-
-      // Introduce each of the type witnesses into the hash table.
-      bool failed = false;
-      for (const auto &typeWitness : witnessReq.Inferred) {
-        // If we've seen a type witness for this associated type that
-        // conflicts, there is no solution.
-        auto known = typeWitnesses.begin(typeWitness.first);
-        if (known != typeWitnesses.end()) {
-          // If witnesses for two difference requirements inferred the same
-          // type, we're okay.
-          if (known->first->isEqual(typeWitness.second))
-            continue;
-
-          // If one has a type parameter remaining but the other does not,
-          // drop the one with the type parameter.
-          if ((known->first->hasTypeParameter() ||
-               known->first->hasDependentMember())
-              != (typeWitness.second->hasTypeParameter() ||
-                  typeWitness.second->hasDependentMember())) {
-            if (typeWitness.second->hasTypeParameter() ||
-                typeWitness.second->hasDependentMember())
-              continue;
-
-            known->first = typeWitness.second;
-            continue;
-          }
-
-          if (!typeWitnessConflict ||
-              numTypeWitnesses > numTypeWitnessesBeforeConflict) {
-            typeWitnessConflict = {typeWitness.first,
-                                   typeWitness.second,
-                                   inferredReq.first,
-                                   witnessReq.Witness,
-                                   known->first,
-                                   valueWitnesses[known->second].first,
-                                   valueWitnesses[known->second].second};
-            numTypeWitnessesBeforeConflict = numTypeWitnesses;
-          }
-
-          failed = true;
-          break;
-        }
-
-        // Record the type witness.
-        ++numTypeWitnesses;
-        typeWitnesses.insert(typeWitness.first, {typeWitness.second, reqDepth});
-      }
-
-      if (failed)
-        continue;
-
-      // Recurse
-      findSolutions(reqDepth + 1);
-    }
-  };
-  findSolutions(0);
-
-  // Go make sure that type declarations that would act as witnesses
-  // did not get injected while we were performing checks above. This
-  // can happen when two associated types in different protocols have
-  // the same name, and validating a declaration (above) triggers the
-  // type-witness generation for that second protocol, introducing a
-  // new type declaration.
-  for (auto assocType : unresolvedAssocTypes) {
-      switch (resolveTypeWitnessViaLookup(assocType)) {
-      case ResolveWitnessResult::Success:
-      case ResolveWitnessResult::ExplicitFailed:
-        // A declaration that can become a witness has shown up. Go
-        // perform the resolution again now that we have more
-        // information.
-        return resolveTypeWitnesses();
-
-      case ResolveWitnessResult::Missing:
-        // The type witness is still missing. Keep going.
-        break;
-      }
-  }
-
-  // If we have more than one solution, do some simple ranking.
-  if (solutions.size() > 1) {
-    // Find the smallest number of value witnesses found in protocol extensions.
-    unsigned bestNumValueWitnessesInProtocolExtensions
-      = solutions.front().NumValueWitnessesInProtocolExtensions;
-    for (unsigned i = 1, n = solutions.size(); i != n; ++i) {
-      bestNumValueWitnessesInProtocolExtensions
-        = std::min(bestNumValueWitnessesInProtocolExtensions,
-                   solutions[i].NumValueWitnessesInProtocolExtensions);
-    }
-
-    // Erase any solutions with more value witnesses in protocol
-    // extensions than the best.
-    solutions.erase(
-      std::remove_if(solutions.begin(), solutions.end(),
-                     [&](const InferredTypeWitnessesSolution &solution) {
-                       return solution.NumValueWitnessesInProtocolExtensions >
-                                bestNumValueWitnessesInProtocolExtensions;
-                     }),
-      solutions.end());
-  }
-
-  // If we (still) have more than one solution, find the one with
-  // more-specialized witnesses.
-  if (solutions.size() > 1) {
-    // Local function to compare two solutions.
-    auto compareSolutions = [&](const InferredTypeWitnessesSolution &first,
-                                const InferredTypeWitnessesSolution &second) {
-      assert(first.ValueWitnesses.size() == second.ValueWitnesses.size());
-      bool firstBetter = false;
-      bool secondBetter = false;
-      for (unsigned i = 0, n = first.ValueWitnesses.size(); i != n; ++i) {
-        assert(first.ValueWitnesses[i].first == second.ValueWitnesses[i].first);
-        auto firstWitness = first.ValueWitnesses[i].second;
-        auto secondWitness = second.ValueWitnesses[i].second;
-        if (firstWitness == secondWitness)
-          continue;
-
-        switch (compareDeclsForInference(TC, DC, firstWitness, secondWitness)) {
-        case Comparison::Better:
-          if (secondBetter)
-            return false;
-
-          firstBetter = true;
-          break;
-
-        case Comparison::Worse:
-          if (firstBetter)
-            return false;
-
-          secondBetter = true;
-          break;
-
-        case Comparison::Unordered:
-          break;
-        }
-      }
-
-      return firstBetter;
-    };
-
-    // Find a solution that's at least as good as the solutions that follow it.
-    unsigned bestIdx = 0;
-    for (unsigned i = 1, n = solutions.size(); i != n; ++i) {
-      if (compareSolutions(solutions[i], solutions[bestIdx]))
-        bestIdx = i;
-    }
-    
-    // Make sure that solution is better than any of the other solutions.
-    bool ambiguous = false;
-    for (unsigned i = 1, n = solutions.size(); i != n; ++i) {
-      if (i != bestIdx && !compareSolutions(solutions[bestIdx], solutions[i])) {
-        ambiguous = true;
-        break;
-      }
-    }
-    
-    // If we had a best solution, keep just that solution.
-    if (!ambiguous) {
-      if (bestIdx != 0)
-        solutions[0] = std::move(solutions[bestIdx]);
-      solutions.erase(solutions.begin() + 1, solutions.end());
-    }
-  }
-
-  // If we have no solution, but we did find something that is nonviable,
-  // use the first nonviable one to improve error reporting.
-  if (solutions.empty() && !nonViableSolutions.empty()) {
-    solutions.push_back(std::move(nonViableSolutions.front()));
-  }
-
-  // If we found a single solution, take it.
-  if (solutions.size() == 1) {
-    // Record each of the deduced witnesses.
-    auto &typeWitnesses = solutions.front().TypeWitnesses;
-    for (auto assocType : unresolvedAssocTypes) {
-      assert(typeWitnesses.count(assocType) == 1 && "missing witness");
-      auto replacement = typeWitnesses[assocType].first;
-      // FIXME: We can end up here with dependent types that were not folded
-      // away for some reason.
-      if (replacement->hasDependentMember())
-        replacement = ErrorType::get(TC.Context);
-      recordTypeWitness(assocType, replacement, nullptr, true);
-    }
-
-    return;
-  }
-
-  // Error cases follow.
-  Conformance->setInvalid();
-
-  // We're going to produce an error below. Mark each unresolved
-  // associated type witness as erroneous.
-  for (auto assocType : unresolvedAssocTypes) {
-    recordTypeWitness(assocType, ErrorType::get(TC.Context), nullptr, true);
-  }
-
-  // No solutions. Diagnose the first associated type for which we
-  // could not determine a witness.
-  if (solutions.empty()) {
-    // If a defaulted type witness failed, diagnose it.
-    if (failedDefaultedAssocType) {
-      diagnoseOrDefer(failedDefaultedAssocType, true,
-        [failedDefaultedAssocType, failedDefaultedWitness,
-         failedDefaultedResult](NormalProtocolConformance *conformance) {
-          auto proto = conformance->getProtocol();
-          auto &diags = proto->getASTContext().Diags;
-          diags.diagnose(failedDefaultedAssocType,
-                         diag::default_associated_type_req_fail,
-                         failedDefaultedWitness,
-                         failedDefaultedAssocType->getFullName(),
-                         proto->getDeclaredType(),
-                         failedDefaultedResult.getProtocolOrClass()
-                           ->getDeclaredType(),
-                         failedDefaultedResult.isProtocol());
-        });
-      return;
-    }
-
-    // Form a mapping from associated type declarations to failed type
-    // witnesses.
-    llvm::DenseMap<AssociatedTypeDecl *, SmallVector<FailedTypeWitness, 2>>
-      failedTypeWitnesses;
-    for (const auto &inferredReq : inferred) {
-      for (const auto &inferredWitness : inferredReq.second) {
-        for (const auto &nonViable : inferredWitness.NonViable) {
-          failedTypeWitnesses[std::get<0>(nonViable)]
-            .push_back({inferredReq.first, inferredWitness.Witness,
-                        std::get<1>(nonViable), std::get<2>(nonViable)});
-        }
-      }
-    }
-
-    // Local function to attempt to diagnose potential type witnesses
-    // that failed requirements.
-    auto tryDiagnoseTypeWitness = [&](AssociatedTypeDecl *assocType) -> bool {
-      auto known = failedTypeWitnesses.find(assocType);
-      if (known == failedTypeWitnesses.end())
-        return false;
-
-      auto failedSet = std::move(known->second);
-      diagnoseOrDefer(assocType, true,
-        [assocType, failedSet](NormalProtocolConformance *conformance) {
-          auto proto = conformance->getProtocol();
-          auto &diags = proto->getASTContext().Diags;
-          diags.diagnose(assocType, diag::bad_associated_type_deduction,
-                         assocType->getFullName(), proto->getFullName());
-          for (const auto &failed : failedSet) {
-            diags.diagnose(failed.Witness,
-                           diag::associated_type_deduction_witness_failed,
-                           failed.Requirement->getFullName(),
-                           failed.TypeWitness,
-                           failed.Result.getProtocolOrClass()->getFullName(),
-                           failed.Result.isProtocol());
-          }
-        });
-
-      return true;
-    };
-
-    // Try to diagnose the first missing type witness we encountered.
-    if (missingTypeWitness && tryDiagnoseTypeWitness(missingTypeWitness))
-      return;
-
-    // Failing that, try to diagnose any type witness that failed a
-    // requirement.
-    for (auto assocType : unresolvedAssocTypes) {
-      if (tryDiagnoseTypeWitness(assocType))
-        return;
-    }
-
-    // If we saw a conflict, complain about it.
-    if (typeWitnessConflict) {
-      diagnoseOrDefer(typeWitnessConflict->AssocType, true,
-        [typeWitnessConflict](NormalProtocolConformance *conformance) {
-          auto &diags = conformance->getDeclContext()->getASTContext().Diags;
-          diags.diagnose(typeWitnessConflict->AssocType,
-                         diag::ambiguous_associated_type_deduction,
-                         typeWitnessConflict->AssocType->getFullName(),
-                         typeWitnessConflict->FirstType,
-                         typeWitnessConflict->SecondType);
-        
-          diags.diagnose(typeWitnessConflict->FirstWitness,
-                         diag::associated_type_deduction_witness,
-                         typeWitnessConflict->FirstRequirement->getFullName(),
-                         typeWitnessConflict->FirstType);
-          diags.diagnose(typeWitnessConflict->SecondWitness,
-                         diag::associated_type_deduction_witness,
-                         typeWitnessConflict->SecondRequirement->getFullName(),
-                         typeWitnessConflict->SecondType);
-        });
-
-      return;
-    }
-
-    // Save the missing type witnesses for later diagnosis.
-    GlobalMissingWitnesses.insert(unresolvedAssocTypes.begin(),
-                            unresolvedAssocTypes.end());
-
-    return;
-  }
-
-  // Multiple solutions. Diagnose the ambiguity.
-  for (auto assocType : unresolvedAssocTypes) {
-    // Find two types that conflict.
-    auto &firstSolution = solutions.front();
-
-    // Local function to retrieve the value witness for the current associated
-    // type within the given solution.
-    auto getValueWitness = [&](InferredTypeWitnessesSolution &solution) {
-      unsigned witnessIdx = solution.TypeWitnesses[assocType].second;
-      if (witnessIdx < solution.ValueWitnesses.size())
-        return solution.ValueWitnesses[witnessIdx];
-
-      return std::pair<ValueDecl *, ValueDecl *>(nullptr, nullptr);
-    };
-
-    Type firstType = firstSolution.TypeWitnesses[assocType].first;
-
-    // Extract the value witness used to deduce this associated type, if any.
-    auto firstMatch = getValueWitness(firstSolution);
-
-    Type secondType;
-    std::pair<ValueDecl *, ValueDecl *> secondMatch;
-    for (auto &solution : solutions) {
-      Type typeWitness = solution.TypeWitnesses[assocType].first;
-      if (!typeWitness->isEqual(firstType)) {
-        secondType = typeWitness;
-        secondMatch = getValueWitness(solution);
-        break;
-      }
-    }
-
-    if (!secondType)
-      continue;
-
-    // We found an ambiguity. diagnose it.
-    diagnoseOrDefer(assocType, true,
-      [assocType, firstType, firstMatch, secondType, secondMatch](
-        NormalProtocolConformance *conformance) {
-        auto &diags = assocType->getASTContext().Diags;
-        diags.diagnose(assocType, diag::ambiguous_associated_type_deduction,
-                       assocType->getFullName(), firstType, secondType);
-
-        auto diagnoseWitness = [&](std::pair<ValueDecl *, ValueDecl *> match,
-                                   Type type){
-          // If we have a requirement/witness pair, diagnose it.
-          if (match.first && match.second) {
-            diags.diagnose(match.second,
-                           diag::associated_type_deduction_witness,
-                           match.first->getFullName(), type);
-
-            return;
-          }
-
-          // Otherwise, we have a default.
-          diags.diagnose(assocType, diag::associated_type_deduction_default,
-                         type)
-            .highlight(assocType->getDefaultDefinitionLoc().getSourceRange());
-        };
-
-        diagnoseWitness(firstMatch, firstType);
-        diagnoseWitness(secondMatch, secondType);
-      });
-
-    return;
-  }
-}
-
-void ConformanceChecker::resolveSingleTypeWitness(
-       AssociatedTypeDecl *assocType) {
-  // Ensure we diagnose if the witness is missing.
-  SWIFT_DEFER {
-    diagnoseMissingWitnesses(MissingWitnessDiagnosisKind::ErrorFixIt);
-  };
-  switch (resolveTypeWitnessViaLookup(assocType)) {
-  case ResolveWitnessResult::Success:
-  case ResolveWitnessResult::ExplicitFailed:
-    // We resolved this type witness one way or another.
-    return;
-
-  case ResolveWitnessResult::Missing:
-    // The type witness is still missing. Resolve all of the type witnesses.
-    resolveTypeWitnesses();
-    return;
-  }
-}
-
-void ConformanceChecker::resolveSingleWitness(ValueDecl *requirement) {
-  assert(!isa<AssociatedTypeDecl>(requirement) && "Not a value witness");
-  assert(!Conformance->hasWitness(requirement) && "Already resolved");
-
-  // Note that we're resolving this witness.
-  assert(ResolvingWitnesses.count(requirement) == 0 && "Currently resolving");
-  ResolvingWitnesses.insert(requirement);
-  SWIFT_DEFER { ResolvingWitnesses.erase(requirement); };
-
-  // Make sure we've validated the requirement.
-  if (!requirement->hasInterfaceType())
-    TC.validateDecl(requirement);
-
-  if (requirement->isInvalid() || !requirement->hasValidSignature()) {
-    Conformance->setInvalid();
-    return;
-  }
-
-  if (!requirement->isProtocolRequirement())
-    return;
-
-  // Resolve all associated types before trying to resolve this witness.
-  resolveTypeWitnesses();
-
-  // If any of the type witnesses was erroneous, don't bother to check
-  // this value witness: it will fail.
-  for (auto assocType : getReferencedAssociatedTypes(requirement)) {
-    if (Conformance->getTypeWitness(assocType, nullptr)->hasError()) {
-      Conformance->setInvalid();
-      return;
-    }
-  }
-
-  // Try to resolve the witness via explicit definitions.
-  switch (resolveWitnessViaLookup(requirement)) {
-  case ResolveWitnessResult::Success:
-    return;
-  
-  case ResolveWitnessResult::ExplicitFailed:
-    Conformance->setInvalid();
-    recordInvalidWitness(requirement);
-    return;
-
-  case ResolveWitnessResult::Missing:
-    // Continue trying below.
-    break;
-  }
-
-  // Try to resolve the witness via derivation.
-  switch (resolveWitnessViaDerivation(requirement)) {
-  case ResolveWitnessResult::Success:
-    return;
-
-  case ResolveWitnessResult::ExplicitFailed:
-    Conformance->setInvalid();
-    recordInvalidWitness(requirement);
-    return;
-
-  case ResolveWitnessResult::Missing:
-    // Continue trying below.
-    break;
-  }
-
-  // Try to resolve the witness via defaults.
-  switch (resolveWitnessViaDefault(requirement)) {
-  case ResolveWitnessResult::Success:
-    return;
-
-  case ResolveWitnessResult::ExplicitFailed:
-    Conformance->setInvalid();
-    recordInvalidWitness(requirement);
-    return;
-
-  case ResolveWitnessResult::Missing:
-    llvm_unreachable("Should have failed");
-    break;
-  }
 }
 
 static void recordConformanceDependency(DeclContext *DC,
@@ -5185,7 +3295,8 @@ void ConformanceChecker::addUsedConformances(ProtocolConformance *conformance) {
   addUsedConformances(conformance, visited);
 }
 
-void ConformanceChecker::ensureRequirementsAreSatisfied() {
+void ConformanceChecker::ensureRequirementsAreSatisfied(
+                                                     bool failUnsubstituted) {
   auto proto = Conformance->getProtocol();
   // Some other problem stopped the signature being computed.
   if (!proto->isRequirementSignatureComputed()) {
@@ -5201,47 +3312,106 @@ void ConformanceChecker::ensureRequirementsAreSatisfied() {
   if (!Conformance->getSignatureConformances().empty())
     return;
 
-  auto reqSig = GenericSignature::get({proto->getProtocolSelfType()},
-                                      proto->getRequirementSignature());
-
+  auto DC = Conformance->getDeclContext();
+  auto substitutingType = DC->mapTypeIntoContext(Conformance->getType());
   auto substitutions = SubstitutionMap::getProtocolSubstitutions(
-      proto, Conformance->getType(), ProtocolConformanceRef(Conformance));
+      proto, substitutingType, ProtocolConformanceRef(Conformance));
 
   // Create a writer to populate the signature conformances.
   std::function<void(ProtocolConformanceRef)> writer
     = Conformance->populateSignatureConformances();
 
   class GatherConformancesListener : public GenericRequirementsCheckListener {
+    NormalProtocolConformance *conformance;
     std::function<void(ProtocolConformanceRef)> &writer;
   public:
     GatherConformancesListener(
-                         std::function<void(ProtocolConformanceRef)> &writer)
-      : writer(writer) { }
+        NormalProtocolConformance *conformance,
+        std::function<void(ProtocolConformanceRef)> &writer)
+      : conformance(conformance), writer(writer) { }
 
     void satisfiedConformance(Type depTy, Type replacementTy,
                               ProtocolConformanceRef conformance) override {
+      // The conformance will use contextual types, but we want the
+      // interface type equivalent.
+      if (conformance.isConcrete() &&
+          conformance.getConcrete()->getType()->hasArchetype()) {
+        auto concreteConformance = conformance.getConcrete();
+
+        // Map the conformance.
+        auto interfaceType =
+          concreteConformance->getType()->mapTypeOutOfContext();
+
+        concreteConformance = concreteConformance->subst(
+            interfaceType,
+            [](SubstitutableType *type) -> Type {
+              if (auto *archetypeType = type->getAs<ArchetypeType>())
+                return archetypeType->getInterfaceType();
+              return type;
+            },
+            MakeAbstractConformanceForGenericType());
+
+        conformance = ProtocolConformanceRef(concreteConformance);
+      }
+
       writer(conformance);
     }
-  } listener(writer);
+
+    bool diagnoseUnsatisfiedRequirement(
+                      const Requirement &req, Type first, Type second,
+                      ArrayRef<ParentConditionalConformance> parents) override {
+      // Invalidate the conformance to suppress further diagnostics.
+      if (conformance->getLoc().isValid()) {
+        conformance->setInvalid();
+      }
+
+      return false;
+    }
+  } listener(Conformance, writer);
 
   auto result = TC.checkGenericArguments(
-      Conformance->getDeclContext(), Loc, Loc,
+      DC, Loc, Loc,
       // FIXME: maybe this should be the conformance's type
-      proto->getDeclaredInterfaceType(), reqSig,
+      proto->getDeclaredInterfaceType(),
+      { Type(proto->getProtocolSelfType()) },
+      proto->getRequirementSignature(),
       QuerySubstitutionMap{substitutions},
-      TypeChecker::LookUpConformance(TC, Conformance->getDeclContext()),
-      nullptr,
+      TypeChecker::LookUpConformance(TC, DC),
       ConformanceCheckFlags::Used, &listener);
 
-  // If there were errors, mark the conformance as invalid.
-  if (result != RequirementCheckResult::Success) {
+  switch (result) {
+  case RequirementCheckResult::Success:
+    return;
+
+  case RequirementCheckResult::Failure:
     Conformance->setInvalid();
+    return;
+
+  case RequirementCheckResult::SubstitutionFailure:
+    // If we're not allowed to fail, record this as a partially-checked
+    // conformance.
+    if (!failUnsubstituted) {
+      TC.PartiallyCheckedConformances.insert(Conformance);
+      return;
+    }
+
+    // Diagnose the failure generically.
+    // FIXME: Would be nice to give some more context here!
+    if (!Conformance->isInvalid()) {
+      TC.diagnose(Loc, diag::type_does_not_conform,
+                  Adoptee, Proto->getDeclaredType());
+      Conformance->setInvalid();
+    }
+    return;
   }
 }
 
 #pragma mark Protocol conformance checking
 void ConformanceChecker::checkConformance(MissingWitnessDiagnosisKind Kind) {
   assert(!Conformance->isComplete() && "Conformance is already complete");
+
+  FrontendStatsTracer statsTracer(TC.Context.Stats, "check-conformance",
+                                  Conformance);
 
   llvm::SaveAndRestore<bool> restoreSuppressDiagnostics(SuppressDiagnostics);
   SuppressDiagnostics = false;
@@ -5312,54 +3482,82 @@ void ConformanceChecker::checkConformance(MissingWitnessDiagnosisKind Kind) {
         if (!witness->isObjC()) {
           bool isOptional =
             requirement->getAttrs().hasAttribute<OptionalAttr>();
+          SourceLoc diagLoc = getLocForDiagnosingWitness(Conformance, witness);
           if (auto witnessFunc = dyn_cast<AbstractFunctionDecl>(witness)) {
             auto diagInfo = getObjCMethodDiagInfo(witnessFunc);
-            auto diag = TC.diagnose(witness,
-                                    isOptional ? diag::witness_non_objc_optional
-                                               : diag::witness_non_objc,
-                                    diagInfo.first, diagInfo.second,
-                                    Proto->getFullName());
+            Optional<InFlightDiagnostic> fixItDiag =
+                TC.diagnose(diagLoc,
+                            isOptional ? diag::witness_non_objc_optional
+                                       : diag::witness_non_objc,
+                            diagInfo.first, diagInfo.second,
+                            Proto->getFullName());
+            if (diagLoc != witness->getLoc()) {
+              // If the main diagnostic is emitted on the conformance, we want
+              // to attach the fix-it to the note that shows where the
+              // witness is defined.
+              fixItDiag.getValue().flush();
+              fixItDiag.emplace(TC.diagnose(witness, diag::make_decl_objc,
+                                            witness->getDescriptiveKind()));
+            }
             if (!witness->canInferObjCFromRequirement(requirement)) {
               fixDeclarationObjCName(
-                diag, witness,
-                cast<AbstractFunctionDecl>(requirement)->getObjCSelector());
+                  fixItDiag.getValue(), witness,
+                  cast<AbstractFunctionDecl>(requirement)->getObjCSelector());
             }
           } else if (isa<VarDecl>(witness)) {
-            auto diag = TC.diagnose(witness,
-                                    isOptional
-                                      ? diag::witness_non_objc_storage_optional
-                                      : diag::witness_non_objc_storage,
-                                    /*isSubscript=*/false,
-                                    witness->getFullName(),
-                                    Proto->getFullName());
+            Optional<InFlightDiagnostic> fixItDiag =
+                TC.diagnose(diagLoc,
+                            isOptional ? diag::witness_non_objc_storage_optional
+                                       : diag::witness_non_objc_storage,
+                            /*isSubscript=*/false,
+                            witness->getFullName(),
+                            Proto->getFullName());
+            if (diagLoc != witness->getLoc()) {
+              // If the main diagnostic is emitted on the conformance, we want
+              // to attach the fix-it to the note that shows where the
+              // witness is defined.
+              fixItDiag.getValue().flush();
+              fixItDiag.emplace(TC.diagnose(witness, diag::make_decl_objc,
+                                            witness->getDescriptiveKind()));
+            }
             if (!witness->canInferObjCFromRequirement(requirement)) {
               fixDeclarationObjCName(
-                 diag, witness,
+                 fixItDiag.getValue(), witness,
                  ObjCSelector(requirement->getASTContext(), 0,
                               cast<VarDecl>(requirement)
                                 ->getObjCPropertyName()));
             }
           } else if (isa<SubscriptDecl>(witness)) {
-            TC.diagnose(witness,
-                        isOptional
-                          ? diag::witness_non_objc_storage_optional
-                          : diag::witness_non_objc_storage,
-                        /*isSubscript=*/true,
-                        witness->getFullName(),
-                        Proto->getFullName())
-              .fixItInsert(witness->getAttributeInsertionLoc(false),
-                           "@objc ");
+            Optional<InFlightDiagnostic> fixItDiag =
+                TC.diagnose(diagLoc,
+                            isOptional
+                              ? diag::witness_non_objc_storage_optional
+                              : diag::witness_non_objc_storage,
+                            /*isSubscript=*/true,
+                            witness->getFullName(),
+                            Proto->getFullName());
+            if (diagLoc != witness->getLoc()) {
+              // If the main diagnostic is emitted on the conformance, we want
+              // to attach the fix-it to the note that shows where the
+              // witness is defined.
+              fixItDiag.getValue().flush();
+              fixItDiag.emplace(TC.diagnose(witness, diag::make_decl_objc,
+                                            witness->getDescriptiveKind()));
+            }
+            fixItDiag->fixItInsert(witness->getAttributeInsertionLoc(false),
+                                   "@objc ");
           }
 
           // If the requirement is optional, @nonobjc suppresses the
           // diagnostic.
           if (isOptional) {
-            TC.diagnose(witness, diag::optional_req_near_match_nonobjc, false)
+            TC.diagnose(witness, diag::req_near_match_nonobjc, false)
               .fixItInsert(witness->getAttributeInsertionLoc(false),
                            "@nonobjc ");
           }
 
-          TC.diagnose(requirement, diag::protocol_requirement_here,
+          TC.diagnose(requirement, diag::kind_declname_declared_here,
+                      DescriptiveDeclKind::Requirement,
                       requirement->getFullName());
 
           Conformance->setInvalid();
@@ -5406,10 +3604,9 @@ void ConformanceChecker::checkConformance(MissingWitnessDiagnosisKind Kind) {
       continue;
     }
 
-    // If this is a getter/setter for a funcdecl, ignore it.
-    if (auto *FD = dyn_cast<FuncDecl>(requirement))
-      if (FD->isAccessor())
-        continue;
+    // If this is an accessor for a storage decl, ignore it.
+    if (isa<AccessorDecl>(requirement))
+      continue;
     
     // Try to resolve the witness via explicit definitions.
     switch (resolveWitnessViaLookup(requirement)) {
@@ -5467,14 +3664,15 @@ void ConformanceChecker::checkConformance(MissingWitnessDiagnosisKind Kind) {
   // Note that we check the module name to smooth over the difference
   // between an imported Objective-C module and its overlay.
   if (Proto->isSpecificProtocol(KnownProtocolKind::ObjectiveCBridgeable)) {
-    if (auto nominal = Adoptee->getAnyNominal()) {
-      if (!TC.Context.isTypeBridgedInExternalModule(nominal)) {
-        if (nominal->getParentModule() != DC->getParentModule() &&
-            !isInOverlayModuleForImportedModule(DC, nominal)) {
-          auto nominalModule = nominal->getParentModule();
-          TC.diagnose(Loc, diag::nonlocal_bridged_to_objc, nominal->getName(),
-                      Proto->getName(), nominalModule->getName());
-        }
+    auto nominal = Adoptee->getAnyNominal();
+    if (!TC.Context.isTypeBridgedInExternalModule(nominal)) {
+      auto clangLoader = TC.Context.getClangModuleLoader();
+      if (nominal->getParentModule() != DC->getParentModule() &&
+          !(clangLoader &&
+            clangLoader->isInOverlayModuleForImportedModule(DC, nominal))) {
+        auto nominalModule = nominal->getParentModule();
+        TC.diagnose(Loc, diag::nonlocal_bridged_to_objc, nominal->getName(),
+                    Proto->getName(), nominalModule->getName());
       }
     }
   }
@@ -5514,7 +3712,10 @@ static void diagnoseConformanceFailure(TypeChecker &TC, Type T,
   // conformance to RawRepresentable was inferred.
   if (auto enumDecl = T->getEnumOrBoundGenericEnum()) {
     if (Proto->isSpecificProtocol(KnownProtocolKind::RawRepresentable) &&
-        enumDecl->derivesProtocolConformance(Proto) && enumDecl->hasRawType()) {
+        DerivedConformance::derivesProtocolConformance(TC, DC, enumDecl,
+                                                       Proto) &&
+        enumDecl->hasRawType() &&
+        !enumDecl->getRawType()->is<ErrorType>()) {
 
       auto rawType = enumDecl->getRawType();
 
@@ -5593,8 +3794,8 @@ Optional<ProtocolConformanceRef> TypeChecker::containsProtocol(
 
     // First, if we have a superclass constraint, the class may conform
     // concretely.
-    if (layout.superclass) {
-      if (auto result = conformsToProtocol(layout.superclass, Proto,
+    if (layout.explicitSuperclass) {
+      if (auto result = conformsToProtocol(layout.explicitSuperclass, Proto,
                                            DC, options)) {
         return result;
       }
@@ -5603,11 +3804,24 @@ Optional<ProtocolConformanceRef> TypeChecker::containsProtocol(
     // Next, check if the existential contains the protocol in question.
     for (auto P : layout.getProtocols()) {
       auto *PD = P->getDecl();
+
       // If we found the protocol we're looking for, return an abstract
       // conformance to it.
-      if (PD == Proto || PD->inheritsFrom(Proto)) {
+      if (PD == Proto)
         return ProtocolConformanceRef(Proto);
+
+      // If the protocol has a superclass constraint, we might conform
+      // concretely.
+      if (auto superclass = PD->getSuperclass()) {
+        if (auto result = conformsToProtocol(superclass, Proto,
+                                             DC, options)) {
+          return result;
+        }
       }
+
+      // Now check refined protocols.
+      if (PD->inheritsFrom(Proto))
+        return ProtocolConformanceRef(Proto);
     }
 
     return None;
@@ -5654,6 +3868,42 @@ Optional<ProtocolConformanceRef> TypeChecker::conformsToProtocol(
     markConformanceUsed(*lookupResult, DC);
   }
 
+  auto condReqs = lookupResult->getConditionalRequirementsIfAvailable();
+  // If we have a conditional requirements that
+  // we need to check, do so now.
+  if (!condReqs) {
+    assert(
+        options.contains(
+            ConformanceCheckFlags::AllowUnavailableConditionalRequirements) &&
+        "unhandled recursion: missing conditional requirements when they're "
+        "required");
+  } else if (!condReqs->empty() &&
+             !options.contains(
+                 ConformanceCheckFlags::SkipConditionalRequirements)) {
+    // Figure out the location of the conditional conformance.
+    auto conformanceDC = lookupResult->getConcrete()->getDeclContext();
+    SourceLoc noteLoc;
+    if (auto ext = dyn_cast<ExtensionDecl>(conformanceDC))
+      noteLoc = ext->getLoc();
+    else
+      noteLoc = cast<NominalTypeDecl>(conformanceDC)->getLoc();
+
+    auto conditionalCheckResult = checkGenericArguments(
+        DC, ComplainLoc, noteLoc, T,
+        {Type(lookupResult->getRequirement()->getProtocolSelfType())},
+        *condReqs,
+        [](SubstitutableType *dependentType) { return Type(dependentType); },
+        LookUpConformance(*this, DC), options);
+    switch (conditionalCheckResult) {
+    case RequirementCheckResult::Success:
+      break;
+
+    case RequirementCheckResult::Failure:
+    case RequirementCheckResult::SubstitutionFailure:
+      return None;
+    }
+  }
+
   // When requested, print the conformance access path used to find this
   // conformance.
   if (Context.LangOpts.DebugGenericSignatures &&
@@ -5662,11 +3912,10 @@ Optional<ProtocolConformanceRef> TypeChecker::conformsToProtocol(
       !T->castTo<ArchetypeType>()->requiresClass() &&
       T->castTo<ArchetypeType>()->getGenericEnvironment()
         == DC->getGenericEnvironmentOfContext()) {
-    auto interfaceType = DC->mapTypeOutOfContext(T);
+    auto interfaceType = T->mapTypeOutOfContext();
     if (interfaceType->isTypeParameter()) {
       auto genericSig = DC->getGenericSignatureOfContext();
-      auto path = genericSig->getConformanceAccessPath(interfaceType, Proto,
-                                                       *DC->getParentModule());
+      auto path = genericSig->getConformanceAccessPath(interfaceType, Proto);
 
       // Debugging aid: display the conformance access path for archetype
       // conformances.
@@ -5679,39 +3928,6 @@ Optional<ProtocolConformanceRef> TypeChecker::conformsToProtocol(
   }
 
   return lookupResult;
-}
-
-ConformsToProtocolResult
-TypeChecker::conformsToProtocol(Type T, ProtocolDecl *Proto, DeclContext *DC,
-                                ConformanceCheckOptions options,
-                                SourceLoc ComplainLoc,
-                                UnsatisfiedDependency *unsatisfiedDependency) {
-  // If we have a callback to report dependencies, do so.
-  // FIXME: Woefully inadequate.
-  if (unsatisfiedDependency) {
-    if (auto *classDecl = dyn_cast_or_null<ClassDecl>(T->getAnyNominal())) {
-      if ((*unsatisfiedDependency)(requestTypeCheckSuperclass(classDecl)))
-        return ConformsToProtocolResult::unsatisfiedDependency();
-    }
-
-    if (T->isExistentialType()) {
-      bool anyUnsatisfied = false;
-      auto layout = T->getExistentialLayout();
-      for (auto *proto : layout.getProtocols()) {
-        auto *protoDecl = proto->getDecl();
-        if ((*unsatisfiedDependency)(requestInheritedProtocols(protoDecl)))
-          anyUnsatisfied = true;
-      }
-      if (anyUnsatisfied)
-        return ConformsToProtocolResult::unsatisfiedDependency();
-    }
-  }
-
-  // Just punt to the older conformsToProtocol() and hope it doesn't
-  // recurse.
-  auto conformance = conformsToProtocol(T, Proto, DC, options, ComplainLoc);
-  return conformance ? ConformsToProtocolResult::success(*conformance)
-                     : ConformsToProtocolResult::failure();
 }
 
 void TypeChecker::markConformanceUsed(ProtocolConformanceRef conformance,
@@ -5736,15 +3952,17 @@ Optional<ProtocolConformanceRef>
 TypeChecker::LookUpConformance::operator()(
                                        CanType dependentType,
                                        Type conformingReplacementType,
-                                       ProtocolType *conformedProtocol) const {
+                                       ProtocolDecl *conformedProtocol) const {
   if (conformingReplacementType->isTypeParameter())
-    return ProtocolConformanceRef(conformedProtocol->getDecl());
+    return ProtocolConformanceRef(conformedProtocol);
 
-  return tc.conformsToProtocol(conformingReplacementType,
-                               conformedProtocol->getDecl(),
-                               dc,
-                               (ConformanceCheckFlags::Used|
-                                ConformanceCheckFlags::InExpression));
+  return tc.conformsToProtocol(
+                         conformingReplacementType,
+                         conformedProtocol,
+                         dc,
+                         (ConformanceCheckFlags::Used|
+                          ConformanceCheckFlags::InExpression|
+                          ConformanceCheckFlags::SkipConditionalRequirements));
 }
 
 /// Mark any _ObjectiveCBridgeable conformances in the given type as "used".
@@ -5752,23 +3970,15 @@ TypeChecker::LookUpConformance::operator()(
 /// These conformances might not appear in any substitution lists produced
 /// by Sema, since bridging is done at the SILGen level, so we have to
 /// force them here to ensure SILGen can find them.
-bool TypeChecker::useObjectiveCBridgeableConformances(DeclContext *dc,
-                                                      Type type,
-                                 UnsatisfiedDependency *unsatisfiedDependency) {
+void swift::useObjectiveCBridgeableConformances(DeclContext *dc, Type type) {
   class Walker : public TypeWalker {
-    TypeChecker &TC;
+    ASTContext &Ctx;
     DeclContext *DC;
     ProtocolDecl *Proto;
-    UnsatisfiedDependency *Callback;
 
   public:
-    bool WasUnsatisfied;
-
-    Walker(TypeChecker &tc, DeclContext *dc, ProtocolDecl *proto,
-           UnsatisfiedDependency *unsatisfiedDependency)
-      : TC(tc), DC(dc), Proto(proto),
-        Callback(unsatisfiedDependency),
-        WasUnsatisfied(false) { }
+    Walker(DeclContext *dc, ProtocolDecl *proto)
+      : Ctx(dc->getASTContext()), DC(dc), Proto(proto) { }
 
     Action walkToTypePre(Type ty) override {
       ConformanceCheckOptions options =
@@ -5781,34 +3991,30 @@ bool TypeChecker::useObjectiveCBridgeableConformances(DeclContext *dc,
       if (auto *nominalDecl = ty->getAnyNominal()) {
         if (isa<ClassDecl>(nominalDecl) || isa<ProtocolDecl>(nominalDecl))
           return Action::Continue;
-        auto result = TC.conformsToProtocol(ty, Proto, DC, options,
-                                            /*ComplainLoc=*/SourceLoc(),
-                                            Callback);
 
-        WasUnsatisfied |= result.hasUnsatisfiedDependency();
-        if (WasUnsatisfied)
-          return Action::Stop;
+        auto lazyResolver = Ctx.getLazyResolver();
+        assert(lazyResolver &&
+               "Cannot do conforms-to-protocol check without a type checker");
+        TypeChecker &tc = *static_cast<TypeChecker *>(lazyResolver);
+        (void)tc.conformsToProtocol(ty, Proto, DC, options,
+                                    /*ComplainLoc=*/SourceLoc());
 
         // Set and Dictionary bridging also requires the conformance
         // of the key type to Hashable.
-        if (nominalDecl == TC.Context.getSetDecl() ||
-            nominalDecl == TC.Context.getDictionaryDecl()) {
+        if (nominalDecl == Ctx.getSetDecl() ||
+            nominalDecl == Ctx.getDictionaryDecl()) {
           if (auto boundGeneric = ty->getAs<BoundGenericType>()) {
             auto args = boundGeneric->getGenericArgs();
             if (!args.empty()) {
               auto keyType = args[0];
               auto *hashableProto =
-                TC.Context.getProtocol(KnownProtocolKind::Hashable);
+                Ctx.getProtocol(KnownProtocolKind::Hashable);
               if (!hashableProto)
                 return Action::Stop;
 
-              auto result = TC.conformsToProtocol(
+              auto result = tc.conformsToProtocol(
                   keyType, hashableProto, DC, options,
-                  /*ComplainLoc=*/SourceLoc(), Callback);
-
-              WasUnsatisfied |= result.hasUnsatisfiedDependency();
-              if (WasUnsatisfied)
-                return Action::Stop;
+                  /*ComplainLoc=*/SourceLoc());
             }
           }
         }
@@ -5818,53 +4024,31 @@ bool TypeChecker::useObjectiveCBridgeableConformances(DeclContext *dc,
     }
   };
 
-  auto proto = getProtocol(SourceLoc(),
-                           KnownProtocolKind::ObjectiveCBridgeable);
-  if (!proto) return false;
+  auto proto =
+    dc->getASTContext().getProtocol(KnownProtocolKind::ObjectiveCBridgeable);
+  if (!proto) return;
 
-  Walker walker(*this, dc, proto, unsatisfiedDependency);
+  Walker walker(dc, proto);
   type.walk(walker);
-  assert(!walker.WasUnsatisfied || unsatisfiedDependency);
-  return walker.WasUnsatisfied;
 }
 
-bool TypeChecker::useObjectiveCBridgeableConformancesOfArgs(
-       DeclContext *dc, BoundGenericType *bound,
-       UnsatisfiedDependency *unsatisfiedDependency) {
-  auto proto = getProtocol(SourceLoc(),
-                           KnownProtocolKind::ObjectiveCBridgeable);
-  if (!proto) return false;
+void swift::useObjectiveCBridgeableConformancesOfArgs(
+       DeclContext *dc, BoundGenericType *bound) {
+  ASTContext &ctx = dc->getASTContext();
+  auto proto = ctx.getProtocol(KnownProtocolKind::ObjectiveCBridgeable);
+  if (!proto) return;
 
   // Check whether the bound generic type itself is bridged to
   // Objective-C.
   ConformanceCheckOptions options =
     (ConformanceCheckFlags::InExpression |
      ConformanceCheckFlags::SuppressDependencyTracking);
-  auto result = conformsToProtocol(
+  auto lazyResolver = ctx.getLazyResolver();
+  assert(lazyResolver && "Need a type checker to check conforms-to-protocol");
+  auto &tc = *static_cast<TypeChecker *>(lazyResolver);
+  (void)tc.conformsToProtocol(
       bound->getDecl()->getDeclaredType(), proto, dc,
-      options, /*ComplainLoc=*/SourceLoc(),
-      unsatisfiedDependency);
-
-  switch (result.getStatus()) {
-  case RequirementCheckResult::UnsatisfiedDependency:
-    return true;
-  case RequirementCheckResult::Failure:
-  case RequirementCheckResult::SubstitutionFailure:
-    return false;
-  case RequirementCheckResult::Success: {
-    bool anyUnsatisfied = false;
-
-    // Mark the conformances within the arguments.
-    for (auto arg : bound->getGenericArgs()) {
-      anyUnsatisfied |=
-          useObjectiveCBridgeableConformances(dc, arg, unsatisfiedDependency);
-    }
-
-    return anyUnsatisfied;
-  }
-  }
-
-  llvm_unreachable("Unhandled RequirementCheckResult in switch.");
+      options, /*ComplainLoc=*/SourceLoc());
 }
 
 void TypeChecker::useBridgedNSErrorConformances(DeclContext *dc, Type type) {
@@ -5909,9 +4093,31 @@ void TypeChecker::useBridgedNSErrorConformances(DeclContext *dc, Type type) {
 }
 
 void TypeChecker::checkConformance(NormalProtocolConformance *conformance) {
+  PrettyStackTraceType trace1(Context, "checking conformance of",
+                              conformance->getType());
+  PrettyStackTraceDecl trace2("...to", conformance->getProtocol());
+
   MultiConformanceChecker checker(*this);
   checker.addConformance(conformance);
   checker.checkAllConformances();
+}
+
+void TypeChecker::checkConformanceRequirements(
+                                     NormalProtocolConformance *conformance) {
+  // If the conformance is already invalid, there's nothing to do here.
+  if (conformance->isInvalid())
+    return;
+
+  PrettyStackTraceType trace1(Context, "checking conformance requirements of",
+                              conformance->getType());
+  PrettyStackTraceDecl trace2("...to", conformance->getProtocol());
+
+  conformance->setSignatureConformances({ });
+
+  llvm::SetVector<ValueDecl *> globalMissingWitnesses;
+  ConformanceChecker checker(*this, conformance, globalMissingWitnesses);
+  checker.ensureRequirementsAreSatisfied(/*failUnsubstituted=*/true);
+  checker.diagnoseMissingWitnesses(MissingWitnessDiagnosisKind::ErrorFixIt);
 }
 
 /// Determine the score when trying to match two identifiers together.
@@ -6024,11 +4230,14 @@ static Optional<unsigned> scorePotentiallyMatching(TypeChecker &tc,
   DeclName reqName = req->getFullName();
   DeclName witnessName = witness->getFullName();
 
-  // Apply the omit-needless-words heuristics to both names.
-  if (auto adjustedReqName = ::omitNeedlessWords(tc, req))
-    reqName = *adjustedReqName;
-  if (auto adjustedWitnessName = ::omitNeedlessWords(tc, witness))
-    witnessName = *adjustedWitnessName;
+  // For @objc protocols, apply the omit-needless-words heuristics to
+  // both names.
+  if (cast<ProtocolDecl>(req->getDeclContext())->isObjC()) {
+    if (auto adjustedReqName = ::omitNeedlessWords(tc, req))
+      reqName = *adjustedReqName;
+    if (auto adjustedWitnessName = ::omitNeedlessWords(tc, witness))
+      witnessName = *adjustedWitnessName;
+  }
 
   return scorePotentiallyMatchingNames(reqName, witnessName, isa<FuncDecl>(req),
                                        limit);
@@ -6128,19 +4337,63 @@ static unsigned getNameLength(DeclName name) {
   return length;
 }
 
+/// Determine whether a particular declaration is generic.
+static bool isGeneric(ValueDecl *decl) {
+  if (auto func = dyn_cast<AbstractFunctionDecl>(decl))
+    return func->isGeneric();
+  if (auto subscript = dyn_cast<SubscriptDecl>(decl))
+    return subscript->isGeneric();
+  return false;
+}
+
+/// Determine whether this is an unlabeled initializer or subscript.
+static bool isUnlabeledInitializerOrSubscript(ValueDecl *value) {
+  ParameterList *paramList = nullptr;
+  if (auto constructor = dyn_cast<ConstructorDecl>(value))
+    paramList = constructor->getParameters();
+  else if (auto subscript = dyn_cast<SubscriptDecl>(value))
+    paramList = subscript->getIndices();
+  else
+    return false;
+
+  for (auto param : *paramList) {
+    if (!param->getArgumentName().empty()) return false;
+  }
+
+  return true;
+}
+
+/// Determine whether this declaration is an initializer
 /// Determine whether we should warn about the given witness being a close
 /// match for the given optional requirement.
-static bool shouldWarnAboutPotentialWitness(ValueDecl *req,
-                                            ValueDecl *witness,
-                                            AccessLevel access,
-                                            unsigned score) {
+static bool shouldWarnAboutPotentialWitness(
+                                      MultiConformanceChecker &groupChecker,
+                                      ValueDecl *req,
+                                      ValueDecl *witness,
+                                      AccessLevel access,
+                                      unsigned score) {
+  // If the witness is covered, don't warn about it.
+  if (groupChecker.isCoveredMember(witness))
+    return false;
+
+  // If the kinds of the requirement and witness are different, there's
+  // nothing to warn about.
+  if (req->getKind() != witness->getKind())
+    return false;
+
   // If the warning couldn't be suppressed, don't warn.
   if (!canSuppressPotentialWitnessWarningWithMovement(req, witness) &&
       !canSuppressPotentialWitnessWarningWithNonObjC(req, witness))
     return false;
 
-  // If the potential witness is already marked @nonobjc, don't warn.
-  if (witness->getAttrs().hasAttribute<NonObjCAttr>())
+  // If the potential witness for an @objc requirement is already
+  // marked @nonobjc, don't warn.
+  if (req->isObjC() && witness->getAttrs().hasAttribute<NonObjCAttr>())
+    return false;
+
+  // If the witness is generic and requirement is not, or vice-versa,
+  // don't warn.
+  if (isGeneric(req) != isGeneric(witness))
     return false;
 
   // Don't warn if the potential witness has been explicitly given less
@@ -6149,6 +4402,17 @@ static bool shouldWarnAboutPotentialWitness(ValueDecl *req,
     if (auto attr = witness->getAttrs().getAttribute<AccessControlAttr>())
       if (!attr->isImplicit()) return false;
   }
+
+  // Don't warn if the requirement or witness is an initializer or subscript
+  // with no argument labels.
+  if (isUnlabeledInitializerOrSubscript(req) ||
+      isUnlabeledInitializerOrSubscript(witness))
+    return false;
+
+  // For non-@objc requirements, only warn if the witness comes from an
+  // extension.
+  if (!req->isObjC() && !isa<ExtensionDecl>(witness->getDeclContext()))
+    return false;
 
   // If the score is relatively high, don't warn: this is probably
   // unrelated.  Allow about one typo for every four properly-typed
@@ -6171,17 +4435,17 @@ static void diagnosePotentialWitness(TypeChecker &tc,
   auto proto = cast<ProtocolDecl>(req->getDeclContext());
 
   // Primary warning.
-  tc.diagnose(witness, diag::optional_req_near_match,
+  tc.diagnose(witness, diag::req_near_match,
               witness->getDescriptiveKind(),
               witness->getFullName(),
+              req->getAttrs().hasAttribute<OptionalAttr>(),
               req->getFullName(),
               proto->getFullName());
 
   // Describe why the witness didn't satisfy the requirement.
   auto dc = conformance->getDeclContext();
-  RequirementEnvironment reqEnvironment(tc, dc, req, conformance);
   auto match = matchWitness(tc, conformance->getProtocol(), conformance,
-                            dc, req, witness, reqEnvironment);
+                            dc, req, witness);
   if (match.Kind == MatchKind::ExactMatch &&
       req->isObjC() && !witness->isObjC()) {
     // Special case: note to add @objc.
@@ -6197,25 +4461,26 @@ static void diagnosePotentialWitness(TypeChecker &tc,
   // If moving the declaration can help, suggest that.
   if (auto move
         = canSuppressPotentialWitnessWarningWithMovement(req, witness)) {
-    tc.diagnose(witness, diag::optional_req_near_match_move,
+    tc.diagnose(witness, diag::req_near_match_move,
                 witness->getFullName(), static_cast<unsigned>(*move));
   }
 
   // If adding 'private', 'fileprivate', or 'internal' can help, suggest that.
   if (access > AccessLevel::FilePrivate &&
       !witness->getAttrs().hasAttribute<AccessControlAttr>()) {
-    tc.diagnose(witness, diag::optional_req_near_match_access,
+    tc.diagnose(witness, diag::req_near_match_access,
                 witness->getFullName(), access)
       .fixItInsert(witness->getAttributeInsertionLoc(true), "private ");
   }
 
   // If adding @nonobjc can help, suggest that.
   if (canSuppressPotentialWitnessWarningWithNonObjC(req, witness)) {
-    tc.diagnose(witness, diag::optional_req_near_match_nonobjc, false)
+    tc.diagnose(witness, diag::req_near_match_nonobjc, false)
       .fixItInsert(witness->getAttributeInsertionLoc(false), "@nonobjc ");
   }
 
-  tc.diagnose(req, diag::protocol_requirement_here, req->getFullName());
+  tc.diagnose(req, diag::kind_declname_declared_here,
+              DescriptiveDeclKind::Requirement, req->getFullName());
 }
 
 /// Whether the given protocol is "NSCoding".
@@ -6251,16 +4516,32 @@ static bool hasGenericAncestry(ClassDecl *classDecl) {
 
 /// Infer the attribute tostatic-initialize the Objective-C metadata for the
 /// given class, if needed.
-static void inferStaticInitializeObjCMetadata(ClassDecl *classDecl) {
+static void inferStaticInitializeObjCMetadata(TypeChecker &tc,
+                                              ClassDecl *classDecl) {
   // If we already have the attribute, there's nothing to do.
   if (classDecl->getAttrs().hasAttribute<StaticInitializeObjCMetadataAttr>())
     return;
 
   // If we know that the Objective-C metadata will be statically registered,
   // there's nothing to do.
-  if (!hasGenericAncestry(classDecl) &&
-      classDecl->getDeclContext()->isModuleScopeContext()) {
+  if (!hasGenericAncestry(classDecl)) {
     return;
+  }
+
+  // If this class isn't always available on the deployment target, don't
+  // mark it as statically initialized.
+  // FIXME: This is a workaround. The proper solution is for IRGen to
+  // only statically initializae the Objective-C metadata when running on
+  // a new-enough OS.
+  if (auto sourceFile = classDecl->getParentSourceFile()) {
+    AvailabilityContext availableInfo = AvailabilityContext::alwaysAvailable();
+    for (Decl *enclosingDecl = classDecl; enclosingDecl;
+         enclosingDecl = enclosingDecl->getDeclContext()
+                           ->getInnermostDeclarationDeclContext()) {
+      if (!tc.isDeclAvailable(enclosingDecl, SourceLoc(), sourceFile,
+                              availableInfo))
+        return;
+    }
   }
 
   // Infer @_staticInitializeObjCMetadata.
@@ -6380,13 +4661,22 @@ void TypeChecker::checkConformancesInContext(DeclContext *dc,
         }
 
         // Infer @_staticInitializeObjCMetadata if needed.
-        inferStaticInitializeObjCMetadata(classDecl);
+        inferStaticInitializeObjCMetadata(*this, classDecl);
       }
     }
   }
 
   // Check all conformances.
   groupChecker.checkAllConformances();
+
+  if (Context.LangOpts.DebugGenericSignatures) {
+    // Now that they're filled out, print out information about the conformances
+    // here, when requested.
+    for (auto conformance : conformances) {
+      dc->dumpContext();
+      conformance->dump();
+    }
+  }
 
   // Catalog all of members of this declaration context that satisfy
   // requirements of conformances in this context.
@@ -6403,6 +4693,12 @@ void TypeChecker::checkConformancesInContext(DeclContext *dc,
 
     // Complain about the redundant conformance.
 
+    auto currentSig = dc->getGenericSignatureOfContext();
+    auto existingSig = diag.ExistingDC->getGenericSignatureOfContext();
+    auto differentlyConditional = currentSig && existingSig &&
+                                  currentSig->getCanonicalSignature() !=
+                                      existingSig->getCanonicalSignature();
+
     // If we've redundantly stated a conformance for which the original
     // conformance came from the module of the type or the module of the
     // protocol, just warn; we'll pick up the original conformance.
@@ -6414,11 +4710,13 @@ void TypeChecker::checkConformancesInContext(DeclContext *dc,
            extendedNominal->getParentModule()->getName() ||
          existingModule == diag.Protocol->getParentModule())) {
       // Warn about the conformance.
-      diagnose(diag.Loc, diag::redundant_conformance_adhoc,
-               dc->getDeclaredInterfaceType(),
+      auto diagID = differentlyConditional
+                        ? diag::redundant_conformance_adhoc_conditional
+                        : diag::redundant_conformance_adhoc;
+      diagnose(diag.Loc, diagID, dc->getDeclaredInterfaceType(),
                diag.Protocol->getName(),
                existingModule->getName() ==
-                 extendedNominal->getParentModule()->getName(),
+                   extendedNominal->getParentModule()->getName(),
                existingModule->getName());
 
       // Complain about any declarations in this extension whose names match
@@ -6436,8 +4734,8 @@ void TypeChecker::checkConformancesInContext(DeclContext *dc,
 
         bool valueIsType = isa<TypeDecl>(value);
         for (auto requirement
-              : diag.Protocol->lookupDirect(value->getFullName(),
-                                            /*ignoreNewExtensions=*/true)) {
+                : diag.Protocol->lookupDirect(value->getFullName(),
+                                              /*ignoreNewExtensions=*/true)) {
           auto requirementIsType = isa<TypeDecl>(requirement);
           if (valueIsType != requirementIsType)
             continue;
@@ -6449,18 +4747,22 @@ void TypeChecker::checkConformancesInContext(DeclContext *dc,
         }
       }
     } else {
-      diagnose(diag.Loc, diag::redundant_conformance,
-               dc->getDeclaredInterfaceType(),
+      auto diagID = differentlyConditional
+                        ? diag::redundant_conformance_conditional
+                        : diag::redundant_conformance;
+      diagnose(diag.Loc, diagID, dc->getDeclaredInterfaceType(),
                diag.Protocol->getName());
     }
 
     // Special case: explain that 'RawRepresentable' conformance
     // is implied for enums which already declare a raw type.
     if (auto enumDecl = dyn_cast<EnumDecl>(existingDecl)) {
-      if (diag.Protocol->isSpecificProtocol(KnownProtocolKind::RawRepresentable)
-          && enumDecl->derivesProtocolConformance(diag.Protocol)
-          && enumDecl->hasRawType()
-          && enumDecl->getInherited()[0].getSourceRange().isValid()) {
+      if (diag.Protocol->isSpecificProtocol(
+              KnownProtocolKind::RawRepresentable) &&
+          DerivedConformance::derivesProtocolConformance(*this, dc, enumDecl,
+                                                         diag.Protocol) &&
+          enumDecl->hasRawType() &&
+          enumDecl->getInherited()[0].getSourceRange().isValid()) {
         diagnose(enumDecl->getInherited()[0].getSourceRange().Start,
                  diag::enum_declares_rawrep_with_raw_type,
                  dc->getDeclaredInterfaceType(), enumDecl->getRawType());
@@ -6530,8 +4832,8 @@ void TypeChecker::checkConformancesInContext(DeclContext *dc,
             bestOptionalReqs.begin(),
             bestOptionalReqs.end(),
             [&](ValueDecl *req) {
-              return !shouldWarnAboutPotentialWitness(req, value, defaultAccess,
-                                                      bestScore);
+              return !shouldWarnAboutPotentialWitness(groupChecker, req, value,
+                                                      defaultAccess, bestScore);
             }),
           bestOptionalReqs.end());
       }
@@ -6552,7 +4854,7 @@ void TypeChecker::checkConformancesInContext(DeclContext *dc,
         assert(diagnosed && "Failed to find conformance to diagnose?");
         (void)diagnosed;
 
-        // Remove this optional requirement from the list. We don't want to
+        // Remove this requirement from the list. We don't want to
         // complain about it twice.
         unsatisfiedReqs.erase(std::find(unsatisfiedReqs.begin(),
                                         unsatisfiedReqs.end(),
@@ -6585,8 +4887,8 @@ void TypeChecker::checkConformancesInContext(DeclContext *dc,
 }
 
 llvm::TinyPtrVector<ValueDecl *>
-TypeChecker::findWitnessedObjCRequirements(const ValueDecl *witness,
-                                           bool anySingleRequirement) {
+swift::findWitnessedObjCRequirements(const ValueDecl *witness,
+                                     bool anySingleRequirement) {
   llvm::TinyPtrVector<ValueDecl *> result;
 
   // Types don't infer @objc this way.
@@ -6597,30 +4899,30 @@ TypeChecker::findWitnessedObjCRequirements(const ValueDecl *witness,
   if (!nominal) return result;
 
   DeclName name = witness->getFullName();
-  auto accessorKind = AccessorKind::NotAccessor;
-  if (auto *fn = dyn_cast<FuncDecl>(witness)) {
-    accessorKind = fn->getAccessorKind();
-    switch (accessorKind) {
-    case AccessorKind::IsAddressor:
-    case AccessorKind::IsMutableAddressor:
-    case AccessorKind::IsMaterializeForSet:
+  Optional<AccessorKind> accessorKind;
+  if (auto *accessor = dyn_cast<AccessorDecl>(witness)) {
+    accessorKind = accessor->getAccessorKind();
+    switch (*accessorKind) {
+    case AccessorKind::Address:
+    case AccessorKind::MutableAddress:
+    case AccessorKind::MaterializeForSet:
+    case AccessorKind::Read:
+    case AccessorKind::Modify:
       // These accessors are never exposed to Objective-C.
       return result;
-    case AccessorKind::IsDidSet:
-    case AccessorKind::IsWillSet:
+    case AccessorKind::DidSet:
+    case AccessorKind::WillSet:
       // These accessors are folded into the setter.
       return result;
-    case AccessorKind::IsGetter:
-    case AccessorKind::IsSetter:
+    case AccessorKind::Get:
+    case AccessorKind::Set:
       // These are found relative to the main decl.
-      name = fn->getAccessorStorageDecl()->getFullName();
-      break;
-    case AccessorKind::NotAccessor:
-      // Do nothing.
+      name = accessor->getStorage()->getFullName();
       break;
     }
   }
 
+  ASTContext &ctx = nominal->getASTContext();
   for (auto proto : nominal->getAllProtocols()) {
     // We only care about Objective-C protocols.
     if (!proto->isObjC()) continue;
@@ -6634,7 +4936,7 @@ TypeChecker::findWitnessedObjCRequirements(const ValueDecl *witness,
       if (isa<TypeDecl>(req)) continue;
 
       // Skip unavailable requirements.
-      if (req->getAttrs().isUnavailable(Context)) continue;
+      if (req->getAttrs().isUnavailable(ctx)) continue;
 
       // Dig out the conformance.
       if (!conformance.hasValue()) {
@@ -6648,7 +4950,7 @@ TypeChecker::findWitnessedObjCRequirements(const ValueDecl *witness,
       }
       if (!*conformance) continue;
 
-      const Decl *found = (*conformance)->getWitnessDecl(req, this);
+      const Decl *found = (*conformance)->getWitnessDecl(req, nullptr);
 
       if (!found) {
         // If we have an optional requirement in an inherited conformance,
@@ -6669,19 +4971,21 @@ TypeChecker::findWitnessedObjCRequirements(const ValueDecl *witness,
         }
 
         const ValueDecl *witnessToMatch = witness;
-        if (accessorKind != AccessorKind::NotAccessor)
-          witnessToMatch = cast<FuncDecl>(witness)->getAccessorStorageDecl();
+        if (accessorKind)
+          witnessToMatch = cast<AccessorDecl>(witness)->getStorage();
 
-        RequirementEnvironment reqEnvironment(*this, dc, req, *conformance);
-        if (matchWitness(*this, proto, *conformance,
+        auto lazyResolver = ctx.getLazyResolver();
+        assert(lazyResolver && "Need a type checker to match witnesses");
+        auto &tc = *static_cast<TypeChecker *>(lazyResolver);
+        if (matchWitness(tc, proto, *conformance,
                          witnessToMatch->getDeclContext(), req,
-                         const_cast<ValueDecl *>(witnessToMatch),
-                         reqEnvironment).Kind == MatchKind::ExactMatch) {
-          if (accessorKind != AccessorKind::NotAccessor) {
+                         const_cast<ValueDecl *>(witnessToMatch))
+              .Kind == MatchKind::ExactMatch) {
+          if (accessorKind) {
             auto *storageReq = dyn_cast<AbstractStorageDecl>(req);
             if (!storageReq)
               continue;
-            req = storageReq->getAccessorFunction(accessorKind);
+            req = storageReq->getAccessor(*accessorKind);
             if (!req)
               continue;
           }
@@ -6694,15 +4998,15 @@ TypeChecker::findWitnessedObjCRequirements(const ValueDecl *witness,
       }
 
       // Dig out the appropriate accessor, if necessary.
-      if (accessorKind != AccessorKind::NotAccessor) {
+      if (accessorKind) {
         auto *storageReq = dyn_cast<AbstractStorageDecl>(req);
         auto *storageFound = dyn_cast_or_null<AbstractStorageDecl>(found);
         if (!storageReq || !storageFound)
           continue;
-        req = storageReq->getAccessorFunction(accessorKind);
+        req = storageReq->getAccessor(*accessorKind);
         if (!req)
           continue;
-        found = storageFound->getAccessorFunction(accessorKind);
+        found = storageFound->getAccessor(*accessorKind);
       }
 
       // Determine whether the witness for this conformance is in fact
@@ -6723,8 +5027,7 @@ TypeChecker::findWitnessedObjCRequirements(const ValueDecl *witness,
                          = cast<ProtocolDecl>(lhs->getDeclContext());
                        ProtocolDecl *rhsProto
                          = cast<ProtocolDecl>(rhs->getDeclContext());
-                       return ProtocolType::compareProtocols(&lhsProto,
-                                                             &rhsProto) < 0;
+                       return TypeDecl::compare(lhsProto, rhsProto) < 0;
                      });
   }
   return result;
@@ -6742,6 +5045,7 @@ void TypeChecker::resolveTypeWitness(
     checker.resolveTypeWitnesses();
   else
     checker.resolveSingleTypeWitness(assocType);
+  checker.diagnoseMissingWitnesses(MissingWitnessDiagnosisKind::ErrorFixIt);
 }
 
 void TypeChecker::resolveWitness(const NormalProtocolConformance *conformance,
@@ -6752,6 +5056,7 @@ void TypeChecker::resolveWitness(const NormalProtocolConformance *conformance,
                        const_cast<NormalProtocolConformance*>(conformance),
                        MissingWitnesses);
   checker.resolveSingleWitness(requirement);
+  checker.diagnoseMissingWitnesses(MissingWitnessDiagnosisKind::ErrorFixIt);
 }
 
 ValueDecl *TypeChecker::deriveProtocolRequirement(DeclContext *DC,
@@ -6767,30 +5072,35 @@ ValueDecl *TypeChecker::deriveProtocolRequirement(DeclContext *DC,
     return nullptr;
 
   auto Decl = DC->getInnermostDeclarationDeclContext();
+  if (Decl->isInvalid())
+    return nullptr;
+
+  DerivedConformance derived(*this, Decl, TypeDecl, protocol);
 
   switch (*knownKind) {
   case KnownProtocolKind::RawRepresentable:
-    return DerivedConformance::deriveRawRepresentable(*this, Decl,
-                                                      TypeDecl, Requirement);
+    return derived.deriveRawRepresentable(Requirement);
+
+  case KnownProtocolKind::CaseIterable:
+    return derived.deriveCaseIterable(Requirement);
 
   case KnownProtocolKind::Equatable:
-    return DerivedConformance::deriveEquatable(*this, Decl, TypeDecl, Requirement);
-  
+    return derived.deriveEquatable(Requirement);
+
   case KnownProtocolKind::Hashable:
-    return DerivedConformance::deriveHashable(*this, Decl, TypeDecl, Requirement);
-    
+    return derived.deriveHashable(Requirement);
+
   case KnownProtocolKind::BridgedNSError:
-    return DerivedConformance::deriveBridgedNSError(*this, Decl, TypeDecl,
-                                                    Requirement);
+    return derived.deriveBridgedNSError(Requirement);
 
   case KnownProtocolKind::CodingKey:
-    return DerivedConformance::deriveCodingKey(*this, Decl, TypeDecl, Requirement);
+    return derived.deriveCodingKey(Requirement);
 
   case KnownProtocolKind::Encodable:
-    return DerivedConformance::deriveEncodable(*this, Decl, TypeDecl, Requirement);
+    return derived.deriveEncodable(Requirement);
 
   case KnownProtocolKind::Decodable:
-    return DerivedConformance::deriveDecodable(*this, Decl, TypeDecl, Requirement);
+    return derived.deriveDecodable(Requirement);
 
   default:
     return nullptr;
@@ -6809,11 +5119,12 @@ Type TypeChecker::deriveTypeWitness(DeclContext *DC,
 
   auto Decl = DC->getInnermostDeclarationDeclContext();
 
+  DerivedConformance derived(*this, Decl, TypeDecl, protocol);
   switch (*knownKind) {
   case KnownProtocolKind::RawRepresentable:
-    return DerivedConformance::deriveRawRepresentable(*this, Decl,
-                                                      TypeDecl, AssocType);
-        
+    return derived.deriveRawRepresentable(AssocType);
+  case KnownProtocolKind::CaseIterable:
+    return derived.deriveCaseIterable(AssocType);
   default:
     return nullptr;
   }
@@ -6828,8 +5139,7 @@ namespace {
       : WitnessChecker(tc, proto, proto->getDeclaredType(), proto) { }
 
     ResolveWitnessResult resolveWitnessViaLookup(ValueDecl *requirement);
-    void recordWitness(ValueDecl *requirement, const RequirementMatch &match,
-                       RequirementEnvironment &&reqEnvironment);
+    void recordWitness(ValueDecl *requirement, const RequirementMatch &match);
   };
 } // end anonymous namespace
 
@@ -6843,10 +5153,8 @@ DefaultWitnessChecker::resolveWitnessViaLookup(ValueDecl *requirement) {
   unsigned bestIdx = 0;
   bool doNotDiagnoseMatches = false;
 
-  RequirementEnvironment reqEnvironment(TC, DC, requirement,
-                                        /*conformance=*/nullptr);
   if (findBestWitness(
-                 requirement, nullptr, nullptr, reqEnvironment,
+                 requirement, nullptr, nullptr,
                  /* out parameters: */
                  matches, numViable, bestIdx, doNotDiagnoseMatches)) {
 
@@ -6859,7 +5167,7 @@ DefaultWitnessChecker::resolveWitnessViaLookup(ValueDecl *requirement) {
       return ResolveWitnessResult::ExplicitFailed;
 
     // Record the match.
-    recordWitness(requirement, best, std::move(reqEnvironment));
+    recordWitness(requirement, best);
     return ResolveWitnessResult::Success;
   }
 
@@ -6869,11 +5177,9 @@ DefaultWitnessChecker::resolveWitnessViaLookup(ValueDecl *requirement) {
 
 void DefaultWitnessChecker::recordWitness(
                                   ValueDecl *requirement,
-                                  const RequirementMatch &match,
-                                  RequirementEnvironment &&reqEnvironment) {
+                                  const RequirementMatch &match) {
   Proto->setDefaultWitness(requirement,
-                           match.getWitness(TC.Context,
-                                            std::move(reqEnvironment)));
+                           match.getWitness(TC.Context));
 
   // Synthesize accessors for the protocol witness table to use.
   if (auto storage = dyn_cast<AbstractStorageDecl>(match.Witness))
@@ -6903,57 +5209,14 @@ void TypeChecker::inferDefaultWitnesses(ProtocolDecl *proto) {
   }
 }
 
-bool TypeChecker::isProtocolExtensionUsable(DeclContext *dc, Type type,
-                                            ExtensionDecl *protocolExtension) {
-  using namespace constraints;
-
-  assert(protocolExtension->getAsProtocolExtensionContext() &&
-         "Only intended for protocol extensions");
-
-  resolveExtension(protocolExtension);
-
-  // Dig down to the type we care about.
-  type = type->getInOutObjectType()->getRValueType();
-  if (auto metaTy = type->getAs<AnyMetatypeType>())
-    type = metaTy->getInstanceType();
-
-  // Unconstrained protocol extensions are always usable.
-  if (!protocolExtension->isConstrainedExtension())
-    return true;
-
-  // If the type still has parameters, the constrained extension is considered
-  // unusable.
-  if (type->hasTypeParameter() || type->hasTypeVariable())
-    return false;
-
-  // Set up a constraint system where we open the generic parameters of the
-  // protocol extension.
-  ConstraintSystem cs(*this, dc, None);
-  OpenedTypeMap replacements;
-  auto genericSig = protocolExtension->getGenericSignature();
-  
-  cs.openGeneric(protocolExtension, protocolExtension, genericSig, false,
-                 ConstraintLocatorBuilder(nullptr), replacements);
-
-  // Bind the 'Self' type variable to the provided type.
-  auto selfType = cast<GenericTypeParamType>(
-    genericSig->getGenericParams().back()->getCanonicalType());
-  auto selfTypeVar = replacements[selfType];
-  cs.addConstraint(ConstraintKind::Bind, selfTypeVar, type, nullptr);
-
-  // If we can solve the solution, the protocol extension is usable.
-  return cs.solveSingle().hasValue();
-}
-
 void TypeChecker::recordKnownWitness(NormalProtocolConformance *conformance,
                                      ValueDecl *req, ValueDecl *witness) {
   // Match the witness. This should never fail, but it does allow renaming
   // (because property behaviors rely on renaming).
   validateDecl(witness);
   auto dc = conformance->getDeclContext();
-  RequirementEnvironment reqEnvironment(*this, dc, req, conformance);
   auto match = matchWitness(*this, conformance->getProtocol(), conformance,
-                            dc, req, witness, reqEnvironment);
+                            dc, req, witness);
   if (match.Kind != MatchKind::ExactMatch &&
       match.Kind != MatchKind::RenamedMatch) {
     diagnose(witness, diag::property_behavior_conformance_broken,
@@ -6961,8 +5224,7 @@ void TypeChecker::recordKnownWitness(NormalProtocolConformance *conformance,
     return;
   }
 
-  conformance->setWitness(req,
-                          match.getWitness(Context, std::move(reqEnvironment)));
+  conformance->setWitness(req, match.getWitness(Context));
 }
 
 Type TypeChecker::getWitnessType(Type type, ProtocolDecl *protocol,

@@ -2,10 +2,8 @@
 #define __COREFOUNDATION_COREFOUNDATION__ 1
 #define __COREFOUNDATION__ 1
 
-#include <MacTypes.h>
-
 typedef const struct __CFAllocator * CFAllocatorRef;
-const CFAllocatorRef kCFAllocatorDefault;
+extern const CFAllocatorRef kCFAllocatorDefault;
 
 
 typedef const void *CFTypeRef;
@@ -26,5 +24,7 @@ extern CFIndex CFIndex_test;
 
 #define CF_ENUM(_type, _name) enum _name : _type _name; enum _name : _type
 #define CF_OPTIONS(_type, _name) enum _name : _type _name; enum _name : _type
+
+#define CF_NOESCAPE __attribute__((noescape))
 
 #endif

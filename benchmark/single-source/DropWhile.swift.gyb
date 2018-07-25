@@ -47,7 +47,7 @@ public let DropWhile = [
   BenchmarkInfo(
     name: "DropWhile${Name}",
     runFunction: run_DropWhile${Name},
-    tags: [.validation, .api${', .Array' if Name == 'Array' else ''}]),
+    tags: [.validation, .api${', .Array, .unstable' if Name == 'Array' else ''}]),
 % end
 ]
 
@@ -64,3 +64,7 @@ public func run_DropWhile${Name}(_ N: Int) {
   }
 }
 % end
+
+// ${'Local Variables'}:
+// eval: (read-only-mode 1)
+// End:

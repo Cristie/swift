@@ -26,7 +26,7 @@ if (1) {} // expected-error{{'Int' is not convertible to 'Bool'}}
 if 1 {} // expected-error {{'Int' is not convertible to 'Bool'}}
 
 var a: [String] = [1] // expected-error{{cannot convert value of type 'Int' to expected element type 'String'}}
-var b: Int = [1, 2, 3] // expected-error{{contextual type 'Int' cannot be used with array literal}}
+var b: Int = [1, 2, 3] // expected-error{{cannot convert value of type '[Int]' to specified type 'Int'}}
 
 var f1: Float = 2.0
 var f2: Float = 3.0
@@ -129,15 +129,15 @@ func test17875634() {
 
 // <rdar://problem/20770032> Pattern matching ranges against tuples crashes the compiler
 func test20770032() {
-  if case let 1...10 = (1, 1) { // expected-warning{{'let' pattern has no effect; sub-pattern didn't bind any variables}} {{11-15=}} expected-error{{expression pattern of type 'CountableClosedRange<Int>' cannot match values of type '(Int, Int)'}}
+  if case let 1...10 = (1, 1) { // expected-warning{{'let' pattern has no effect; sub-pattern didn't bind any variables}} {{11-15=}} expected-error{{expression pattern of type 'ClosedRange<Int>' cannot match values of type '(Int, Int)'}}
   }
 }
 
 
 
-func tuple_splat1(_ a : Int, _ b : Int) { // expected-note {{'tuple_splat1' declared here}}
+func tuple_splat1(_ a : Int, _ b : Int) { // expected-note 2 {{'tuple_splat1' declared here}}
   let x = (1,2)
-  tuple_splat1(x)          // expected-error {{passing 2 arguments to a callee as a single tuple value has been removed in Swift 3}}
+  tuple_splat1(x)          // expected-error {{missing argument for parameter #2 in call}}
   tuple_splat1(1, 2)       // Ok.
   tuple_splat1((1, 2))     // expected-error {{missing argument for parameter #2 in call}}
 }

@@ -75,7 +75,7 @@ static cl::opt<unsigned> FunctionMergeThreshold(
     "swiftmergefunc-threshold",
     cl::desc("Functions larger than the threshold are considered for merging."
              "'0' disables function merging at all."),
-    cl::init(30), cl::Hidden);
+    cl::init(15), cl::Hidden);
 
 namespace {
 
@@ -263,7 +263,7 @@ private:
       return FCmp.compareIgnoringConsts() == -1;
     }
   };
-  typedef std::set<EquivalenceClass, FunctionNodeCmp> FnTreeType;
+  using FnTreeType = std::set<EquivalenceClass, FunctionNodeCmp>;
 
   /// 
   struct FunctionEntry {
@@ -334,7 +334,7 @@ private:
     int NumParamsNeeded;
   };
 
-  typedef SmallVector<FunctionInfo, 8> FunctionInfos;
+  using FunctionInfos = SmallVector<FunctionInfo, 8>;
 
   /// Describes a parameter which we create to parameterize the merged function.
   struct ParamInfo {
@@ -361,7 +361,7 @@ private:
     }
   };
 
-  typedef SmallVector<ParamInfo, maxAddedParams> ParamInfos;
+  using ParamInfos = SmallVector<ParamInfo, maxAddedParams>;
 
   GlobalNumberState GlobalNumbers;
 
@@ -595,9 +595,9 @@ bool SwiftMergeFunctions::runOnModule(Module &M) {
     std::vector<WeakTrackingVH> Worklist;
     Deferred.swap(Worklist);
 
-    DEBUG(dbgs() << "======\nbuild tree: worklist-size=" << Worklist.size() <<
-                    '\n');
-    DEBUG(doSanityCheck(Worklist));
+    LLVM_DEBUG(dbgs() << "======\nbuild tree: worklist-size="
+                      << Worklist.size() << '\n');
+    LLVM_DEBUG(doSanityCheck(Worklist));
 
     SmallVector<FunctionEntry *, 8> FuncsToMerge;
 
@@ -616,10 +616,10 @@ bool SwiftMergeFunctions::runOnModule(Module &M) {
 
       if (Result.second) {
         assert(Eq.First == FE);
-        DEBUG(dbgs() << "  new in tree: " << F->getName() << '\n');
+        LLVM_DEBUG(dbgs() << "  new in tree: " << F->getName() << '\n');
       } else {
         assert(Eq.First != FE);
-        DEBUG(dbgs() << "  add to existing: " << F->getName() << '\n');
+        LLVM_DEBUG(dbgs() << "  add to existing: " << F->getName() << '\n');
         // Add the function to the existing equivalence class.
         FE->Next = Eq.First->Next;
         Eq.First->Next = FE;
@@ -629,7 +629,8 @@ bool SwiftMergeFunctions::runOnModule(Module &M) {
           FuncsToMerge.push_back(Eq.First);
       }
     }
-    DEBUG(dbgs() << "merge functions: tree-size=" << FnTree.size() << '\n');
+    LLVM_DEBUG(dbgs() << "merge functions: tree-size=" << FnTree.size()
+                      << '\n');
 
     // Figure out the leaf functions. We want to do the merging in bottom-up
     // call order. This ensures that we don't parameterize on callee function
@@ -875,7 +876,7 @@ void SwiftMergeFunctions::mergeWithParams(const FunctionInfos &FInfos,
   FirstF->getParent()->getFunctionList().insert(
                         std::next(FInfos[1].F->getIterator()), NewFunction);
   
-  DEBUG(dbgs() << "  Merge into " << NewFunction->getName() << '\n');
+  LLVM_DEBUG(dbgs() << "  Merge into " << NewFunction->getName() << '\n');
 
   // Move the body of FirstF into the NewFunction.
   NewFunction->getBasicBlockList().splice(NewFunction->begin(),
@@ -917,7 +918,7 @@ void SwiftMergeFunctions::mergeWithParams(const FunctionInfos &FInfos,
       assert(!isInEquivalenceClass(&*Iter->second));
       Iter->second->F = nullptr;
       FuncEntries.erase(Iter);
-      DEBUG(dbgs() << "    Erase " << OrigFunc->getName() << '\n');
+      LLVM_DEBUG(dbgs() << "    Erase " << OrigFunc->getName() << '\n');
       OrigFunc->eraseFromParent();
     } else {
       // Otherwise we need a thunk which calls the merged function.
@@ -937,7 +938,8 @@ void SwiftMergeFunctions::removeEquivalenceClassFromTree(FunctionEntry *FE) {
   FunctionEntry *Unlink = Iter->First;
   Unlink->numUnhandledCallees = 0;
   while (Unlink) {
-    DEBUG(dbgs() << "    remove from tree: " << Unlink->F->getName() << '\n');
+    LLVM_DEBUG(dbgs() << "    remove from tree: " << Unlink->F->getName()
+                      << '\n');
     if (!Unlink->isMerged)
       Deferred.emplace_back(Unlink->F);
     Unlink->TreeIter = FnTree.end();
@@ -1016,7 +1018,7 @@ void SwiftMergeFunctions::writeThunk(Function *ToFunc, Function *Thunk,
     Builder.CreateRet(createCast(Builder, CI, Thunk->getReturnType()));
   }
 
-  DEBUG(dbgs() << "    writeThunk: " << Thunk->getName() << '\n');
+  LLVM_DEBUG(dbgs() << "    writeThunk: " << Thunk->getName() << '\n');
   ++NumSwiftThunksWritten;
 }
 
@@ -1098,4 +1100,3 @@ bool SwiftMergeFunctions::replaceDirectCallers(Function *Old, Function *New,
   assert(Old->use_empty() && "should have replaced all uses of old function");
   return Old->hasLocalLinkage();
 }
-

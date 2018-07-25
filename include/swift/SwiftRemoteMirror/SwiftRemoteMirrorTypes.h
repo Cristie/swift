@@ -35,12 +35,35 @@ typedef struct swift_reflection_section {
 /// \brief Represents the set of Swift reflection sections of an image.
 /// Not all sections may be present.
 typedef struct swift_reflection_info {
-  swift_reflection_section_t fieldmd;
-  swift_reflection_section_t assocty;
-  swift_reflection_section_t builtin;
-  swift_reflection_section_t capture;
-  swift_reflection_section_t typeref;
-  swift_reflection_section_t reflstr;
+  struct {
+    swift_reflection_section_t section;
+    uintptr_t offset;
+  } field;
+
+  struct {
+    swift_reflection_section_t section;
+    uintptr_t offset;
+  } associated_types;
+
+  struct {
+    swift_reflection_section_t section;
+    uintptr_t offset;
+  } builtin_types;
+
+  struct {
+    swift_reflection_section_t section;
+    uintptr_t offset;
+  } capture;
+
+  struct {
+    swift_reflection_section_t section;
+    uintptr_t offset;
+  } type_references;
+
+  struct {
+    swift_reflection_section_t section;
+    uintptr_t offset;
+  } reflection_strings;
 
   // Start address in local and remote address spaces.
   uintptr_t LocalStartAddress;
@@ -85,9 +108,9 @@ typedef enum swift_layout_kind {
 
   // References to other objects in the heap.
   SWIFT_STRONG_REFERENCE,
-  SWIFT_UNOWNED_REFERENCE,
-  SWIFT_WEAK_REFERENCE,
-  SWIFT_UNMANAGED_REFERENCE,
+#define REF_STORAGE(Name, name, NAME) \
+  SWIFT_##NAME##_REFERENCE,
+#include "swift/AST/ReferenceStorage.def"
 
   // Layouts of heap objects. These are only ever returned from
   // swift_reflection_infoFor{Instance,Metadata}(), and not

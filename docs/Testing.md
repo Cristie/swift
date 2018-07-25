@@ -33,6 +33,7 @@ The testsuite is split into four subsets:
 * Validation testsuite, located under ``swift/validation-test``.
 * Unit tests, located under ``swift/unittests``.
 * Long tests, which are marked with ``REQUIRES: long_test``.
+* Stress tests, which are marked with ``REQUIRES: stress_test``.
 
 ### Running the LLVM lit-based testsuite
 
@@ -83,6 +84,10 @@ out with ``lit.py -h``. We document some of the more useful ones below:
 
 * ``-s`` reduces the amount of output that lit shows.
 * ``-v`` causes a test's commandline and output to be printed if the test fails.
+* ``-vv`` causes a test's commandline and output to be printed if the test fails,
+         showing the exact command in the test execution script where progress
+         stopped; this can be useful for finding a single silently-failing RUN
+         line, amid a sequence.
 * ``-a`` causes a test's commandline and output to always be printed.
 * ``--filter=<pattern>`` causes only tests with paths matching the given regular
   expression to be run.
@@ -122,8 +127,9 @@ Besides ``check-swift``, other targets are also available. Here's the full list:
 
 * ``check-swift``: Runs tests from the ``${SWIFT_SOURCE_ROOT}/test`` directory.
 * ``check-swift-only_validation``: Runs tests from the ``${SWIFT_SOURCE_ROOT}/validation-test`` directory.
-* ``check-swift-validation``: Runs the primary and validation tests, without the long tests.
+* ``check-swift-validation``: Runs the primary and validation tests, without the long tests or stress tests.
 * ``check-swift-only_long``: Runs long tests only.
+* ``check-swift-only_stress``: Runs stress tests only.
 * ``check-swift-all``: Runs all tests (primary, validation, and long).
 * ``SwiftUnitTests``: Builds all unit tests.  Executables are located under
   ``${SWIFT_BUILD_DIR}/unittests`` and must be run individually.

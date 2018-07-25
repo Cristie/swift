@@ -92,12 +92,11 @@ func superclassConformance3<T>(t: T) where T : C, T : P4, T : C2 {}
 // expected-warning@-3{{redundant conformance constraint 'T': 'P4'}}
 // expected-note@-4{{conformance constraint 'T': 'P4' implied here}}
 
-protocol P5: A { } // expected-error{{non-class type 'P5' cannot inherit from class 'A'}}
+protocol P5: A { }
 
 protocol P6: A, Other { } // expected-error {{protocol 'P6' cannot be a subclass of both 'Other' and 'A'}}
-// expected-error@-1{{non-class type 'P6' cannot inherit from class 'A'}}
-// expected-error@-2{{non-class type 'P6' cannot inherit from class 'Other'}}
-// expected-note@-3{{superclass constraint 'Self' : 'A' written here}}
+// expected-error@-1{{multiple inheritance from classes 'A' and 'Other'}}
+// expected-note@-2 {{superclass constraint 'Self' : 'A' written here}}
 
 func takeA(_: A) { }
 func takeP5<T: P5>(_ t: T) {
@@ -164,3 +163,44 @@ protocol P10 {
 // CHECK: Generic signature: <T where T : P10, T.A : C10>
 // CHECK: Canonical generic signature: <τ_0_0 where τ_0_0 : P10, τ_0_0.A : C10>
 func testP10<T>(_: T) where T: P10, T.A: C10 { }
+
+// Nested types of generic class-constrained type parameters.
+protocol Tail {
+  associatedtype E
+}
+
+protocol Rump : Tail {
+  associatedtype E = Self
+}
+
+class Horse<T>: Rump { }
+
+func hasRedundantConformanceConstraint<X : Horse<T>, T>(_: X) where X : Rump {}
+// expected-warning@-1 {{redundant conformance constraint 'X': 'Rump'}}
+// expected-note@-2 {{conformance constraint 'X': 'Rump' implied here}}
+
+// SR-5862
+protocol X {
+	associatedtype Y : A
+}
+
+// CHECK-DAG: .noRedundancyWarning@
+// CHECK: Generic signature: <C where C : X, C.Y == B>
+func noRedundancyWarning<C : X>(_ wrapper: C) where C.Y == B {}
+
+// Qualified lookup bug -- <https://bugs.swift.org/browse/SR-2190>
+
+protocol Init {
+  init(x: ())
+}
+
+class Base {
+  required init(y: ()) {}
+}
+
+class Derived : Base {}
+
+func g<T : Init & Derived>(_: T.Type) {
+  _ = T(x: ())
+  _ = T(y: ())
+}

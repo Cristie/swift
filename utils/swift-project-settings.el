@@ -114,7 +114,7 @@
 ;; project settings yet.  For example, Swift files may come up in
 ;; Fundamental mode, and C++ files won't use the swift style, unless
 ;; we do something.  This hack causes the file to be re-mode-ed.
-(set-auto-mode)
+(unless (eq major-mode 'dired-mode) (set-auto-mode))
 
 (defun swift-project-comment-end ()
   "If comment-end is non-empty returns it, stripped of leading whitespace.  Returns nil otherwise"
@@ -369,7 +369,7 @@ libraries that require a single frontend invocation" )
 
 (defconst swift-project-stdlib-aux-swiftc-args
   (append swift-project-single-frontend-swiftc-args
-          (list "-Xfrontend" "-sil-serialize-all" "-parse-stdlib"))
+          (list "-sil-serialize-vtables" "-parse-stdlib"))
   "swiftc arguments for library components that are compiled as
   though they are part of the standard library even though
   they're not strictly in that binary."  )

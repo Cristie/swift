@@ -86,15 +86,15 @@ static void emitCompareBuiltin(IRGenFunction &IGF, Explosion &result,
 static void emitTypeTraitBuiltin(IRGenFunction &IGF,
                                  Explosion &out,
                                  Explosion &args,
-                                 SubstitutionList substitutions,
+                                 SubstitutionMap substitutions,
                                  TypeTraitResult (TypeBase::*trait)()) {
-  assert(substitutions.size() == 1
+  assert(substitutions.getReplacementTypes().size() == 1
          && "type trait should have gotten single type parameter");
   args.claimNext();
   
   // Lower away the trait to a tristate 0 = no, 1 = yes, 2 = maybe.
   unsigned result;
-  switch ((substitutions[0].getReplacement().getPointer()->*trait)()) {
+  switch ((substitutions.getReplacementTypes()[0].getPointer()->*trait)()) {
   case TypeTraitResult::IsNot:
     result = 0;
     break;
@@ -116,13 +116,10 @@ getLoweredTypeAndTypeInfo(IRGenModule &IGM, Type unloweredType) {
 }
 
 /// emitBuiltinCall - Emit a call to a builtin function.
-void irgen::emitBuiltinCall(IRGenFunction &IGF, Identifier FnId,
-                            SILType resultType,
+void irgen::emitBuiltinCall(IRGenFunction &IGF, const BuiltinInfo &Builtin,
+                            Identifier FnId, SILType resultType,
                             Explosion &args, Explosion &out,
-                            SubstitutionList substitutions) {
-  // Decompose the function's name into a builtin name and type list.
-  const BuiltinInfo &Builtin = IGF.getSILModule().getBuiltinInfo(FnId);
-
+                            SubstitutionMap substitutions) {
   if (Builtin.ID == BuiltinValueKind::UnsafeGuaranteedEnd) {
     // Just consume the incoming argument.
     assert(args.size() == 1 && "Expecting one incoming argument");
@@ -149,7 +146,7 @@ void irgen::emitBuiltinCall(IRGenFunction &IGF, Identifier FnId,
   if (Builtin.ID == BuiltinValueKind::Sizeof) {
     (void)args.claimAll();
     auto valueTy = getLoweredTypeAndTypeInfo(IGF.IGM,
-                                             substitutions[0].getReplacement());
+                                             substitutions.getReplacementTypes()[0]);
     out.add(valueTy.second.getSize(IGF, valueTy.first));
     return;
   }
@@ -157,7 +154,7 @@ void irgen::emitBuiltinCall(IRGenFunction &IGF, Identifier FnId,
   if (Builtin.ID == BuiltinValueKind::Strideof) {
     (void)args.claimAll();
     auto valueTy = getLoweredTypeAndTypeInfo(IGF.IGM,
-                                             substitutions[0].getReplacement());
+                                             substitutions.getReplacementTypes()[0]);
     out.add(valueTy.second.getStride(IGF, valueTy.first));
     return;
   }
@@ -165,7 +162,7 @@ void irgen::emitBuiltinCall(IRGenFunction &IGF, Identifier FnId,
   if (Builtin.ID == BuiltinValueKind::Alignof) {
     (void)args.claimAll();
     auto valueTy = getLoweredTypeAndTypeInfo(IGF.IGM,
-                                             substitutions[0].getReplacement());
+                                             substitutions.getReplacementTypes()[0]);
     // The alignof value is one greater than the alignment mask.
     out.add(IGF.Builder.CreateAdd(
                            valueTy.second.getAlignmentMask(IGF, valueTy.first),
@@ -176,7 +173,7 @@ void irgen::emitBuiltinCall(IRGenFunction &IGF, Identifier FnId,
   if (Builtin.ID == BuiltinValueKind::IsPOD) {
     (void)args.claimAll();
     auto valueTy = getLoweredTypeAndTypeInfo(IGF.IGM,
-                                             substitutions[0].getReplacement());
+                                             substitutions.getReplacementTypes()[0]);
     out.add(valueTy.second.getIsPOD(IGF, valueTy.first));
     return;
   }
@@ -197,36 +194,69 @@ void irgen::emitBuiltinCall(IRGenFunction &IGF, Identifier FnId,
   const IntrinsicInfo &IInfo = IGF.getSILModule().getIntrinsicInfo(FnId);
   llvm::Intrinsic::ID IID = IInfo.ID;
 
+  // Emit non-mergeable traps only.
+  if (IGF.Builder.isTrapIntrinsic(IID)) {
+    IGF.Builder.CreateNonMergeableTrap(IGF.IGM);
+    return;
+  }
+
   // Calls to the int_instrprof_increment intrinsic are emitted during SILGen.
   // At that stage, the function name GV used by the profiling pass is hidden.
   // Fix the intrinsic call here by pointing it to the correct GV.
   if (IID == llvm::Intrinsic::instrprof_increment) {
+    // If we import profiling intrinsics from a swift module but profiling is
+    // not enabled, ignore the increment.
+    SILModule &SILMod = IGF.getSILModule();
+    const auto &Opts = SILMod.getOptions();
+    if (!Opts.GenerateProfile) {
+      (void)args.claimAll();
+      return;
+    }
+
     // Extract the PGO function name.
     auto *NameGEP = cast<llvm::User>(args.claimNext());
     auto *NameGV = dyn_cast<llvm::GlobalVariable>(NameGEP->stripPointerCasts());
-    if (NameGV) {
-      auto *NameC = NameGV->getInitializer();
-      StringRef Name = cast<llvm::ConstantDataArray>(NameC)->getRawDataValues();
-      StringRef PGOFuncName = Name.rtrim(StringRef("\0", 1));
 
-      // Point the increment call to the right function name variable.
-      std::string PGOFuncNameVar = llvm::getPGOFuncNameVarName(
-          PGOFuncName, llvm::GlobalValue::LinkOnceAnyLinkage);
-      auto *FuncNamePtr = IGF.IGM.Module.getNamedGlobal(PGOFuncNameVar);
-
-      if (FuncNamePtr) {
-        llvm::SmallVector<llvm::Value *, 2> Indices(2, NameGEP->getOperand(1));
-        NameGEP = llvm::ConstantExpr::getGetElementPtr(
-            ((llvm::PointerType *)FuncNamePtr->getType())->getElementType(),
-            FuncNamePtr, makeArrayRef(Indices));
-      }
+    // TODO: The SIL optimizer may rewrite the name argument in a way that
+    // makes it impossible to lower. Until that issue is fixed, defensively
+    // refuse to lower ill-formed intrinsics (rdar://39146527).
+    if (!NameGV) {
+      (void)args.claimAll();
+      return;
     }
+
+    auto *NameC = NameGV->getInitializer();
+    StringRef Name = cast<llvm::ConstantDataArray>(NameC)->getRawDataValues();
+    StringRef PGOFuncName = Name.rtrim(StringRef("\0", 1));
+
+    // Point the increment call to the right function name variable.
+    std::string PGOFuncNameVar = llvm::getPGOFuncNameVarName(
+        PGOFuncName, llvm::GlobalValue::LinkOnceAnyLinkage);
+    auto *FuncNamePtr = IGF.IGM.Module.getNamedGlobal(PGOFuncNameVar);
+    if (!FuncNamePtr)
+      FuncNamePtr = llvm::createPGOFuncNameVar(
+          *IGF.IGM.getModule(), llvm::GlobalValue::LinkOnceAnyLinkage,
+          PGOFuncName);
+
+    llvm::SmallVector<llvm::Value *, 2> Indices(2, NameGEP->getOperand(1));
+    NameGEP = llvm::ConstantExpr::getGetElementPtr(
+        ((llvm::PointerType *)FuncNamePtr->getType())->getElementType(),
+        FuncNamePtr, makeArrayRef(Indices));
 
     // Replace the placeholder value with the new GEP.
     Explosion replacement;
     replacement.add(NameGEP);
     replacement.add(args.claimAll());
     args = std::move(replacement);
+
+    if (Opts.EmitProfileCoverageMapping) {
+      // Update the associated coverage mapping: it's now safe to emit, because
+      // a symtab entry for this function is guaranteed (r://39146527).
+      auto &coverageMaps = SILMod.getCoverageMaps();
+      auto CovMapIt = coverageMaps.find(PGOFuncName);
+      if (CovMapIt != coverageMaps.end())
+        CovMapIt->second->setSymtabEntryGuaranteed();
+    }
   }
 
   if (IID != llvm::Intrinsic::not_intrinsic) {
@@ -248,7 +278,14 @@ void irgen::emitBuiltinCall(IRGenFunction &IGF, Identifier FnId,
     return;
   }
 
-  // TODO: A linear series of ifs is suboptimal.
+  if (Builtin.ID == BuiltinValueKind::StringObjectOr) {
+    llvm::Value *lhs = args.claimNext();
+    llvm::Value *rhs = args.claimNext();
+    llvm::Value *v = IGF.Builder.CreateOr(lhs, rhs);
+    return out.add(v);
+  }
+
+    // TODO: A linear series of ifs is suboptimal.
 #define BUILTIN_SIL_OPERATION(id, name, overload) \
   if (Builtin.ID == BuiltinValueKind::id) \
     llvm_unreachable(name " builtin should be lowered away by SILGen!");
@@ -271,14 +308,14 @@ void irgen::emitBuiltinCall(IRGenFunction &IGF, Identifier FnId,
     return out.add(v); \
   }
 
-#define BUILTIN_RUNTIME_CALL(id, name, attrs) \
-  if (Builtin.ID == BuiltinValueKind::id) { \
-    llvm::CallInst *call = IGF.Builder.CreateCall(IGF.IGM.get##id##Fn(),  \
-                           args.claimNext()); \
-    call->setCallingConv(IGF.IGM.DefaultCC); \
-    call->setDoesNotThrow(); \
-    return out.add(call); \
- }
+#define BUILTIN_RUNTIME_CALL(id, name, attrs)                                  \
+  if (Builtin.ID == BuiltinValueKind::id) {                                    \
+    auto *fn = cast<llvm::Function>(IGF.IGM.get##id##Fn());                    \
+    llvm::CallInst *call = IGF.Builder.CreateCall(fn, args.claimNext());       \
+    call->setCallingConv(fn->getCallingConv());                                \
+    call->setAttributes(fn->getAttributes());                                  \
+    return out.add(call);                                                      \
+  }
 
 #define BUILTIN_BINARY_OPERATION_WITH_OVERFLOW(id, name, uncheckedID, attrs, overload) \
 if (Builtin.ID == BuiltinValueKind::id) { \
@@ -776,7 +813,7 @@ if (Builtin.ID == BuiltinValueKind::id) { \
     llvm::Value *count = args.claimNext();
     
     auto valueTy = getLoweredTypeAndTypeInfo(IGF.IGM,
-                                             substitutions[0].getReplacement());
+                                             substitutions.getReplacementTypes()[0]);
     
     ptr = IGF.Builder.CreateBitCast(ptr,
                               valueTy.second.getStorageType()->getPointerTo());
@@ -802,7 +839,7 @@ if (Builtin.ID == BuiltinValueKind::id) { \
     llvm::Value *count = args.claimNext();
     
     auto valueTy = getLoweredTypeAndTypeInfo(IGF.IGM,
-                                             substitutions[0].getReplacement());
+                                             substitutions.getReplacementTypes()[0]);
     
     dest = IGF.Builder.CreateBitCast(dest,
                                valueTy.second.getStorageType()->getPointerTo());
@@ -859,7 +896,7 @@ if (Builtin.ID == BuiltinValueKind::id) { \
   if (Builtin.ID == BuiltinValueKind::ZeroInitializer) {
     // Build a zero initializer of the result type.
     auto valueTy = getLoweredTypeAndTypeInfo(IGF.IGM,
-                                             substitutions[0].getReplacement());
+                                             substitutions.getReplacementTypes()[0]);
     auto schema = valueTy.second.getSchema();
     for (auto &elt : schema) {
       out.add(llvm::Constant::getNullValue(elt.getScalarType()));
@@ -869,7 +906,7 @@ if (Builtin.ID == BuiltinValueKind::id) { \
   
   if (Builtin.ID == BuiltinValueKind::GetObjCTypeEncoding) {
     (void)args.claimAll();
-    Type valueTy = substitutions[0].getReplacement();
+    Type valueTy = substitutions.getReplacementTypes()[0];
     // Get the type encoding for the associated clang type.
     auto clangTy = IGF.IGM.getClangType(valueTy->getCanonicalType());
     std::string encoding;

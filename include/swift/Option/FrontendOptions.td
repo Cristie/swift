@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2018 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -21,17 +21,18 @@ def triple : Separate<["-"], "triple">, Alias<target>;
 def color_diagnostics : Flag<["-"], "color-diagnostics">,
   HelpText<"Print diagnostics in color">;
 
-def delayed_function_body_parsing :
-  Flag<["-"], "delayed-function-body-parsing">,
-  HelpText<"Delay function body parsing until the end of all files">;
-
 def primary_file : Separate<["-"], "primary-file">,
   HelpText<"Produce output for this file, not the whole module">;
 
 def filelist : Separate<["-"], "filelist">,
   HelpText<"Specify source inputs in a file rather than on the command line">;
+def primary_filelist : Separate<["-"], "primary-filelist">,
+  HelpText<"Specify primary inputs in a file rather than on the command line">;
 def output_filelist : Separate<["-"], "output-filelist">,
   HelpText<"Specify outputs in a file rather than on the command line">;
+def supplementary_output_file_map : Separate<["-"], "supplementary-output-file-map">,
+  HelpText<"Specify supplementary outputs in a file rather than on the command line">;
+
 
 def emit_module_doc : Flag<["-"], "emit-module-doc">,
   HelpText<"Emit a module documentation file based on documentation "
@@ -62,6 +63,10 @@ def emit_fixits_path
   : Separate<["-"], "emit-fixits-path">, MetaVarName<"<path>">,
     HelpText<"Output compiler fixits as source edits to <path>">;
 
+def emit_interface_path
+  : Separate<["-"], "emit-interface-path">, MetaVarName<"<path>">,
+    HelpText<"Output textual interface file to <path>">;
+
 def tbd_install_name
   : Separate<["-"], "tbd-install_name">, MetaVarName<"<path>">,
     HelpText<"The install_name to use in an emitted TBD file">;
@@ -76,6 +81,12 @@ def verify_apply_fixes : Flag<["-"], "verify-apply-fixes">,
   HelpText<"Like -verify, but updates the original source file">;
 def verify_ignore_unknown: Flag<["-"], "verify-ignore-unknown">,
   HelpText<"Allow diagnostics for '<unknown>' location in verify mode">;
+def verify_generic_signatures : Separate<["-"], "verify-generic-signatures">,
+  MetaVarName<"<module-name>">,
+  HelpText<"Verify the generic signatures in the given module">;
+
+def verify_syntax_tree : Flag<["-"], "verify-syntax-tree">,
+  HelpText<"Verify that no unknown nodes exist in the libSyntax tree">;
 
 def show_diagnostics_after_fatal : Flag<["-"], "show-diagnostics-after-fatal">,
   HelpText<"Keep emitting subsequent diagnostics after a fatal error">;
@@ -150,11 +161,8 @@ def debug_constraints : Flag<["-"], "debug-constraints">,
 def debug_constraints_attempt : Separate<["-"], "debug-constraints-attempt">,
   HelpText<"Debug the constraint solver at a given attempt">;
 
-def propagate_constraints : Flag<["-"], "propagate-constraints">,
-  HelpText<"Enable constraint propagation in the type checker">;
-
-def iterative_type_checker : Flag<["-"], "iterative-type-checker">,
-  HelpText<"Enable the iterative type checker">;
+def disable_named_lazy_member_loading : Flag<["-"], "disable-named-lazy-member-loading">,
+  HelpText<"Disable per-name lazy member loading">;
 
 def debug_generic_signatures : Flag<["-"], "debug-generic-signatures">,
   HelpText<"Debug generic signatures">;
@@ -162,6 +170,11 @@ def debug_generic_signatures : Flag<["-"], "debug-generic-signatures">,
 def debug_forbid_typecheck_prefix : Separate<["-"], "debug-forbid-typecheck-prefix">,
   HelpText<"Triggers llvm fatal_error if typechecker tries to typecheck a decl "
            "with the provided prefix name">;
+
+def debug_cycles : Flag<["-"], "debug-cycles">,
+  HelpText<"Print out debug dumps when cycles are detected in evaluation">;
+def output_request_graphviz : Separate<["-"], "output-request-graphviz">,
+  HelpText<"Emit GraphViz output visualizing the request graph">;
 
 def debug_time_compilation : Flag<["-"], "debug-time-compilation">,
   HelpText<"Prints the time taken by each compilation phase">;
@@ -185,14 +198,8 @@ def debugger_support : Flag<["-"], "debugger-support">,
 def disable_arc_opts : Flag<["-"], "disable-arc-opts">,
   HelpText<"Don't run SIL ARC optimization passes.">;
 
-def enable_guaranteed_closure_contexts : Flag<["-"], "enable-guaranteed-closure-contexts">,
-  HelpText<"Use @guaranteed convention for closure context">;
-
 def disable_sil_partial_apply : Flag<["-"], "disable-sil-partial-apply">,
   HelpText<"Disable use of partial_apply in SIL generation">;
-
-def remove_runtime_asserts : Flag<["-"], "remove-runtime-asserts">,
-  HelpText<"Remove runtime asserts.">;
 
 def disable_access_control : Flag<["-"], "disable-access-control">,
   HelpText<"Don't respect access control restrictions">;
@@ -201,6 +208,8 @@ def enable_access_control : Flag<["-"], "enable-access-control">,
 
 def code_complete_inits_in_postfix_expr : Flag<["-"], "code-complete-inits-in-postfix-expr">,
   HelpText<"Include initializers when completing a postfix expression">;
+def code_complete_call_pattern_heuristics : Flag<["-"], "code-complete-call-pattern-heuristics">,
+  HelpText<"Use heuristics to guess whether we want call pattern completions">;
 
 def disable_autolink_framework : Separate<["-"],"disable-autolink-framework">,
   HelpText<"Disable autolinking against the provided framework">;
@@ -214,8 +223,8 @@ def disable_llvm_optzns : Flag<["-"], "disable-llvm-optzns">,
 def disable_sil_perf_optzns : Flag<["-"], "disable-sil-perf-optzns">,
   HelpText<"Don't run SIL performance optimization passes">;
 
-def disable_llvm_arc_opts : Flag<["-"], "disable-llvm-arc-opts">,
-  HelpText<"Don't run LLVM ARC optimization passes.">;
+def disable_swift_specific_llvm_optzns : Flag<["-"], "disable-swift-specific-llvm-optzns">,
+  HelpText<"Don't run Swift specific LLVM optimization passes.">;
 
 def disable_llvm_slp_vectorizer : Flag<["-"], "disable-llvm-slp-vectorizer">,
   HelpText<"Don't run LLVM SLP vectorizer">;
@@ -243,9 +252,6 @@ def stack_promotion_limit : Separate<["-"], "stack-promotion-limit">,
   HelpText<"Limit the size of stack promoted objects to the provided number "
            "of bytes.">;
 
-def disable_sil_linking : Flag<["-"], "disable-sil-linking">,
-  HelpText<"Don't link SIL functions">;
-
 def dump_clang_diagnostics : Flag<["-"], "dump-clang-diagnostics">,
   HelpText<"Dump Clang diagnostics to stderr">;
 
@@ -263,6 +269,9 @@ def pch_disable_validation : Flag<["-"], "pch-disable-validation">,
 
 def enable_sil_ownership : Flag<["-"], "enable-sil-ownership">,
   HelpText<"Enable the SIL Ownership Model">;
+
+def disable_guaranteed_normal_arguments : Flag<["-"], "disable-guaranteed-normal-arguments">,
+  HelpText<"If set to true, all normal parameters (except to inits/setters) will be passed at +1">;
 
 def disable_mandatory_semantic_arc_opts : Flag<["-"], "disable-mandatory-semantic-arc-opts">,
   HelpText<"Disable the mandatory semantic arc optimizer">;
@@ -321,6 +330,13 @@ def disable_nskeyedarchiver_diagnostics :
   Flag<["-"], "disable-nskeyedarchiver-diagnostics">,
   HelpText<"Allow classes with unstable mangled names to adopt NSCoding">;
 
+def enable_nonfrozen_enum_exhaustivity_diagnostics :
+  Flag<["-"], "enable-nonfrozen-enum-exhaustivity-diagnostics">,
+  HelpText<"Diagnose switches over non-frozen enums without catch-all cases">;
+def disable_nonfrozen_enum_exhaustivity_diagnostics :
+  Flag<["-"], "disable-nonfrozen-enum-exhaustivity-diagnostics">,
+  HelpText<"Allow switches over non-frozen enums without catch-all cases">;
+
 def warn_long_function_bodies : Separate<["-"], "warn-long-function-bodies">,
   MetaVarName<"<n>">,
   HelpText<"Warns when type-checking a function takes longer than <n> ms">;
@@ -335,6 +351,13 @@ def warn_long_expression_type_checking_EQ : Joined<["-"], "warn-long-expression-
 
 def solver_expression_time_threshold_EQ : Joined<["-"], "solver-expression-time-threshold=">;
 
+def solver_disable_shrink :
+  Flag<["-"], "solver-disable-shrink">,
+  HelpText<"Disable the shrink phase of expression type checking">;
+
+def switch_checking_invocation_threshold_EQ : Joined<["-"],
+    "switch-checking-invocation-threshold=">;
+
 def enable_source_import : Flag<["-"], "enable-source-import">,
   HelpText<"Enable importing of Swift source files">;
 
@@ -346,6 +369,10 @@ def import_module : Separate<["-"], "import-module">,
 
 def print_stats : Flag<["-"], "print-stats">,
   HelpText<"Print various statistics">;
+
+def debugger_testing_transform : Flag<["-"], "debugger-testing-transform">,
+  HelpText<"Instrument the code with calls to an intrinsic that record the expected values of "
+           "local variables so they can be compared against the results from the debugger.">;
 
 def playground : Flag<["-"], "playground">,
   HelpText<"Apply the playground semantics and transformation">;
@@ -366,20 +393,18 @@ def sil_inline_threshold : Separate<["-"], "sil-inline-threshold">,
   MetaVarName<"<50>">,
   HelpText<"Controls the aggressiveness of performance inlining">;
 
+def sil_inline_caller_benefit_reduction_factor : Separate<["-"], "sil-inline-caller-benefit-reduction-factor">,
+  MetaVarName<"<2>">,
+  HelpText<"Controls the aggressiveness of performance inlining in -Osize "
+          "mode by reducing the base benefits of a caller (lower value "
+          "permits more inlining!)">;
+
+def sil_unroll_threshold : Separate<["-"], "sil-unroll-threshold">,
+  MetaVarName<"<250>">,
+  HelpText<"Controls the aggressiveness of loop unrolling">;
+
 def sil_merge_partial_modules : Flag<["-"], "sil-merge-partial-modules">,
   HelpText<"Merge SIL from all partial swiftmodules into the final module">;
-
-def sil_link_all : Flag<["-"], "sil-link-all">,
-  HelpText<"Link all SIL functions">;
-
-def sil_serialize_all : Flag<["-"], "sil-serialize-all">,
-  HelpText<"Serialize all generated SIL">;
-
-def sil_serialize_witness_tables : Flag<["-"], "sil-serialize-witness-tables">,
-  HelpText<"Serialize eligible SIL witness tables">;
-
-def sil_serialize_vtables : Flag<["-"], "sil-serialize-vtables">,
-  HelpText<"Serialize eligible SIL vtables">;
 
 def sil_verify_all : Flag<["-"], "sil-verify-all">,
   HelpText<"Verify SIL after each transform">;
@@ -439,8 +464,10 @@ def enable_resilience : Flag<["-"], "enable-resilience">,
             "public declarations by default">;
 
 def enable_class_resilience : Flag<["-"], "enable-class-resilience">,
-   HelpText<"Compile the module to export resilient interfaces for all "
-            "public classes by default (doesn't work yet)">;
+   HelpText<"Enable resilient layout for classes containing resilient value types">;
+
+def enable_resilience_bypass : Flag<["-"], "enable-resilience-bypass">,
+   HelpText<"Completely bypass resilience when accessing types in resilient frameworks">;
 
 def group_info_path : Separate<["-"], "group-info-path">,
   HelpText<"The path to collect the group information of the compiled module">;
@@ -456,5 +483,17 @@ def validate_tbd_against_ir_EQ: Joined<["-"], "validate-tbd-against-ir=">,
 // This is used to guard preemptive testing for the fix-it.
 def fix_string_substring_conversion: Flag<["-"], "fix-string-substring-conversion">,
     HelpText<"Emit a fix-it to append '[]' to String expressions when converting to Substring.">;
+    
+def bypass_batch_mode_checks: Flag<["-"], "bypass-batch-mode-checks">,
+    HelpText<"Bypass checks for batch-mode errors.">;
+
+def enable_verify_exclusivity : Flag<["-"], "enable-verify-exclusivity">,
+  HelpText<"Enable verification of access markers used to enforce exclusivity.">;
+
+def disable_verify_exclusivity : Flag<["-"], "disable-verify-exclusivity">,
+  HelpText<"Diable verification of access markers used to enforce exclusivity.">;
+
+def enable_key_path_resilience : Flag<["-"], "enable-key-path-resilience">,
+  HelpText<"Enable key path resilience.">;
 
 } // end let Flags = [FrontendOption, NoDriverOption, HelpHidden]

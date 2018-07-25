@@ -49,7 +49,7 @@ Currently, a generic type cannot be nested within another generic type, e.g.
 
 ```Swift
 struct X<T> {
-  struct Y<U> { }  // currently ill-formed, but should be possible
+  struct Y<U> { }
 }
 ```
 
@@ -691,7 +691,7 @@ The generics system doesn't seem like a good candidate for a reduction in scope;
 
 ### Associated type inference
 
-*This feature has been rejected in [SE-0108](https://github.com/apple/swift-evolution/blob/master/proposals/0108-remove-assoctype-inference.md).*
+*[SE-0108](https://github.com/apple/swift-evolution/blob/master/proposals/0108-remove-assoctype-inference.md), a proposal to remove this feature, was rejected.*
 
 Associated type inference is the process by which we infer the type bindings for associated types from other requirements. For example:
 
@@ -757,9 +757,9 @@ if e1 == e2 { ... } // error: e1 and e2 don't necessarily have the same dynamic 
 One explicit way to allow such operations in a type-safe manner is to introduce an "open existential" operation of some sort, which extracts and gives a name to the dynamic type stored inside an existential. For example:
 
 ```Swift
-if let storedInE1 = e1 openas T {     // T is a the type of storedInE1, a copy of the value stored in e1
-  if let storedInE2 = e2 as? T {      // is e2 also a T?
-    if storedInE1 == storedInE2 { ... } // okay: storedInT1 and storedInE2 are both of type T, which we know is Equatable
+if let storedInE1 = e1 openas T { // T is the type of storedInE1, a copy of the value stored in e1
+  if let storedInE2 = e2 as? T {  // Does e2 have type T? If so, copy its value to storedInE2
+    if storedInE1 == storedInE2 { ... } // Okay: storedInT1 and storedInE2 are both of type T, which we know is Equatable
   }
 }
 ```

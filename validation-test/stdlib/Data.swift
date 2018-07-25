@@ -1,4 +1,4 @@
-// RUN: %target-run-simple-swift
+// RUN: %target-run-simple-swift-swift3
 // REQUIRES: executable_test
 // REQUIRES: objc_interop
 
@@ -38,7 +38,6 @@ DataTestSuite.test("associated types") {
     iteratorType: Data.Iterator.self,
     subSequenceType: Subject.self,
     indexType: Int.self,
-    indexDistanceType: Int.self,
     indicesType: CountableRange<Int>.self)
 }
 

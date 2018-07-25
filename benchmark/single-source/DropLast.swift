@@ -51,7 +51,7 @@ public let DropLast = [
   BenchmarkInfo(
     name: "DropLastArray",
     runFunction: run_DropLastArray,
-    tags: [.validation, .api, .Array]),
+    tags: [.validation, .api, .Array, .unstable]),
   BenchmarkInfo(
     name: "DropLastCountableRangeLazy",
     runFunction: run_DropLastCountableRangeLazy,
@@ -79,7 +79,7 @@ public let DropLast = [
   BenchmarkInfo(
     name: "DropLastArrayLazy",
     runFunction: run_DropLastArrayLazy,
-    tags: [.validation, .api]),
+    tags: [.validation, .api, .Array, .unstable]),
 ]
 
 @inline(never)
@@ -236,3 +236,7 @@ public func run_DropLastArrayLazy(_ N: Int) {
     CheckResults(result == sumCount)
   }
 }
+
+// Local Variables:
+// eval: (read-only-mode 1)
+// End:

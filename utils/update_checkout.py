@@ -77,7 +77,7 @@ def get_branch_for_repo(config, repo_name, scheme_name, scheme_map,
                           echo=True, allow_non_zero_exit=True)
             shell.run(["git", "fetch", "origin",
                        "pull/{0}/merge:{1}"
-                       .format(pr_id, repo_branch)], echo=True)
+                       .format(pr_id, repo_branch), "--tags"], echo=True)
     return repo_branch, cross_repo
 
 
@@ -102,9 +102,6 @@ def update_single_repository(args):
                     checkout_target = find_rev_by_timestamp(timestamp,
                                                             repo_name,
                                                             checkout_target)
-            elif timestamp:
-                checkout_target = find_rev_by_timestamp(timestamp, repo_name,
-                                                        "HEAD")
 
             # The clean option restores a repository to pristine condition.
             if should_clean:
@@ -128,7 +125,8 @@ def update_single_repository(args):
             # It's important that we checkout, fetch, and rebase, in order.
             # .git/FETCH_HEAD updates the not-for-merge attributes based on
             # which branch was checked out during the fetch.
-            shell.run(["git", "fetch", "--recurse-submodules=yes"], echo=True)
+            shell.run(["git", "fetch", "--recurse-submodules=yes", "--tags"],
+                      echo=True)
 
             # If we were asked to reset to the specified branch, do the hard
             # reset and return.
@@ -224,8 +222,9 @@ def obtain_additional_swift_sources(pool_args):
         print("Cloning '" + repo_name + "'")
 
         if skip_history:
-            shell.run(['git', 'clone', '--recursive', '--depth', '1',
-                       remote, repo_name], echo=True)
+            shell.run(['git', 'clone', '--recursive', '--depth', '1', 
+                       '--branch', repo_branch, remote, repo_name],
+                      echo=True)
         else:
             shell.run(['git', 'clone', '--recursive', remote,
                        repo_name], echo=True)
@@ -269,14 +268,21 @@ def obtain_all_additional_swift_sources(args, config, with_ssh, scheme_name,
                     remote = config['https-clone-pattern'] % remote_repo_id
 
             repo_branch = None
+            repo_not_in_scheme = False
             if scheme_name:
                 for v in config['branch-schemes'].values():
                     if scheme_name not in v['aliases']:
+                        continue
+                    # If repo is not specified in the scheme, skip cloning it.
+                    if repo_name not in v['repos']:
+                        repo_not_in_scheme = True
                         continue
                     repo_branch = v['repos'][repo_name]
                     break
                 else:
                     repo_branch = scheme_name
+            if repo_not_in_scheme:
+                continue
 
             pool_args.append([args, repo_name, repo_info, repo_branch, remote,
                               with_ssh, scheme_name, skip_history,
@@ -291,19 +297,28 @@ def obtain_all_additional_swift_sources(args, config, with_ssh, scheme_name,
 
 
 def dump_repo_hashes(config):
-    max_len = reduce(lambda acc, x: max(acc, len(x)),
-                     config['repos'].keys(), 0)
-    fmt = "{:<%r}{}" % (max_len + 5)
+    """
+    Dumps the current state of the repo into a new config file that contains a
+    master branch scheme with the relevant branches set to the appropriate
+    hashes.
+    """
+    branch_scheme_name = 'repro'
+    new_config = {}
+    config_copy_keys = ['ssh-clone-pattern', 'https-clone-pattern', 'repos']
+    for config_copy_key in config_copy_keys:
+        new_config[config_copy_key] = config[config_copy_key]
+    repos = {}
+    branch_scheme = {'aliases': [branch_scheme_name], 'repos': repos}
+    new_config['branch-schemes'] = {branch_scheme_name: branch_scheme}
     for repo_name, repo_info in sorted(config['repos'].items(),
                                        key=lambda x: x[0]):
-        repo_path = os.path.join(SWIFT_SOURCE_ROOT, repo_name)
-        if os.path.isdir(repo_path):
-            with shell.pushd(repo_path, dry_run=False, echo=False):
-                h = shell.capture(["git", "log", "--oneline", "-n", "1"],
-                                  echo=False).strip()
-                print(fmt.format(repo_name, h))
-        else:
-            print(fmt.format(repo_name, "(not checked out)"))
+        with shell.pushd(os.path.join(SWIFT_SOURCE_ROOT, repo_name),
+                         dry_run=False,
+                         echo=False):
+            h = shell.capture(["git", "rev-parse", "HEAD"],
+                              echo=False).strip()
+            repos[repo_name] = str(h)
+    json.dump(new_config, sys.stdout, indent=4)
 
 
 def dump_hashes_config(args, config):
@@ -323,7 +338,7 @@ def dump_hashes_config(args, config):
             h = shell.capture(["git", "rev-parse", "HEAD"],
                               echo=False).strip()
             repos[repo_name] = str(h)
-    print(json.dumps(new_config, indent=4))
+    json.dump(new_config, sys.stdout, indent=4)
 
 
 def validate_config(config):
@@ -433,10 +448,17 @@ By default, updates your checkouts of Swift, SourceKit, LLDB, and SwiftPM.""")
         dest="n_processes")
     args = parser.parse_args()
 
-    if args.reset_to_remote and not args.scheme:
-        print("update-checkout usage error: --reset-to-remote must specify "
-              "--scheme=foo")
-        sys.exit(1)
+    if not args.scheme:
+        if args.reset_to_remote:
+            print("update-checkout usage error: --reset-to-remote must "
+                  "specify --scheme=foo")
+            sys.exit(1)
+        if args.match_timestamp:
+            # without a scheme, we won't be able match timestamps forward in
+            # time, which is an annoying footgun for bisection etc.
+            print("update-checkout usage error: --match-timestamp must "
+                  "specify --scheme=foo")
+            sys.exit(1)
 
     clone = args.clone
     clone_with_ssh = args.clone_with_ssh
@@ -477,6 +499,14 @@ By default, updates your checkouts of Swift, SourceKit, LLDB, and SwiftPM.""")
                                                             scheme,
                                                             skip_history,
                                                             skip_repo_list)
+
+    # Quick check whether somebody is calling update in an empty directory
+    directory_contents = os.listdir(SWIFT_SOURCE_ROOT)
+    if not ('cmark' in directory_contents or 
+            'llvm' in directory_contents or
+            'clang' in directory_contents):
+        print("You don't have all swift sources. "
+              "Call this script with --clone to get them.")
 
     update_results = update_all_repositories(args, config, scheme,
                                              cross_repos_pr)

@@ -49,9 +49,7 @@
 ///     space (`" "`).
 ///   - terminator: The string to print after all items have been printed. The
 ///     default is a newline (`"\n"`).
-@_inlineable // FIXME(sil-serialize-all)
 @inline(never)
-@_semantics("stdlib_binary_only")
 public func print(
   _ items: Any...,
   separator: String = " ",
@@ -84,7 +82,7 @@ public func print(
 ///     // Prints "One two three four five"
 ///
 ///     debugPrint(1...5)
-///     // Prints "CountableClosedRange(1...5)"
+///     // Prints "ClosedRange(1...5)"
 ///
 ///     debugPrint(1.0, 2.0, 3.0, 4.0, 5.0)
 ///     // Prints "1.0 2.0 3.0 4.0 5.0"
@@ -110,9 +108,7 @@ public func print(
 ///     space (`" "`).
 ///   - terminator: The string to print after all items have been printed. The
 ///     default is a newline (`"\n"`).
-@_inlineable // FIXME(sil-serialize-all)
 @inline(never)
-@_semantics("stdlib_binary_only")
 public func debugPrint(
   _ items: Any...,
   separator: String = " ",
@@ -167,7 +163,7 @@ public func debugPrint(
 ///     default is a newline (`"\n"`).
 ///   - output: An output stream to receive the text representation of each
 ///     item.
-@_inlineable // FIXME(sil-serialize-all)
+@inlinable // FIXME(sil-serialize-all)
 @inline(__always)
 public func print<Target : TextOutputStream>(
   _ items: Any...,
@@ -189,7 +185,7 @@ public func print<Target : TextOutputStream>(
 ///
 ///     var range = "My range: "
 ///     debugPrint(1...5, to: &range)
-///     // range == "My range: CountableClosedRange(1...5)\n"
+///     // range == "My range: ClosedRange(1...5)\n"
 ///
 /// To print the items separated by something other than a space, pass a string
 /// as `separator`.
@@ -216,7 +212,7 @@ public func print<Target : TextOutputStream>(
 ///     default is a newline (`"\n"`).
 ///   - output: An output stream to receive the text representation of each
 ///     item.
-@_inlineable // FIXME(sil-serialize-all)
+@inlinable // FIXME(sil-serialize-all)
 @inline(__always)
 public func debugPrint<Target : TextOutputStream>(
   _ items: Any...,
@@ -228,10 +224,8 @@ public func debugPrint<Target : TextOutputStream>(
     items, separator: separator, terminator: terminator, to: &output)
 }
 
-@_inlineable // FIXME(sil-serialize-all)
-@_versioned
+@usableFromInline
 @inline(never)
-@_semantics("stdlib_binary_only")
 internal func _print<Target : TextOutputStream>(
   _ items: [Any],
   separator: String = " ",
@@ -249,10 +243,8 @@ internal func _print<Target : TextOutputStream>(
   output.write(terminator)
 }
 
-@_inlineable // FIXME(sil-serialize-all)
-@_versioned
+@usableFromInline
 @inline(never)
-@_semantics("stdlib_binary_only")
 internal func _debugPrint<Target : TextOutputStream>(
   _ items: [Any],
   separator: String = " ",

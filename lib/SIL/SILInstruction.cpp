@@ -172,21 +172,34 @@ void SILInstruction::dropAllReferences() {
   }
 }
 
-ArrayRef<ValueBase> SILInstruction::getResultsImpl() const {
-  switch (getKind()) {
-#define NON_VALUE_INST(ID, NAME, PARENT, MEMBEHAVIOR, MAYRELEASE) \
-  case SILInstructionKind::ID:
-#include "swift/SIL/SILNodes.def"
-    return {};
+namespace {
 
-#define SINGLE_VALUE_INST(ID, NAME, PARENT, MEMBEHAVIOR, MAYRELEASE) \
-  case SILInstructionKind::ID:
-#include "swift/SIL/SILNodes.def"
-    return static_cast<const SingleValueInstruction *>(this)->getResultsImpl();
-
-  // add any multi-result instructions here...
+class AllResultsAccessor
+    : public SILInstructionVisitor<AllResultsAccessor,
+                                   SILInstructionResultArray> {
+public:
+// Make sure we hit a linker error if we ever miss an instruction.
+#define INST(ID, NAME) SILInstructionResultArray visit##ID(ID *I);
+#define NON_VALUE_INST(ID, NAME, PARENT, MEMBEHAVIOR, MAYRELEASE)              \
+  SILInstructionResultArray visit##ID(ID *I) {                                 \
+    return SILInstructionResultArray();                                        \
   }
-  llvm_unreachable("bad kind");
+#define SINGLE_VALUE_INST(ID, TEXTUALNAME, PARENT, MEMBEHAVIOR, MAYRELEASE)    \
+  SILInstructionResultArray visit##ID(ID *I) {                                 \
+    return SILInstructionResultArray(                                          \
+        static_cast<SingleValueInstruction *>(I));                             \
+  }
+#define MULTIPLE_VALUE_INST(ID, TEXTUALNAME, PARENT, MEMBEHAVIOR, MAYRELEASE)  \
+  SILInstructionResultArray visit##ID(ID *I) {                                 \
+    return SILInstructionResultArray(I->getAllResults());                      \
+  }
+#include "swift/SIL/SILNodes.def"
+};
+
+} // end anonymous namespace
+
+SILInstructionResultArray SILInstruction::getResultsImpl() const {
+  return AllResultsAccessor().visit(const_cast<SILInstruction *>(this));
 }
 
 // Initialize the static members of SILInstruction.
@@ -239,6 +252,27 @@ void SILInstruction::replaceAllUsesPairwiseWith(SILInstruction *other) {
   assert(results.size() == otherResults.size());
   for (auto i : indices(results)) {
     results[i]->replaceAllUsesWith(otherResults[i]);
+  }
+}
+
+void SILInstruction::replaceAllUsesPairwiseWith(
+    const llvm::SmallVectorImpl<SILValue> &NewValues) {
+  auto Results = getResults();
+
+  // If we don't have any results, fast-path out without asking the other
+  // instruction for its results.
+  if (Results.empty()) {
+    assert(NewValues.empty());
+    return;
+  }
+
+  // Replace values with the corresponding values of the list. Make sure they
+  // are all the same type.
+  assert(Results.size() == NewValues.size());
+  for (unsigned i : indices(Results)) {
+    assert(Results[i]->getType() == NewValues[i]->getType() &&
+           "Can only replace results with new values of the same type");
+    Results[i]->replaceAllUsesWith(NewValues[i]);
   }
 }
 
@@ -353,7 +387,9 @@ namespace {
     bool visitBeginAccessInst(const BeginAccessInst *right) {
       auto left = cast<BeginAccessInst>(LHS);
       return left->getAccessKind() == right->getAccessKind()
-          && left->getEnforcement() == right->getEnforcement();
+          && left->getEnforcement() == right->getEnforcement()
+          && left->hasNoNestedConflict() == right->hasNoNestedConflict()
+          && left->isFromBuiltin() == right->isFromBuiltin();
     }
 
     bool visitEndAccessInst(const EndAccessInst *right) {
@@ -364,13 +400,16 @@ namespace {
     bool visitBeginUnpairedAccessInst(const BeginUnpairedAccessInst *right) {
       auto left = cast<BeginUnpairedAccessInst>(LHS);
       return left->getAccessKind() == right->getAccessKind()
-          && left->getEnforcement() == right->getEnforcement();
+          && left->getEnforcement() == right->getEnforcement()
+          && left->hasNoNestedConflict() == right->hasNoNestedConflict()
+          && left->isFromBuiltin() == right->isFromBuiltin();
     }
 
     bool visitEndUnpairedAccessInst(const EndUnpairedAccessInst *right) {
       auto left = cast<EndUnpairedAccessInst>(LHS);
       return left->getEnforcement() == right->getEnforcement()
-          && left->isAborting() == right->isAborting();
+             && left->isAborting() == right->isAborting()
+             && left->isFromBuiltin() == right->isFromBuiltin();
     }
 
     bool visitStrongReleaseInst(const StrongReleaseInst *RHS) {
@@ -378,10 +417,6 @@ namespace {
     }
 
     bool visitStrongRetainInst(const StrongRetainInst *RHS) {
-      return true;
-    }
-
-    bool visitStrongRetainUnownedInst(const StrongRetainUnownedInst *RHS) {
       return true;
     }
 
@@ -570,7 +605,7 @@ namespace {
 
     bool visitApplyInst(ApplyInst *RHS) {
       auto *X = cast<ApplyInst>(LHS);
-      return X->getSubstitutions() == RHS->getSubstitutions();
+      return X->getSubstitutionMap() == RHS->getSubstitutionMap();
     }
 
     bool visitBuiltinInst(BuiltinInst *RHS) {
@@ -676,21 +711,18 @@ namespace {
       return true;
     }
 
-    bool visitRefToUnownedInst(RefToUnownedInst *RHS) {
-      return true;
+#define LOADABLE_REF_STORAGE_HELPER(Name) \
+    bool visit##Name##ToRefInst(Name##ToRefInst *RHS) { return true; } \
+    bool visitRefTo##Name##Inst(RefTo##Name##Inst *RHS) { return true; }
+#define ALWAYS_OR_SOMETIMES_LOADABLE_CHECKED_REF_STORAGE(Name, ...) \
+    LOADABLE_REF_STORAGE_HELPER(Name) \
+    bool visitStrongRetain##Name##Inst(const StrongRetain##Name##Inst *RHS) { \
+      return true; \
     }
-
-    bool visitUnownedToRefInst(UnownedToRefInst *RHS) {
-      return true;
-    }
-
-    bool visitRefToUnmanagedInst(RefToUnmanagedInst *RHS) {
-      return true;
-    }
-
-    bool visitUnmanagedToRefInst(UnmanagedToRefInst *RHS) {
-      return true;
-    }
+#define UNCHECKED_REF_STORAGE(Name, ...) \
+    LOADABLE_REF_STORAGE_HELPER(Name)
+#include "swift/AST/ReferenceStorage.def"
+#undef LOADABLE_REF_STORAGE_HELPER
 
     bool visitThinToThickFunctionInst(ThinToThickFunctionInst *RHS) {
       return true;
@@ -708,6 +740,10 @@ namespace {
       return true;
     }
 
+    bool visitConvertEscapeToNoEscapeInst(ConvertEscapeToNoEscapeInst *RHS) {
+      return true;
+    }
+
     bool visitObjCMetatypeToObjectInst(ObjCMetatypeToObjectInst *RHS) {
       return true;
     }
@@ -720,11 +756,11 @@ namespace {
       return true;
     }
 
-    bool visitIsNonnullInst(IsNonnullInst *RHS) {
+    bool visitBridgeObjectToRefInst(BridgeObjectToRefInst *X) {
       return true;
     }
-      
-    bool visitBridgeObjectToRefInst(BridgeObjectToRefInst *X) {
+
+    bool visitValueToBridgeObjectInst(ValueToBridgeObjectInst *i) {
       return true;
     }
 
@@ -733,6 +769,9 @@ namespace {
     }
       
     bool visitRefToBridgeObjectInst(RefToBridgeObjectInst *X) {
+      return true;
+    }
+    bool visitClassifyBridgeObjectInst(ClassifyBridgeObjectInst *X) {
       return true;
     }
     bool visitThinFunctionToPointerInst(ThinFunctionToPointerInst *X) {
@@ -777,8 +816,6 @@ namespace {
 
     bool visitWitnessMethodInst(const WitnessMethodInst *RHS) {
       auto *X = cast<WitnessMethodInst>(LHS);
-      if (X->isVolatile() != RHS->isVolatile())
-        return false;
       if (X->getMember() != RHS->getMember())
         return false;
       if (X->getLookupType() != RHS->getLookupType())
@@ -898,7 +935,7 @@ SILInstruction::MemoryBehavior SILInstruction::getMemoryBehavior() const {
                                 : MemoryBehavior::MayHaveSideEffects;
 
     // Handle LLVM intrinsic functions.
-    const IntrinsicInfo & IInfo = BI->getIntrinsicInfo();
+    const IntrinsicInfo &IInfo = BI->getIntrinsicInfo();
     if (IInfo.ID != llvm::Intrinsic::not_intrinsic) {
       // Read-only.
       if (IInfo.hasAttribute(llvm::Attribute::ReadOnly) &&
@@ -964,9 +1001,15 @@ bool SILInstruction::mayRelease() const {
 
   case SILInstructionKind::ApplyInst:
   case SILInstructionKind::TryApplyInst:
+  case SILInstructionKind::BeginApplyInst:
+  case SILInstructionKind::AbortApplyInst:
+  case SILInstructionKind::EndApplyInst:
+  case SILInstructionKind::YieldInst:
   case SILInstructionKind::DestroyAddrInst:
   case SILInstructionKind::StrongReleaseInst:
-  case SILInstructionKind::UnownedReleaseInst:
+#define ALWAYS_OR_SOMETIMES_LOADABLE_CHECKED_REF_STORAGE(Name, ...) \
+  case SILInstructionKind::Name##ReleaseInst:
+#include "swift/AST/ReferenceStorage.def"
   case SILInstructionKind::ReleaseValueInst:
   case SILInstructionKind::ReleaseValueAddrInst:
     return true;
@@ -1025,6 +1068,7 @@ bool SILInstruction::mayRelease() const {
 bool SILInstruction::mayReleaseOrReadRefCount() const {
   switch (getKind()) {
   case SILInstructionKind::IsUniqueInst:
+  case SILInstructionKind::IsEscapingClosureInst:
   case SILInstructionKind::IsUniqueOrPinnedInst:
     return true;
   default:
@@ -1099,9 +1143,6 @@ SILInstruction *SILInstruction::clone(SILInstruction *InsertPt) {
 /// additional handling. It is important to know this information when
 /// you perform such optimizations like e.g. jump-threading.
 bool SILInstruction::isTriviallyDuplicatable() const {
-  if (isa<ThrowInst>(this))
-    return false;
-
   if (isa<AllocStackInst>(this) || isa<DeallocStackInst>(this)) {
     return false;
   }
@@ -1109,7 +1150,6 @@ bool SILInstruction::isTriviallyDuplicatable() const {
     if (ARI->canAllocOnStack())
       return false;
   }
-
   if (isa<OpenExistentialAddrInst>(this) || isa<OpenExistentialRefInst>(this) ||
       isa<OpenExistentialMetatypeInst>(this) ||
       isa<OpenExistentialValueInst>(this) || isa<OpenExistentialBoxInst>(this) ||
@@ -1126,6 +1166,13 @@ bool SILInstruction::isTriviallyDuplicatable() const {
     if (MI->getMember().isForeign)
       return false;
   }
+  if (isa<ThrowInst>(this))
+    return false;
+
+  // BeginAccess defines the access scope entry point. All associated EndAccess
+  // instructions must directly operate on the BeginAccess.
+  if (isa<BeginAccessInst>(this))
+    return false;
 
   return true;
 }
@@ -1139,6 +1186,20 @@ bool SILInstruction::mayTrap() const {
   default:
     return false;
   }
+}
+
+bool SILInstruction::isMetaInstruction() const {
+  // Every instruction that implements getVarInfo() should be in this list.
+  switch (getKind()) {
+  case SILInstructionKind::AllocBoxInst:
+  case SILInstructionKind::AllocStackInst:
+  case SILInstructionKind::DebugValueInst:
+  case SILInstructionKind::DebugValueAddrInst:
+    return true;
+  default:
+    return false;
+  }
+  llvm_unreachable("Instruction not handled in isMetaInstruction()!");
 }
 
 //===----------------------------------------------------------------------===//
@@ -1174,3 +1235,255 @@ llvm::raw_ostream &swift::operator<<(llvm::raw_ostream &OS,
 
   llvm_unreachable("Unhandled ReleasingBehavior in switch.");
 }
+
+//===----------------------------------------------------------------------===//
+//                         SILInstructionResultArray
+//===----------------------------------------------------------------------===//
+
+SILInstructionResultArray::SILInstructionResultArray(
+    const SingleValueInstruction *SVI)
+    : Pointer(), Size(1) {
+  // Make sure that even though we are munging things, we are able to get back
+  // the original value, types, and operands.
+  SILValue originalValue(SVI);
+  SILType originalType = SVI->getType();
+  (void)originalValue;
+  (void)originalType;
+
+  // *PLEASE READ BEFORE CHANGING*
+  //
+  // Since SingleValueInstruction is both a ValueBase and a SILInstruction, but
+  // SILInstruction is the first parent, we need to ensure that our ValueBase *
+  // pointer is properly offset. by first static casting to ValueBase and then
+  // going back to a uint8_t *.
+  auto *Value = static_cast<const ValueBase *>(SVI);
+  assert(uintptr_t(Value) != uintptr_t(SVI) &&
+         "Expected value to be offset from SVI since it is not the first "
+         "multi-inheritence parent");
+  Pointer = reinterpret_cast<const uint8_t *>(Value);
+
+#ifndef NDEBUG
+  assert(originalValue == (*this)[0] &&
+         "Wrong value returned for single result");
+  assert(originalType == (*this)[0]->getType());
+
+  auto ValueRange = getValues();
+  assert(1 == std::distance(ValueRange.begin(), ValueRange.end()));
+  assert(originalValue == *ValueRange.begin());
+
+  auto TypedRange = getTypes();
+  assert(1 == std::distance(TypedRange.begin(), TypedRange.end()));
+  assert(originalType == *TypedRange.begin());
+
+  SILInstructionResultArray Copy = *this;
+  assert(Copy.hasSameTypes(*this));
+  assert(Copy == *this);
+#endif
+}
+
+SILInstructionResultArray::SILInstructionResultArray(
+    ArrayRef<MultipleValueInstructionResult> MVResults)
+    : Pointer(nullptr), Size(MVResults.size()) {
+  // We are assuming here that MultipleValueInstructionResult when static_cast
+  // is not offset.
+  if (Size)
+    Pointer = reinterpret_cast<const uint8_t *>(&MVResults[0]);
+
+#ifndef NDEBUG
+  // Verify our invariants.
+  assert(size() == MVResults.size());
+  auto ValueRange = getValues();
+  auto VRangeBegin = ValueRange.begin();
+  auto VRangeIter = VRangeBegin;
+  auto VRangeEnd = ValueRange.end();
+  assert(MVResults.size() == unsigned(std::distance(VRangeBegin, VRangeEnd)));
+
+  auto TypedRange = getTypes();
+  auto TRangeBegin = TypedRange.begin();
+  auto TRangeIter = TRangeBegin;
+  auto TRangeEnd = TypedRange.end();
+  assert(MVResults.size() == unsigned(std::distance(TRangeBegin, TRangeEnd)));
+  for (unsigned i : indices(MVResults)) {
+    assert(SILValue(&MVResults[i]) == (*this)[i]);
+    assert(SILValue(&MVResults[i])->getType() == (*this)[i]->getType());
+    assert(SILValue(&MVResults[i]) == (*VRangeIter));
+    assert(SILValue(&MVResults[i])->getType() == (*VRangeIter)->getType());
+    assert(SILValue(&MVResults[i])->getType() == *TRangeIter);
+    ++VRangeIter;
+    ++TRangeIter;
+  }
+
+  SILInstructionResultArray Copy = *this;
+  assert(Copy.hasSameTypes(*this));
+  assert(Copy == *this);
+#endif
+}
+
+SILValue SILInstructionResultArray::operator[](size_t Index) const {
+  assert(Index < Size && "Index out of bounds");
+  // *NOTE* In the case where we have a single instruction, Index will always
+  // necessarily be 0 implying that it is safe for us to just multiple Index by
+  // sizeof(MultipleValueInstructionResult).
+  size_t Offset = sizeof(MultipleValueInstructionResult) * Index;
+  return SILValue(reinterpret_cast<const ValueBase *>(&Pointer[Offset]));
+}
+
+bool SILInstructionResultArray::hasSameTypes(
+    const SILInstructionResultArray &rhs) {
+  auto &lhs = *this;
+  if (lhs.size() != rhs.size())
+    return false;
+  for (unsigned i : indices(lhs)) {
+    if (lhs[i]->getType() != rhs[i]->getType())
+      return false;
+  }
+  return true;
+}
+
+bool SILInstructionResultArray::
+operator==(const SILInstructionResultArray &other) {
+  if (size() != other.size())
+    return false;
+  for (auto i : indices(*this))
+    if ((*this)[i] != other[i])
+      return false;
+  return true;
+}
+
+SILInstructionResultArray::type_range
+SILInstructionResultArray::getTypes() const {
+  SILType (*F)(SILValue) = [](SILValue V) -> SILType {
+    return V->getType();
+  };
+  return {llvm::map_iterator(begin(), F), llvm::map_iterator(end(), F)};
+}
+
+SILInstructionResultArray::iterator SILInstructionResultArray::begin() const {
+  return iterator(*this, 0);
+}
+
+SILInstructionResultArray::iterator SILInstructionResultArray::end() const {
+  return iterator(*this, size());
+}
+
+SILInstructionResultArray::reverse_iterator
+SILInstructionResultArray::rbegin() const {
+  return llvm::make_reverse_iterator(end());
+}
+
+SILInstructionResultArray::reverse_iterator
+SILInstructionResultArray::rend() const {
+  return llvm::make_reverse_iterator(begin());
+}
+
+SILInstructionResultArray::range SILInstructionResultArray::getValues() const {
+  return {begin(), end()};
+}
+
+SILInstructionResultArray::reverse_range
+SILInstructionResultArray::getReversedValues() const {
+  return {rbegin(), rend()};
+}
+
+const ValueBase *SILInstructionResultArray::front() const {
+  assert(size() && "Can not access front of an empty result array");
+  return *begin();
+}
+
+const ValueBase *SILInstructionResultArray::back() const {
+  assert(size() && "Can not access back of an empty result array");
+  if (std::next(begin()) == end()) {
+    return *begin();
+  }
+  return *std::prev(end());
+}
+
+//===----------------------------------------------------------------------===//
+//                         Multiple Value Instruction
+//===----------------------------------------------------------------------===//
+
+Optional<unsigned>
+MultipleValueInstruction::getIndexOfResult(SILValue Target) const {
+  // First make sure we actually have one of our instruction results.
+  auto *MVIR = dyn_cast<MultipleValueInstructionResult>(Target);
+  if (!MVIR || MVIR->getParent() != this)
+    return None;
+  return MVIR->getIndex();
+}
+
+MultipleValueInstructionResult::MultipleValueInstructionResult(
+    ValueKind valueKind, unsigned index, SILType type,
+    ValueOwnershipKind ownershipKind)
+    : ValueBase(valueKind, type, IsRepresentative::No) {
+  setOwnershipKind(ownershipKind);
+  setIndex(index);
+}
+
+void MultipleValueInstructionResult::setOwnershipKind(
+    ValueOwnershipKind NewKind) {
+  Bits.MultipleValueInstructionResult.VOKind = unsigned(NewKind);
+}
+
+void MultipleValueInstructionResult::setIndex(unsigned NewIndex) {
+  // We currently use 32 bits to store the Index. A previous comment wrote
+  // that "500k fields is probably enough".
+  Bits.MultipleValueInstructionResult.Index = NewIndex;
+}
+
+ValueOwnershipKind MultipleValueInstructionResult::getOwnershipKind() const {
+  return ValueOwnershipKind(Bits.MultipleValueInstructionResult.VOKind);
+}
+
+MultipleValueInstruction *MultipleValueInstructionResult::getParent() {
+  char *Ptr = reinterpret_cast<char *>(
+      const_cast<MultipleValueInstructionResult *>(this));
+
+  // We know that we are in a trailing objects array with an extra prefix
+  // element that contains the pointer to our parent SILNode. So grab the
+  // address of the beginning of the array.
+  Ptr -= getIndex() * sizeof(MultipleValueInstructionResult);
+
+  // We may have some bytes of padding depending on our platform. Move past
+  // those bytes if we need to.
+  static_assert(alignof(MultipleValueInstructionResult) >=
+                    alignof(MultipleValueInstruction *),
+                "We assume this relationship in between the alignments");
+  Ptr -= alignof(MultipleValueInstructionResult) -
+         alignof(MultipleValueInstruction *);
+
+  // Then subtract the size of MultipleValueInstruction.
+  Ptr -= sizeof(MultipleValueInstruction *);
+
+  // Now that we have the correct address of our parent instruction, grab it and
+  // return it avoiding type punning.
+  uintptr_t value;
+  memcpy(&value, Ptr, sizeof(value));
+  return reinterpret_cast<MultipleValueInstruction *>(value);
+}
+
+#ifndef NDEBUG
+
+//---
+// Static verification of multiple value properties.
+//
+
+// Make sure that all subclasses of MultipleValueInstruction implement
+// getAllResults()
+#define MULTIPLE_VALUE_INST(ID, TEXTUALNAME, PARENT, MEMBEHAVIOR, MAYRELEASE)  \
+  static_assert(IMPLEMENTS_METHOD(ID, PARENT, getAllResults,                   \
+                                  SILInstructionResultArray() const),          \
+                #ID " does not implement SILInstructionResultArray "           \
+                    "getAllResults() const?!");
+
+// Check that all subclasses of MultipleValueInstructionResult are the same size
+// as MultipleValueInstructionResult.
+//
+// If this changes, we just need to expand the size fo SILInstructionResultArray
+// to contain a stride. But we assume this now so we should enforce it.
+#define MULTIPLE_VALUE_INST_RESULT(ID, PARENT)                                 \
+  static_assert(                                                               \
+      sizeof(ID) == sizeof(PARENT) && alignof(ID) == alignof(PARENT),          \
+      "Expected all multiple value inst result to be the same size?!");
+#include "swift/SIL/SILNodes.def"
+
+#endif

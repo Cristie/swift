@@ -27,6 +27,7 @@
 #include "swift/Basic/LLVM.h"
 #include "swift/Basic/LLVMContext.h"
 #include "swift/Frontend/Frontend.h"
+#include "swift/IRGen/IRGenPublic.h"
 #include "swift/SILOptimizer/PassManager/Passes.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/Config/config.h"
@@ -195,21 +196,18 @@ bool swift::immediate::linkLLVMModules(llvm::Module *Module,
                             /*, llvm::Linker::LinkerMode LinkerMode */)
 {
   llvm::LLVMContext &Ctx = SubModule->getContext();
-  auto OldHandler = Ctx.getDiagnosticHandler();
+  auto OldHandler = Ctx.getDiagnosticHandlerCallBack();
   void *OldDiagnosticContext = Ctx.getDiagnosticContext();
-  Ctx.setDiagnosticHandler(linkerDiagnosticHandler, nullptr);
+  Ctx.setDiagnosticHandlerCallBack(linkerDiagnosticHandler, nullptr);
   bool Failed = llvm::Linker::linkModules(*Module, std::move(SubModule));
-  Ctx.setDiagnosticHandler(OldHandler, OldDiagnosticContext);
-
+  Ctx.setDiagnosticHandlerCallBack(OldHandler, OldDiagnosticContext);
   return !Failed;
 }
 
 bool swift::immediate::IRGenImportedModules(
-    CompilerInstance &CI,
-    llvm::Module &Module,
-    llvm::SmallPtrSet<swift::ModuleDecl *, 8> &ImportedModules,
-    SmallVectorImpl<llvm::Function*> &InitFns,
-    IRGenOptions &IRGenOpts,
+    CompilerInstance &CI, llvm::Module &Module,
+    llvm::SmallPtrSetImpl<swift::ModuleDecl *> &ImportedModules,
+    SmallVectorImpl<llvm::Function *> &InitFns, IRGenOptions &IRGenOpts,
     const SILOptions &SILOpts) {
   swift::ModuleDecl *M = CI.getMainModule();
 
@@ -219,20 +217,7 @@ bool swift::immediate::IRGenImportedModules(
     AllLinkLibraries.push_back(linkLib);
   };
 
-  M->forAllVisibleModules({}, /*includePrivateTopLevelImports=*/true,
-                          [&](ModuleDecl::ImportedModule import) {
-    import.second->collectLinkLibraries(addLinkLibrary);
-  });
-
-  // Hack to handle thunks eagerly synthesized by the Clang importer.
-  swift::ModuleDecl *prev = nullptr;
-  for (auto external : CI.getASTContext().ExternalDefinitions) {
-    swift::ModuleDecl *next = external->getModuleContext();
-    if (next == prev)
-      continue;
-    next->collectLinkLibraries(addLinkLibrary);
-    prev = next;
-  }
+  M->collectLinkLibraries(addLinkLibrary);
 
   tryLoadLibraries(AllLinkLibraries, CI.getASTContext().SearchPathOpts,
                    CI.getDiags());
@@ -254,19 +239,18 @@ bool swift::immediate::IRGenImportedModules(
 
     std::unique_ptr<SILModule> SILMod = performSILGeneration(import,
                                                              CI.getSILOptions());
-    performSILLinking(SILMod.get());
     if (runSILDiagnosticPasses(*SILMod)) {
       hadError = true;
       break;
     }
     runSILLoweringPasses(*SILMod);
 
+    const auto PSPs = CI.getPrimarySpecificPathsForAtMostOnePrimary();
     // FIXME: We shouldn't need to use the global context here, but
     // something is persisting across calls to performIRGeneration.
-    auto SubModule = performIRGeneration(IRGenOpts, import,
-                                         std::move(SILMod),
-                                         import->getName().str(),
-                                         getGlobalLLVMContext());
+    auto SubModule = performIRGeneration(
+        IRGenOpts, import, std::move(SILMod), import->getName().str(), PSPs,
+        getGlobalLLVMContext(), ArrayRef<std::string>());
 
     if (CI.getASTContext().hadError()) {
       hadError = true;
@@ -300,12 +284,12 @@ int swift::RunImmediately(CompilerInstance &CI, const ProcessCmdLine &CmdLine,
   
   // IRGen the main module.
   auto *swiftModule = CI.getMainModule();
+  const auto PSPs = CI.getPrimarySpecificPathsForAtMostOnePrimary();
   // FIXME: We shouldn't need to use the global context here, but
   // something is persisting across calls to performIRGeneration.
-  auto ModuleOwner = performIRGeneration(IRGenOpts, swiftModule,
-                                         CI.takeSILModule(),
-                                         swiftModule->getName().str(),
-                                         getGlobalLLVMContext());
+  auto ModuleOwner = performIRGeneration(
+      IRGenOpts, swiftModule, CI.takeSILModule(), swiftModule->getName().str(),
+      PSPs, getGlobalLLVMContext(), ArrayRef<std::string>());
   auto *Module = ModuleOwner.get();
 
   if (Context.hadError())
@@ -360,8 +344,9 @@ int swift::RunImmediately(CompilerInstance &CI, const ProcessCmdLine &CmdLine,
   std::string ErrorMsg;
   llvm::TargetOptions TargetOpt;
   std::string CPU;
+  std::string Triple;
   std::vector<std::string> Features;
-  std::tie(TargetOpt, CPU, Features)
+  std::tie(TargetOpt, CPU, Features, Triple)
     = getIRTargetOptions(IRGenOpts, swiftModule->getASTContext());
   builder.setRelocationModel(llvm::Reloc::PIC_);
   builder.setTargetOptions(TargetOpt);
@@ -375,21 +360,21 @@ int swift::RunImmediately(CompilerInstance &CI, const ProcessCmdLine &CmdLine,
     return -1;
   }
 
-  DEBUG(llvm::dbgs() << "Module to be executed:\n";
-        Module->dump());
+  LLVM_DEBUG(llvm::dbgs() << "Module to be executed:\n";
+             Module->dump());
 
   EE->finalizeObject();
   
   // Run the generated program.
   for (auto InitFn : InitFns) {
-    DEBUG(llvm::dbgs() << "Running initialization function "
-            << InitFn->getName() << '\n');
+    LLVM_DEBUG(llvm::dbgs() << "Running initialization function "
+                            << InitFn->getName() << '\n');
     EE->runFunctionAsMain(InitFn, CmdLine, nullptr);
   }
 
-  DEBUG(llvm::dbgs() << "Running static constructors\n");
+  LLVM_DEBUG(llvm::dbgs() << "Running static constructors\n");
   EE->runStaticConstructorsDestructors(false);
-  DEBUG(llvm::dbgs() << "Running main\n");
+  LLVM_DEBUG(llvm::dbgs() << "Running main\n");
   llvm::Function *EntryFn = Module->getFunction("main");
   return EE->runFunctionAsMain(EntryFn, CmdLine, nullptr);
 }

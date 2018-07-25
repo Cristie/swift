@@ -44,10 +44,6 @@
 // RUN: %FileCheck %s -check-prefix=DL_FUNC_NAME_PAREN_1 < %t.dl.txt
 // RUN: %FileCheck %s -check-prefix=GLOBAL_NEGATIVE < %t.dl.txt
 
-// RUN: %target-swift-ide-test -code-completion -source-filename %s -I %t -disable-objc-attr-requires-foundation-module -code-completion-token=DL_FUNC_NAME_DOT_1 > %t.dl.txt
-// RUN: %FileCheck %s -check-prefix=DL_FUNC_NAME_DOT_1 < %t.dl.txt
-// RUN: %FileCheck %s -check-prefix=GLOBAL_NEGATIVE < %t.dl.txt
-
 // RUN: %target-swift-ide-test -code-completion -source-filename %s -I %t -disable-objc-attr-requires-foundation-module -code-completion-token=DL_FUNC_NAME_BANG_1 > %t.dl.txt
 // RUN: %FileCheck %s -check-prefix=DL_FUNC_NAME_BANG_1 < %t.dl.txt
 // RUN: %FileCheck %s -check-prefix=GLOBAL_NEGATIVE < %t.dl.txt
@@ -122,8 +118,8 @@ protocol Bar { func bar() }
 // DL_INSTANCE_NO_DOT-DAG: Decl[Subscript]/OtherModule[swift_ide_test]:        [{#Int8#}][#Int?#]{{; name=.+$}}
 // DL_INSTANCE_NO_DOT-DAG: Decl[Subscript]/OtherModule[swift_ide_test]:        [{#TopLevelObjcClass#}][#Int?#]{{; name=.+$}}
 // DL_INSTANCE_NO_DOT-DAG: Decl[Subscript]/OtherModule[swift_ide_test]:        [{#TopLevelObjcProtocol#}][#Int?#]{{; name=.+$}}
-// DL_INSTANCE_NO_DOT-DAG: Decl[Subscript]/OtherModule[baz_clang_module]:      [{#Int32#}][#Any!?#]{{; name=.+$}}
-// DL_INSTANCE_NO_DOT-DAG: Decl[Subscript]/OtherModule[baz_clang_module]:      [{#Any!#}][#Any!?#]{{; name=.+$}}
+// DL_INSTANCE_NO_DOT-DAG: Decl[Subscript]/OtherModule[baz_clang_module]:      [{#Int32#}][#Any??#]{{; name=.+$}}
+// DL_INSTANCE_NO_DOT-DAG: Decl[Subscript]/OtherModule[baz_clang_module]:      [{#Any!#}][#Any??#]{{; name=.+$}}
 // DL_INSTANCE_NO_DOT: End completions
 // GLOBAL_NEGATIVE-NOT:.objectAtIndexedSubscript
 
@@ -238,9 +234,11 @@ protocol Bar { func bar() }
 // TLOC_MEMBERS_NO_DOT-NEXT: Decl[InstanceVar]/CurrNominal:    .topLevelObjcClass_Property1[#Int#]{{; name=.+$}}
 // TLOC_MEMBERS_NO_DOT-NEXT: Decl[InfixOperatorFunction]/OtherModule[Swift]: === {#AnyObject?#}[#Bool#];
 // TLOC_MEMBERS_NO_DOT-NEXT: Decl[InfixOperatorFunction]/OtherModule[Swift]: !== {#AnyObject?#}[#Bool#];
+// TLOC_MEMBERS_NO_DOT-NEXT: Keyword[self]/CurrNominal: .self[#TopLevelObjcClass#]; name=self
 // TLOC_MEMBERS_NO_DOT-NEXT: End completions
 
 // TLOC_MEMBERS_DOT: Begin completions
+// TLOC_MEMBERS_DOT-NEXT: Keyword[self]/CurrNominal: self[#TopLevelObjcClass#]; name=self
 // TLOC_MEMBERS_DOT-NEXT: Decl[InstanceMethod]/CurrNominal: returnsObjcClass({#(i): Int#})[#TopLevelObjcClass#]{{; name=.+$}}
 // TLOC_MEMBERS_DOT-NEXT: Decl[InstanceMethod]/CurrNominal: topLevelObjcClass_InstanceFunc1()[#Void#]{{; name=.+$}}
 // TLOC_MEMBERS_DOT-NEXT: Decl[InstanceVar]/CurrNominal:    topLevelObjcClass_Property1[#Int#]{{; name=.+$}}
@@ -251,27 +249,27 @@ protocol Bar { func bar() }
 // Blocked by: rdar://15136550 Properties in protocols not implemented
 
 @objc class TopLevelObjcClass {
-  func returnsObjcClass(_ i: Int) -> TopLevelObjcClass {}
+  @objc func returnsObjcClass(_ i: Int) -> TopLevelObjcClass {}
 
-  func topLevelObjcClass_InstanceFunc1() {}
-  class func topLevelObjcClass_ClassFunc1() {}
-  subscript(i: Int8) -> Int {
+  @objc func topLevelObjcClass_InstanceFunc1() {}
+  @objc class func topLevelObjcClass_ClassFunc1() {}
+  @objc subscript(i: Int8) -> Int {
     get {
       return 0
     }
   }
-  var topLevelObjcClass_Property1: Int
+  @objc var topLevelObjcClass_Property1: Int
 }
 
 @objc class TopLevelObjcClass_DuplicateMembers {
-  func topLevelObjcClass_InstanceFunc1() {}
-  class func topLevelObjcClass_ClassFunc1() {}
-  subscript(i: Int8) -> Int {
+  @objc func topLevelObjcClass_InstanceFunc1() {}
+  @objc class func topLevelObjcClass_ClassFunc1() {}
+  @objc subscript(i: Int8) -> Int {
     get {
       return 0
     }
   }
-  var topLevelObjcClass_Property1: Int
+  @objc var topLevelObjcClass_Property1: Int
 }
 
 class TopLevelClass {
@@ -295,10 +293,10 @@ class TopLevelClass {
 }
 
 @objc protocol TopLevelObjcProtocol {
-  func topLevelObjcProtocol_InstanceFunc1()
-  class func topLevelObjcProtocol_ClassFunc1()
-  subscript (i: TopLevelObjcClass) -> Int { get set }
-  var topLevelObjcProtocol_Property1: Int { get set }
+  @objc func topLevelObjcProtocol_InstanceFunc1()
+  @objc class func topLevelObjcProtocol_ClassFunc1()
+  @objc subscript (i: TopLevelObjcClass) -> Int { get set }
+  @objc var topLevelObjcProtocol_Property1: Int { get set }
 }
 
 class ContainerForNestedClass1 {
@@ -338,7 +336,7 @@ struct ContainerForNestedClass2 {
 
 class GenericContainerForNestedClass1<T> {
   class Nested3 {
-    @objc func ERROR1() {}
+    func ERROR1() {}
     func ERROR2() {}
     class func ERROR3() {}
     typealias ERROR = Int
@@ -354,7 +352,7 @@ class GenericContainerForNestedClass1<T> {
 
 struct GenericContainerForNestedClass2<T> {
   class Nested3 {
-    @objc func ERROR1() {}
+    func ERROR1() {}
     func ERROR2() {}
     class func ERROR3() {}
     typealias ERROR = Int
@@ -369,36 +367,36 @@ struct GenericContainerForNestedClass2<T> {
 }
 
 @objc class Base1 {
-  func base1_InstanceFunc1() {}
+  @objc func base1_InstanceFunc1() {}
 
-  func base1_InstanceFunc2(_ a: Derived) {}
+  @objc func base1_InstanceFunc2(_ a: Derived) {}
 
-  func base1_InstanceFunc3(_ a: Derived) {}
+  @objc func base1_InstanceFunc3(_ a: Derived) {}
 
-  func base1_InstanceFunc4() -> Base {}
+  @objc func base1_InstanceFunc4() -> Base {}
 
-  var base1_Property1: Int
+  @objc var base1_Property1: Int
 
-  var base1_Property2: Base
+  @objc var base1_Property2: Base
 }
 
 @objc class Derived1 : Base1 {
-  func base1_InstanceFunc1() {}
+  @objc func base1_InstanceFunc1() {}
 
-  func base1_InstanceFunc2(_ a: Derived) {}
+  @objc func base1_InstanceFunc2(_ a: Derived) {}
 
-  func base1_InstanceFunc3(_ a: Base) {}
+  @objc func base1_InstanceFunc3(_ a: Base) {}
 
-  func base1_InstanceFunc4() -> Derived {}
+  @objc func base1_InstanceFunc4() -> Derived {}
 
-  var base1_Property1: Int {
+  @objc var base1_Property1: Int {
     get {
       return 0
     }
     set {}
   }
 
-  var base1_Property2: Derived {
+  @objc var base1_Property2: Derived {
     get {
       return Derived()
     }
@@ -459,29 +457,26 @@ func testAnyObject11(_ dl: AnyObject) {
 }
 // FIXME: it would be nice if we produced a call pattern here.
 // DL_FUNC_NAME_1:     Begin completions
-// DL_FUNC_NAME_1-DAG: Decl[InstanceVar]/CurrNominal:      .description[#String#]{{; name=.+$}}
 // DL_FUNC_NAME_1:     End completions
 
 func testAnyObject11_(_ dl: AnyObject) {
   dl.returnsObjcClass!(#^DL_FUNC_NAME_PAREN_1^#
 }
 // DL_FUNC_NAME_PAREN_1: Begin completions
-// DL_FUNC_NAME_PAREN_1-DAG: Pattern/ExprSpecific: ['(']{#Int#})[#TopLevelObjcClass#]{{; name=.+$}}
+// DL_FUNC_NAME_PAREN_1-DAG: Pattern/CurrModule: ['(']{#Int#}[')'][#TopLevelObjcClass#]{{; name=.+$}}
 // DL_FUNC_NAME_PAREN_1: End completions
 
 func testAnyObject12(_ dl: AnyObject) {
   dl.returnsObjcClass.#^DL_FUNC_NAME_DOT_1^#
 }
 // FIXME: it would be nice if we produced a call pattern here.
-// DL_FUNC_NAME_DOT_1:     Begin completions
-// DL_FUNC_NAME_DOT_1-DAG: Decl[InstanceVar]/CurrNominal:      description[#String#]{{; name=.+$}}
-// DL_FUNC_NAME_DOT_1:     End completions
 
 func testAnyObject13(_ dl: AnyObject) {
   dl.returnsObjcClass!#^DL_FUNC_NAME_BANG_1^#
 }
 // DL_FUNC_NAME_BANG_1: Begin completions
-// DL_FUNC_NAME_BANG_1-NEXT: Pattern/ExprSpecific: ({#Int#})[#TopLevelObjcClass#]
+// DL_FUNC_NAME_BANG_1-NEXT: Pattern/CurrModule: ({#Int#})[#TopLevelObjcClass#]
+// DL_FUNC_NAME_BANG_1-NEXT: Keyword[self]/CurrNominal: .self[#(Int) -> TopLevelObjcClass#]; name=self
 // DL_FUNC_NAME_BANG_1-NEXT: End completions
 
 func testAnyObject14() {

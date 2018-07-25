@@ -68,7 +68,8 @@ public:
   void print(raw_ostream &OS, const SourceManager &SM,
              unsigned &LastBufferID) const;
 
-  void printLineAndColumn(raw_ostream &OS, const SourceManager &SM) const;
+  void printLineAndColumn(raw_ostream &OS, const SourceManager &SM,
+                          unsigned BufferID = 0) const;
 
   void print(raw_ostream &OS, const SourceManager &SM) const {
     unsigned Tmp = ~0U;
@@ -95,6 +96,10 @@ public:
   
   bool isValid() const { return Start.isValid(); }
   bool isInvalid() const { return !isValid(); }
+
+  /// Extend this SourceRange to the smallest continuous SourceRange that
+  /// includes both this range and the other one.
+  void widen(SourceRange Other);
 
   bool operator==(const SourceRange &other) const {
     return Start == other.Start && End == other.End;

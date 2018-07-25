@@ -53,9 +53,20 @@ Globals
   global ::= type 'MP'                   // type metadata pattern
   global ::= type 'Ma'                   // type metadata access function
   global ::= type 'ML'                   // type metadata lazy cache variable
+  global ::= nominal-type 'Mr'           // generic type completion function
+  global ::= nominal-type 'Mi'           // generic type instantiation function
+  global ::= nominal-type 'MI'           // generic type instantiation cache
   global ::= nominal-type 'Mm'           // class metaclass
   global ::= nominal-type 'Mn'           // nominal type descriptor
+  global ::= module 'MXM'                // module descriptor
+  global ::= context 'MXE'               // extension descriptor
+  global ::= context 'MXX'               // anonymous context descriptor
+  global ::= context identifier 'MXY'    // anonymous context descriptor
+  global ::= type assoc_type_path 'MXA'  // generic parameter ref
   global ::= protocol 'Mp'               // protocol descriptor
+
+  global ::= nominal-type 'Mo'           // class metadata immediate member base offset
+
   global ::= type 'MF'                   // metadata for remote mirrors: field descriptor
   global ::= type 'MB'                   // metadata for remote mirrors: builtin type descriptor
   global ::= protocol-conformance 'MA'   // metadata for remote mirrors: associated type descriptor
@@ -66,26 +77,26 @@ Globals
   global ::= mangled-name 'Ta'                     // ObjC partial application forwarder
 
   global ::= type 'w' VALUE-WITNESS-KIND // value witness
+
+  global ::= protocol-conformance 'Mc'   // protocol conformance descriptor
+  global ::= protocol-conformance 'WP'   // protocol witness table
   global ::= protocol-conformance 'Wa'   // protocol witness table accessor
+
   global ::= protocol-conformance 'WG'   // generic protocol witness table
+  global ::= protocol-conformance 'Wp'   // protocol witness table pattern
+  global ::= protocol-conformance 'Wr'   // resilient witness table
   global ::= protocol-conformance 'WI'   // generic protocol witness table instantiation function
   global ::= type protocol-conformance 'WL'   // lazy protocol witness table cache variable
-  global ::= entity 'Wo'                 // witness table offset
-  global ::= protocol-conformance 'WP'   // protocol witness table
 
   global ::= protocol-conformance identifier 'Wt' // associated type metadata accessor
-  global ::= protocol-conformance identifier nominal-type 'WT' // associated type witness table accessor
+  global ::= protocol-conformance assoc_type_path nominal-type 'WT' // associated type witness table accessor
   global ::= type protocol-conformance 'Wl' // lazy protocol witness table accessor
+
   global ::= type 'WV'                   // value witness table
-  global ::= entity 'Wv' DIRECTNESS      // field offset
+  global ::= entity 'Wvd'                // field offset
+  global ::= entity 'WC'                 // resilient enum tag index
 
-  global ::= type 'Wy' // Outlined Copy Function Type
-  global ::= type 'We' // Outlined Consume Function Type
-  global ::= type 'Wr' // Outlined Retain Function Type
-  global ::= type 'Ws' // Outlined Release Function Type
-
-  DIRECTNESS ::= 'd'                         // direct
-  DIRECTNESS ::= 'i'                         // indirect
+  assoc_type_path ::= identifier '_' identifier*
 
 A direct symbol resolves directly to the address of an object.  An
 indirect symbol resolves to the address of a pointer to the object.
@@ -109,7 +120,8 @@ types where the metadata itself has unknown layout.)
   global ::= global 'TD'                 // dynamic dispatch thunk
   global ::= global 'Td'                 // direct method reference thunk
   global ::= entity entity 'TV'          // vtable override thunk, derived followed by base
-  global ::= type 'D'                    // type mangling for the debugger. TODO: check if we really need this
+  global ::= type label-list? 'D'        // type mangling for the debugger with label list for function types.
+  global ::= type 'TC'                   // continuation prototype (not actually used for real symbols)
   global ::= protocol-conformance entity 'TW' // protocol witness thunk
   global ::= context identifier identifier 'TB' // property behavior initializer thunk (not used currently)
   global ::= context identifier identifier 'Tb' // property behavior setter thunk (not used currently)
@@ -156,6 +168,18 @@ The types in a reabstraction thunk helper function are always non-polymorphic
 ``<VALUE-WITNESS-KIND>`` differentiates the kinds of value
 witness functions for a type.
 
+::
+
+  global ::= generic-signature? type 'WOy' // Outlined copy
+  global ::= generic-signature? type 'WOe' // Outlined consume
+  global ::= generic-signature? type 'WOr' // Outlined retain
+  global ::= generic-signature? type 'WOs' // Outlined release
+  global ::= generic-signature? type 'WOb' // Outlined initializeWithTake
+  global ::= generic-signature? type 'WOc' // Outlined initializeWithCopy
+  global ::= generic-signature? type 'WOd' // Outlined assignWithTake
+  global ::= generic-signature? type 'WOf' // Outlined assignWithCopy
+  global ::= generic-signature? type 'WOh' // Outlined destroy
+
 Entities
 ~~~~~~~~
 
@@ -167,9 +191,13 @@ Entities
   static ::= 'Z'
   curry-thunk ::= 'Tc'
 
+  label-list ::= empty-list            // represents complete absence of parameter labels
+  label-list ::= ('_' | identifier)*   // '_' is inserted as placeholder for empty label,
+                                       // since the number of labels should match the number of parameters
+
   // The leading type is the function type
-  entity-spec ::= type file-discriminator? 'fC'      // allocating constructor
-  entity-spec ::= type file-discriminator? 'fc'      // non-allocating constructor
+  entity-spec ::= label-list type file-discriminator? 'fC'      // allocating constructor
+  entity-spec ::= label-list type file-discriminator? 'fc'      // non-allocating constructor
   entity-spec ::= type 'fU' INDEX            // explicit anonymous closure expression
   entity-spec ::= type 'fu' INDEX            // implicit anonymous closure
   entity-spec ::= 'fA' INDEX                 // default argument N+1 generator
@@ -181,13 +209,12 @@ Entities
   entity-spec ::= 'Tv' NATURAL               // outlined global variable (from context function)
   entity-spec ::= 'Te' bridge-spec           // outlined objective c method call
 
-  entity-spec ::= decl-name function-signature generic-signature? 'F'    // function
-  entity-spec ::= storage-spec
-  entity-spec ::= decl-name type 'fp'                // generic type parameter
-  entity-spec ::= decl-name type 'fo'                // enum element (currently not used)
-
-  storage-spec ::= type file-discriminator? 'i' ACCESSOR
-  storage-spec ::= decl-name type 'v' ACCESSOR
+  entity-spec ::= decl-name label-list function-signature generic-signature? 'F'    // function
+  entity-spec ::= label-list type file-discriminator? 'i' ACCESSOR                  // subscript
+  entity-spec ::= decl-name label-list? type 'v' ACCESSOR                           // variable
+  entity-spec ::= decl-name type 'fp'                                               // generic type parameter
+  entity-spec ::= decl-name type 'fo'                                               // enum element (currently not used)
+  entity-spec ::= identifier 'Qa'                                                   // associated type declaration
 
   ACCESSOR ::= 'm'                           // materializeForSet
   ACCESSOR ::= 's'                           // setter
@@ -195,28 +222,39 @@ Entities
   ACCESSOR ::= 'G'                           // global getter
   ACCESSOR ::= 'w'                           // willSet
   ACCESSOR ::= 'W'                           // didSet
+  ACCESSOR ::= 'r'                           // read
+  ACCESSOR ::= 'M'                           // modify (temporary)
   ACCESSOR ::= 'a' ADDRESSOR-KIND            // mutable addressor
   ACCESSOR ::= 'l' ADDRESSOR-KIND            // non-mutable addressor
   ACCESSOR ::= 'p'                           // pseudo accessor referring to the storage itself
-                                         
+
   ADDRESSOR-KIND ::= 'u'                     // unsafe addressor (no owner)
   ADDRESSOR-KIND ::= 'O'                     // owning addressor (non-native owner)
   ADDRESSOR-KIND ::= 'o'                     // owning addressor (native owner)
   ADDRESSOR-KIND ::= 'p'                     // pinning addressor (native owner)
 
   decl-name ::= identifier
-  decl-name ::= identifier 'L' INDEX         // locally-discriminated declaration
-  decl-name ::= identifier identifier 'LL'   // file-discriminated declaration
+  decl-name ::= identifier 'L' INDEX                  // locally-discriminated declaration
+  decl-name ::= identifier identifier 'LL'            // file-discriminated declaration
+  decl-name ::= identifier 'L' RELATED-DISCRIMINATOR  // related declaration
+
+  RELATED-DISCRIMINATOR ::= [a-j]
+  RELATED-DISCRIMINATOR ::= [A-J]
 
   file-discriminator ::= identifier 'Ll'     // anonymous file-discriminated declaration
 
-The identifier in a ``<file-discriminator>`` and the first identifier in a
+The identifier in a ``<file-discriminator>`` and the second identifier in a
 file-discriminated ``<decl-name>`` is a string that represents the file the
 original declaration came from. It should be considered unique within the
-enclosing module. The second identifier is the name of the entity. Not all
+enclosing module. The first identifier is the name of the entity. Not all
 declarations marked ``private`` declarations will use this mangling; if the
 entity's context is enough to uniquely identify the entity, the simple
 ``identifier`` form is preferred.
+
+Twenty operators of the form 'LA', 'LB', etc. are reserved to described
+entities related to the entity whose name is provided. For example, 'LE' and
+'Le' in the "SC" module are used to represent the structs synthesized by the
+Clang importer for various "error code" enums.
 
 Outlined bridged Objective C method call mangling includes which parameters and
 return value are bridged and the type of pattern outlined.
@@ -262,9 +300,18 @@ destructor, the non-allocating or non-deallocating variant is used.
   module ::= identifier                      // module name
   module ::= known-module                    // abbreviation
 
+  context ::= entity identifier type-list 'XZ' // unknown runtime context
+
+The runtime produces manglings of unknown runtime contexts when a declaration
+context has no preserved runtime information, or when a declaration is encoded
+in runtime in a way that the current runtime does not understand. These
+manglings are unstable and may change between runs of the process.
+
+::
+
   known-module ::= 's'                       // Swift
-  known-module ::= 'SC'                      // C
-  known-module ::= 'So'                      // Objective-C
+  known-module ::= 'SC'                      // Clang-importer-synthesized
+  known-module ::= 'So'                      // C and Objective-C
 
 The Objective-C module is used as the context for mangling Objective-C
 classes as ``<type>``\ s.
@@ -279,30 +326,67 @@ Types
   any-generic-type ::= context decl-name 'C'     // nominal class type
   any-generic-type ::= context decl-name 'O'     // nominal enum type
   any-generic-type ::= context decl-name 'V'     // nominal struct type
+  any-generic-type ::= context decl-name 'XY'    // unknown nominal type
   any-generic-type ::= protocol 'P'              // nominal protocol type
   any-generic-type ::= context decl-name 'a'     // typealias type (used in DWARF and USRs)
 
-  any-generic-type ::= 'S' KNOWN-TYPE-KIND       // known nominal type substitution
-  any-generic-type ::= 'S' NATURAL KNOWN-TYPE-KIND    // repeated known type substitutions of the same kind
+  any-generic-type ::= standard-substitutions
+  
+  standard-substitutions ::= 'S' KNOWN-TYPE-KIND       // known nominal type substitution
+  standard-substitutions ::= 'S' NATURAL KNOWN-TYPE-KIND    // repeated known type substitutions of the same kind
 
+  KNOWN-TYPE-KIND ::= 'A'                    // Swift.AutoreleasingUnsafeMutablePointer
   KNOWN-TYPE-KIND ::= 'a'                    // Swift.Array
+  KNOWN-TYPE-KIND ::= 'B'                    // Swift.BinaryFloatingPoint
   KNOWN-TYPE-KIND ::= 'b'                    // Swift.Bool
   KNOWN-TYPE-KIND ::= 'c'                    // Swift.UnicodeScalar
+  KNOWN-TYPE-KIND ::= 'D'                    // Swift.Dictionary
   KNOWN-TYPE-KIND ::= 'd'                    // Swift.Float64
+  KNOWN-TYPE-KIND ::= 'E'                    // Swift.Encodable
+  KNOWN-TYPE-KIND ::= 'e'                    // Swift.Decodable
+  KNOWN-TYPE-KIND ::= 'F'                    // Swift.FloatingPoint
   KNOWN-TYPE-KIND ::= 'f'                    // Swift.Float32
+  KNOWN-TYPE-KIND ::= 'G'                    // Swift.RandomNumberGenerator
+  KNOWN-TYPE-KIND ::= 'H'                    // Swift.Hashable
+  KNOWN-TYPE-KIND ::= 'h'                    // Swift.Set
+  KNOWN-TYPE-KIND ::= 'I'                    // Swift.DefaultIndices
   KNOWN-TYPE-KIND ::= 'i'                    // Swift.Int
-  KNOWN-TYPE-KIND ::= 'V'                    // Swift.UnsafeRawPointer
-  KNOWN-TYPE-KIND ::= 'v'                    // Swift.UnsafeMutableRawPointer
+  KNOWN-TYPE-KIND ::= 'J'                    // Swift.Character
+  KNOWN-TYPE-KIND ::= 'j'                    // Swift.Numeric
+  KNOWN-TYPE-KIND ::= 'K'                    // Swift.BidirectionalCollection
+  KNOWN-TYPE-KIND ::= 'k'                    // Swift.RandomAccessCollection
+  KNOWN-TYPE-KIND ::= 'L'                    // Swift.Comparable
+  KNOWN-TYPE-KIND ::= 'l'                    // Swift.Collection
+  KNOWN-TYPE-KIND ::= 'M'                    // Swift.MutableCollection
+  KNOWN-TYPE-KIND ::= 'm'                    // Swift.RangeReplaceableCollection
+  KNOWN-TYPE-KIND ::= 'N'                    // Swift.ClosedRange
+  KNOWN-TYPE-KIND ::= 'n'                    // Swift.Range
+  KNOWN-TYPE-KIND ::= 'O'                    // Swift.ObjectIdentifier
   KNOWN-TYPE-KIND ::= 'P'                    // Swift.UnsafePointer
   KNOWN-TYPE-KIND ::= 'p'                    // Swift.UnsafeMutablePointer
-  KNOWN-TYPE-KIND ::= 'Q'                    // Swift.ImplicitlyUnwrappedOptional
+  KNOWN-TYPE-KIND ::= 'Q'                    // Swift.Equatable
   KNOWN-TYPE-KIND ::= 'q'                    // Swift.Optional
   KNOWN-TYPE-KIND ::= 'R'                    // Swift.UnsafeBufferPointer
   KNOWN-TYPE-KIND ::= 'r'                    // Swift.UnsafeMutableBufferPointer
   KNOWN-TYPE-KIND ::= 'S'                    // Swift.String
+  KNOWN-TYPE-KIND ::= 's'                    // Swift.Substring
+  KNOWN-TYPE-KIND ::= 'T'                    // Swift.Sequence
+  KNOWN-TYPE-KIND ::= 't'                    // Swift.IteratorProtocol
+  KNOWN-TYPE-KIND ::= 'U'                    // Swift.UnsignedInteger
   KNOWN-TYPE-KIND ::= 'u'                    // Swift.UInt
+  KNOWN-TYPE-KIND ::= 'V'                    // Swift.UnsafeRawPointer
+  KNOWN-TYPE-KIND ::= 'v'                    // Swift.UnsafeMutableRawPointer
+  KNOWN-TYPE-KIND ::= 'W'                    // Swift.UnsafeRawBufferPointer
+  KNOWN-TYPE-KIND ::= 'w'                    // Swift.UnsafeMutableRawBufferPointer
+  KNOWN-TYPE-KIND ::= 'X'                    // Swift.RangeExpression
+  KNOWN-TYPE-KIND ::= 'x'                    // Swift.Strideable
+  KNOWN-TYPE-KIND ::= 'Y'                    // Swift.RawRepresentable
+  KNOWN-TYPE-KIND ::= 'y'                    // Swift.StringProtocol
+  KNOWN-TYPE-KIND ::= 'Z'                    // Swift.SignedInteger
+  KNOWN-TYPE-KIND ::= 'z'                    // Swift.BinaryInteger
 
   protocol ::= context decl-name
+  protocol ::= standard-substitutions
 
   type ::= 'Bb'                              // Builtin.BridgeObject
   type ::= 'BB'                              // Builtin.UnsafeValueBuffer
@@ -311,9 +395,10 @@ Types
   type ::= 'BO'                              // Builtin.UnknownObject
   type ::= 'Bo'                              // Builtin.NativeObject
   type ::= 'Bp'                              // Builtin.RawPointer
+  type ::= 'Bt'                              // Builtin.SILToken
   type ::= type 'Bv' NATURAL '_'             // Builtin.Vec<n>x<type>
   type ::= 'Bw'                              // Builtin.Word
-  type ::= function-signature 'c'            // function type
+  type ::= function-signature 'c'            // function type (escaping)
   type ::= function-signature 'X' FUNCTION-KIND // special function type
   type ::= bound-generic-type
   type ::= type 'Sg'                         // optional type, shortcut for: type 'ySqG'
@@ -332,18 +417,22 @@ Types
   type ::= type 'Xm' METATYPE-REPR           // existential metatype with representation
   type ::= 'Xe'                              // error or unresolved type
  
-  bound-generic-type ::= type 'y' (type* '_')* type* 'G'   // one type-list per nesting level of type
+  bound-generic-type ::= type 'y' (type* '_')* type* retroactive-conformance* 'G'   // one type-list per nesting level of type
   bound-generic-type ::= substitution
 
   FUNCTION-KIND ::= 'f'                      // @thin function type
   FUNCTION-KIND ::= 'U'                      // uncurried function type (currently not used) 
-  FUNCTION-KIND ::= 'K'                      // @auto_closure function type
+  FUNCTION-KIND ::= 'K'                      // @auto_closure function type (noescape)
   FUNCTION-KIND ::= 'B'                      // objc block function type
   FUNCTION-KIND ::= 'C'                      // C function pointer type
+  FUNCTION-KIND ::= 'A'                      // @auto_closure function type (escaping)
+  FUNCTION-KIND ::= 'E'                      // function type (noescape)
 
   function-signature ::= params-type params-type throws? // results and parameters
 
-  params-type := type                        // tuple in case of multiple parameters
+  params-type := type 'z'? 'h'?              // tuple in case of multiple parameters or a single parameter with a single tuple type
+                                             // with optional inout convention, shared convention. parameters don't have labels,
+                                             // they are mangled separately as part of the entity.
   params-type := empty-list                  // shortcut for no parameters
 
   throws ::= 'K'                             // 'throws' annotation on function types
@@ -352,7 +441,7 @@ Types
   type-list ::= empty-list
 
                                                   // FIXME: Consider replacing 'h' with a two-char code
-  list-type ::= type identifier? 'z'? 'h'? 'd'?   // type with optional label, inout convention, shared convention, and variadic specifier
+  list-type ::= type identifier? 'z'? 'h'? 'n'? 'd'?   // type with optional label, inout convention, shared convention, owned convention, and variadic specifier
 
   METATYPE-REPR ::= 't'                      // Thin metatype representation
   METATYPE-REPR ::= 'T'                      // Thick metatype representation
@@ -379,7 +468,6 @@ Types
 
   assoc-type-list ::= assoc-type-name '_' assoc-type-name*
 
-  archetype ::= context 'Qq' INDEX           // archetype+context (DWARF only)
   archetype ::= associated-type
 
   associated-type ::= substitution
@@ -402,9 +490,11 @@ mangled in to disambiguate.
   impl-function-type ::= type* 'I' FUNC-ATTRIBUTES '_'
   impl-function-type ::= type* generic-signature 'I' PSEUDO-GENERIC? FUNC-ATTRIBUTES '_'
 
-  FUNC-ATTRIBUTES ::= CALLEE-CONVENTION? FUNC-REPRESENTATION PARAM-CONVENTION* RESULT-CONVENTION* ('z' RESULT-CONVENTION)
+  FUNC-ATTRIBUTES ::= CALLEE-ESCAPE? CALLEE-CONVENTION FUNC-REPRESENTATION? PARAM-CONVENTION* RESULT-CONVENTION* ('z' RESULT-CONVENTION)
 
   PSEUDO-GENERIC ::= 'P'
+
+  CALLEE-ESCAPE ::= 'e'                      // @escaping (inverse of SIL @noescape)
 
   CALLEE-CONVENTION ::= 'y'                  // @callee_unowned
   CALLEE-CONVENTION ::= 'g'                  // @callee_guaranteed
@@ -517,6 +607,17 @@ values indicates a single generic parameter at the outermost depth::
 
 A generic signature must only precede an operator character which is different
 from any character in a ``<GENERIC-PARAM-COUNT>``.
+
+::
+
+  retroactive-conformance ::= protocol-conformance 'g' INDEX
+
+When a protocol conformance used to satisfy one of a bound generic type's
+generic requirements is retroactive (i.e., it is specified in a module other
+than the module of the conforming type or the conformed-to protocol), it is
+mangled with its offset into the set of conformance requirements, the
+root protocol conformance, and the suffix 'g'.
+
 
 Identifiers
 ~~~~~~~~~~~
@@ -697,7 +798,7 @@ The type is the function type of the specialized function.
 
 ::
 
-  specialization ::= spec-arg* 'Tf' SPEC-INFO UNIQUE-ID? ARG-SPEC-KIND* '_' ARG-SPEC-KIND  // Function signature specialization kind
+  specialization ::= spec-arg* 'Tf' SPEC-INFO ARG-SPEC-KIND* '_' ARG-SPEC-KIND  // Function signature specialization kind
 
 The ``<ARG-SPEC-KIND>`` describes how arguments are specialized.
 Some kinds need arguments, which precede ``Tf``.
@@ -718,12 +819,11 @@ Some kinds need arguments, which precede ``Tf``.
 
   FRAGILE ::= 'q'
 
-  UNIQUE-ID ::= NATURAL                      // Used to make unique function names
-
   ARG-SPEC-KIND ::= 'n'                      // Unmodified argument
   ARG-SPEC-KIND ::= 'c'                      // Consumes n 'type' arguments which are closed over types in argument order
                                              // and one 'identifier' argument which is the closure symbol name
   ARG-SPEC-KIND ::= 'p' CONST-PROP           // Constant propagated argument
+  ARG-SPEC-KIND ::= 'e' 'D'? 'G'? 'X'?       // Generic argument, with optional dead, owned=>guaranteed or exploded-specifier
   ARG-SPEC-KIND ::= 'd' 'G'? 'X'?            // Dead argument, with optional owned=>guaranteed or exploded-specifier
   ARG-SPEC-KIND ::= 'g' 'X'?                 // Owned => Guaranteed,, with optional exploded-specifier
   ARG-SPEC-KIND ::= 'x'                      // Exploded

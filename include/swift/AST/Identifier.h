@@ -17,6 +17,7 @@
 #ifndef SWIFT_AST_IDENTIFIER_H
 #define SWIFT_AST_IDENTIFIER_H
 
+#include "swift/Basic/EditorPlaceholder.h"
 #include "swift/Basic/LLVM.h"
 #include "llvm/ADT/FoldingSet.h"
 #include "llvm/ADT/PointerUnion.h"
@@ -125,7 +126,7 @@ public:
   }
 
   static bool isEditorPlaceholder(StringRef name) {
-    return name.startswith("<#");
+    return swift::isEditorPlaceholder(name);
   }
 
   bool isEditorPlaceholder() const {
@@ -191,9 +192,9 @@ namespace llvm {
   };
   
   // An Identifier is "pointer like".
-  template<typename T> class PointerLikeTypeTraits;
+  template<typename T> struct PointerLikeTypeTraits;
   template<>
-  class PointerLikeTypeTraits<swift::Identifier> {
+  struct PointerLikeTypeTraits<swift::Identifier> {
   public:
     static inline void *getAsVoidPointer(swift::Identifier I) {
       return const_cast<void *>(I.getAsOpaquePointer());
@@ -215,6 +216,7 @@ public:
   enum class Kind: uint8_t {
     Normal,
     Subscript,
+    Constructor,
     Destructor
   };
   
@@ -224,6 +226,8 @@ private:
   /// This is an implementation detail that should never leak outside of
   /// DeclName.
   static void *SubscriptIdentifierData;
+  /// As above, for special constructor DeclNames.
+  static void *ConstructorIdentifierData;
   /// As above, for special destructor DeclNames.
   static void *DestructorIdentifierData;
 
@@ -238,6 +242,10 @@ public:
     return DeclBaseName(Identifier((const char *)SubscriptIdentifierData));
   }
 
+  static DeclBaseName createConstructor() {
+    return DeclBaseName(Identifier((const char *)ConstructorIdentifierData));
+  }
+
   static DeclBaseName createDestructor() {
     return DeclBaseName(Identifier((const char *)DestructorIdentifierData));
   }
@@ -245,6 +253,8 @@ public:
   Kind getKind() const {
     if (Ident.get() == SubscriptIdentifierData) {
       return Kind::Subscript;
+    } else if (Ident.get() == ConstructorIdentifierData) {
+      return Kind::Constructor;
     } else if (Ident.get() == DestructorIdentifierData) {
         return Kind::Destructor;
     } else {
@@ -282,6 +292,8 @@ public:
       return getIdentifier().str();
     case Kind::Subscript:
       return "subscript";
+    case Kind::Constructor:
+      return "init";
     case Kind::Destructor:
       return "deinit";
     }
@@ -333,8 +345,8 @@ template<> struct DenseMapInfo<swift::DeclBaseName> {
 };
 
 // A DeclBaseName is "pointer like".
-template <typename T> class PointerLikeTypeTraits;
-template <> class PointerLikeTypeTraits<swift::DeclBaseName> {
+template <typename T> struct PointerLikeTypeTraits;
+template <> struct PointerLikeTypeTraits<swift::DeclBaseName> {
 public:
   static inline void *getAsVoidPointer(swift::DeclBaseName D) {
     return const_cast<void *>(D.getAsOpaquePointer());
@@ -671,15 +683,15 @@ public:
   }
 
   friend bool operator<=(ObjCSelector lhs, ObjCSelector rhs) {
-    return lhs.compare(lhs) <= 0;
+    return lhs.compare(rhs) <= 0;
   }
 
   friend bool operator>(ObjCSelector lhs, ObjCSelector rhs) {
-    return lhs.compare(lhs) > 0;
+    return lhs.compare(rhs) > 0;
   }
 
   friend bool operator>=(ObjCSelector lhs, ObjCSelector rhs) {
-    return lhs.compare(lhs) >= 0;
+    return lhs.compare(rhs) >= 0;
   }
 };
 
@@ -687,9 +699,9 @@ public:
 
 namespace llvm {
   // A DeclName is "pointer like".
-  template<typename T> class PointerLikeTypeTraits;
+  template<typename T> struct PointerLikeTypeTraits;
   template<>
-  class PointerLikeTypeTraits<swift::DeclName> {
+  struct PointerLikeTypeTraits<swift::DeclName> {
   public:
     static inline void *getAsVoidPointer(swift::DeclName name) {
       return name.getOpaqueValue();
@@ -717,9 +729,9 @@ namespace llvm {
   };
 
   // An ObjCSelector is "pointer like".
-  template<typename T> class PointerLikeTypeTraits;
+  template<typename T> struct PointerLikeTypeTraits;
   template<>
-  class PointerLikeTypeTraits<swift::ObjCSelector> {
+  struct PointerLikeTypeTraits<swift::ObjCSelector> {
   public:
     static inline void *getAsVoidPointer(swift::ObjCSelector name) {
       return name.getOpaqueValue();

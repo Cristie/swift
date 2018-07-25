@@ -190,6 +190,7 @@ struct T5 : P5 {
 // Unqualified lookup finds typealiases in protocol extensions
 protocol P7 {
   associatedtype A
+  typealias Z = A
 }
 
 extension P7 {
@@ -203,6 +204,7 @@ struct S7 : P7 {
 
   func inExpressionContext() {
     _ = Y.self
+    _ = Z.self
     _ = T5.T1.self
     _ = T5.T2.self
   }
@@ -243,3 +245,57 @@ struct CandyEdible : Edible {
 // Edible.Snack is witnessed by 'typealias Snack' inside the
 // constrained extension of CandyWrapper above
 extension CandyBar : Edible {}
+
+protocol P9 {
+  typealias A = Int
+}
+
+func testT9a<T: P9, U>(_: T, _: U) where T.A == U { } // expected-error {{same-type requirement makes generic parameter 'U' non-generic}}
+func testT9b<T: P9>(_: T) where T.A == Float { } // expected-error{{generic signature requires types 'T.A' (aka 'Int') and 'Float' to be the same}}
+
+
+struct X<T> { }
+
+protocol P10 {
+  associatedtype A
+  typealias T = Int
+
+  @available(*, deprecated, message: "just use Int, silly")
+  typealias V = Int
+}
+
+extension P10 {
+  typealias U = Float
+}
+
+extension P10 where T == Int { } // expected-warning{{neither type in same-type constraint ('Self.T' (aka 'Int') or 'Int') refers to a generic parameter or associated type}}
+
+extension P10 where A == X<T> { }
+
+extension P10 where A == X<U> { } // expected-error{{use of undeclared type 'U'}}
+
+extension P10 where A == X<Self.U> { }
+
+extension P10 where V == Int { } // expected-warning 3{{'V' is deprecated: just use Int, silly}}
+// expected-warning@-1{{neither type in same-type constraint ('Self.V' (aka 'Int') or 'Int') refers to a generic parameter or associated type}}
+
+// rdar://problem/36003312
+protocol P11 {
+  typealias A = Y11
+}
+
+struct X11<T: P11> { }
+struct Y11: P11 { }
+
+extension P11 {
+  func foo(_: X11<Self.A>) { }
+}
+
+// Ordering issue
+struct SomeConformingType : UnboundGenericAliasProto {
+  func f(_: G<Int>) {}
+}
+
+protocol UnboundGenericAliasProto {
+  typealias G = X
+}

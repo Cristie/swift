@@ -14,6 +14,7 @@
 #include "ManagedValue.h"
 #include "Scope.h"
 #include "swift/AST/ASTMangler.h"
+#include "swift/AST/GenericSignature.h"
 #include "swift/SIL/FormalLinkage.h"
 
 using namespace swift;
@@ -25,11 +26,14 @@ SILGlobalVariable *SILGenModule::getSILGlobalVariable(VarDecl *gDecl,
   // First, get a mangled name for the declaration.
   std::string mangledName;
 
-  if (auto SILGenName = gDecl->getAttrs().getAttribute<SILGenNameAttr>()) {
-    mangledName = SILGenName->Name;
-  } else {
-    Mangle::ASTMangler NewMangler;
-    mangledName = NewMangler.mangleGlobalVariableFull(gDecl);
+  {
+    auto SILGenName = gDecl->getAttrs().getAttribute<SILGenNameAttr>();
+    if (SILGenName && !SILGenName->Name.empty()) {
+      mangledName = SILGenName->Name;
+    } else {
+      Mangle::ASTMangler NewMangler;
+      mangledName = NewMangler.mangleGlobalVariableFull(gDecl);
+    }
   }
 
   // Check if it is already created, and update linkage if necessary.
@@ -46,10 +50,7 @@ SILGlobalVariable *SILGenModule::getSILGlobalVariable(VarDecl *gDecl,
   SILLinkage link = getSILLinkage(getDeclLinkage(gDecl), forDef);
   SILType silTy = M.Types.getLoweredTypeOfGlobal(gDecl);
 
-  auto *silGlobal = SILGlobalVariable::create(M, link,
-                                              isMakeModuleFragile()
-                                                ? IsSerialized
-                                                : IsNotSerialized,
+  auto *silGlobal = SILGlobalVariable::create(M, link, IsNotSerialized,
                                               mangledName, silTy,
                                               None, gDecl);
   silGlobal->setDeclaration(!forDef);
@@ -223,9 +224,7 @@ void SILGenModule::emitGlobalInitialization(PatternBindingDecl *pd,
   // TODO: include the module in the onceToken's name mangling.
   // Then we can make it fragile.
   auto onceToken = SILGlobalVariable::create(M, SILLinkage::Private,
-                                             isMakeModuleFragile()
-                                               ? IsSerialized
-                                               : IsNotSerialized,
+                                             IsNotSerialized,
                                              onceTokenBuffer, onceSILTy);
   onceToken->setDeclaration(false);
 
@@ -246,6 +245,8 @@ void SILGenModule::emitGlobalInitialization(PatternBindingDecl *pd,
 
 void SILGenFunction::emitLazyGlobalInitializer(PatternBindingDecl *binding,
                                                unsigned pbdEntry) {
+  MagicFunctionName = SILGenModule::getMagicFunctionName(binding->getDeclContext());
+
   {
     Scope scope(Cleanups, binding);
 
@@ -293,20 +294,5 @@ void SILGenFunction::emitGlobalAccessor(VarDecl *global,
   auto *ret = B.createReturn(global, addr);
   (void)ret;
   assert(ret->getDebugScope() && "instruction without scope");
-}
-
-void SILGenFunction::emitGlobalGetter(VarDecl *global,
-                                      SILGlobalVariable *onceToken,
-                                      SILFunction *onceFunc) {
-  emitOnceCall(*this, global, onceToken, onceFunc);
-
-  auto *silG = SGM.getSILGlobalVariable(global, NotForDefinition);
-  SILValue addr = B.createGlobalAddr(global, silG);
-
-  auto refType = global->getInterfaceType()->getCanonicalType();
-  ManagedValue value = emitLoad(global, addr, getTypeLowering(refType),
-                                SGFContext(), IsNotTake);
-  SILValue result = value.forward(*this);
-  B.createReturn(global, result);
 }
 
